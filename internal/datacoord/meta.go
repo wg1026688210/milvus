@@ -171,10 +171,10 @@ func (m *meta) GetNumRowsOfCollection(collectionID UniqueID) int64 {
 func (m *meta) AddSegment(segment *SegmentInfo) error {
 	m.Lock()
 	defer m.Unlock()
-	m.segments.SetSegment(segment.GetID(), segment)
 	if err := m.saveSegmentInfo(segment); err != nil {
 		return err
 	}
+	m.segments.SetSegment(segment.GetID(), segment)
 	metrics.DataCoordNumSegments.WithLabelValues(segment.GetState().String()).Inc()
 	return nil
 }
@@ -800,11 +800,13 @@ func (m *meta) CompleteMergeCompaction(compactionLogs []*datapb.CompactionSegmen
 
 	var startPosition, dmlPosition *internalpb.MsgPosition
 	for _, s := range segments {
-		if dmlPosition == nil || s.GetDmlPosition().Timestamp < dmlPosition.Timestamp {
+		if dmlPosition == nil ||
+			s.GetDmlPosition() != nil && s.GetDmlPosition().GetTimestamp() < dmlPosition.GetTimestamp() {
 			dmlPosition = s.GetDmlPosition()
 		}
 
-		if startPosition == nil || s.GetStartPosition().Timestamp < startPosition.Timestamp {
+		if startPosition == nil ||
+			s.GetStartPosition() != nil && s.GetStartPosition().GetTimestamp() < startPosition.GetTimestamp() {
 			startPosition = s.GetStartPosition()
 		}
 	}
@@ -844,8 +846,13 @@ func (m *meta) CompleteMergeCompaction(compactionLogs []*datapb.CompactionSegmen
 		CreatedByCompaction: true,
 		CompactionFrom:      compactionFrom,
 	}
-
 	segment := NewSegmentInfo(segmentInfo)
+
+	log.Info("CompleteMergeCompaction", zap.Int64("segmentID", segmentInfo.ID),
+		zap.Int64("collectionID", segmentInfo.CollectionID),
+		zap.Int64("partitionID", segmentInfo.PartitionID),
+		zap.Int64("NumOfRows", segmentInfo.NumOfRows),
+		zap.Any("compactionFrom", segmentInfo.CompactionFrom))
 
 	data := make(map[string]string)
 

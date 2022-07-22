@@ -20,9 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
-
-	"github.com/golang/protobuf/proto"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -32,6 +31,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/errorutil"
+	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
 
@@ -81,6 +81,7 @@ type segmentEvent struct {
 }
 
 type shardQueryNode interface {
+	GetStatistics(context.Context, *querypb.GetStatisticsRequest) (*internalpb.GetStatisticsResponse, error)
 	Search(context.Context, *querypb.SearchRequest) (*internalpb.SearchResults, error)
 	Query(context.Context, *querypb.QueryRequest) (*internalpb.RetrieveResults, error)
 	ReleaseSegments(ctx context.Context, in *querypb.ReleaseSegmentsRequest) (*commonpb.Status, error)
@@ -179,7 +180,7 @@ func NewShardCluster(collectionID int64, replicaID int64, vchannelName string,
 func (sc *ShardCluster) Close() {
 	log.Info("Close shard cluster")
 	sc.closeOnce.Do(func() {
-		sc.state.Store(int32(unavailable))
+		sc.updateShardClusterState(unavailable)
 		close(sc.closeCh)
 	})
 }
@@ -242,7 +243,7 @@ func (sc *ShardCluster) removeNode(evt nodeEvent) {
 		if segment.nodeID == evt.nodeID {
 			segment.state = segmentStateOffline
 			sc.segments[id] = segment
-			sc.state.Store(int32(unavailable))
+			sc.updateShardClusterState(unavailable)
 		}
 	}
 	// ignore leader process here
@@ -301,6 +302,8 @@ func (sc *ShardCluster) SyncSegments(distribution []*querypb.ReplicaSegmentsInfo
 			})
 		}
 	}
+
+	allocations := sc.segments.Clone(filterNothing)
 	sc.mut.Unlock()
 
 	// notify handoff wait online if any
@@ -310,7 +313,7 @@ func (sc *ShardCluster) SyncSegments(distribution []*querypb.ReplicaSegmentsInfo
 
 	sc.mutVersion.Lock()
 	defer sc.mutVersion.Unlock()
-	version := NewShardClusterVersion(sc.nextVersionID.Inc(), sc.segments.Clone(filterNothing))
+	version := NewShardClusterVersion(sc.nextVersionID.Inc(), allocations)
 	sc.versions.Store(version.versionID, version)
 	sc.currentVersion = version
 }
@@ -422,15 +425,28 @@ func (sc *ShardCluster) selectNodeInReplica(nodeIDs []int64) (int64, bool) {
 	return 0, false
 }
 
+func (sc *ShardCluster) updateShardClusterState(state shardClusterState) {
+	old := sc.state.Load()
+	sc.state.Store(int32(state))
+
+	pc, _, _, _ := runtime.Caller(1)
+	callerName := runtime.FuncForPC(pc).Name()
+
+	log.Info("Shard Cluster update state", zap.Int64("collectionID", sc.collectionID),
+		zap.Int64("replicaID", sc.replicaID), zap.String("channel", sc.vchannelName),
+		zap.Int32("old state", old), zap.Int32("new state", int32(state)),
+		zap.String("caller", callerName))
+}
+
 // healthCheck iterate all segments to to check cluster could provide service.
 func (sc *ShardCluster) healthCheck() {
 	for _, segment := range sc.segments {
 		if segment.state != segmentStateLoaded { // TODO check hand-off or load balance
-			sc.state.Store(int32(unavailable))
+			sc.updateShardClusterState(unavailable)
 			return
 		}
 	}
-	sc.state.Store(int32(available))
+	sc.updateShardClusterState(available)
 }
 
 // watchNodes handles node events.
@@ -717,14 +733,96 @@ func (sc *ShardCluster) segmentsOnline(segments []shardSegmentInfo) bool {
 	return true
 }
 
+// GetStatistics returns the statistics on the shard cluster.
+func (sc *ShardCluster) GetStatistics(ctx context.Context, req *querypb.GetStatisticsRequest, withStreaming withStreaming) ([]*internalpb.GetStatisticsResponse, error) {
+	if !sc.serviceable() {
+		return nil, fmt.Errorf("ShardCluster for %s replicaID %d is no available", sc.vchannelName, sc.replicaID)
+	}
+	if !funcutil.SliceContain(req.GetDmlChannels(), sc.vchannelName) {
+		return nil, fmt.Errorf("ShardCluster for %s does not match request channels :%v", sc.vchannelName, req.GetDmlChannels())
+	}
+
+	// get node allocation and maintains the inUse reference count
+	segAllocs, versionID := sc.segmentAllocations(req.GetReq().GetPartitionIDs())
+	defer sc.finishUsage(versionID)
+
+	log.Debug("cluster segment distribution", zap.Int("len", len(segAllocs)))
+	for nodeID, segmentIDs := range segAllocs {
+		log.Debug("segments distribution", zap.Int64("nodeID", nodeID), zap.Int64s("segments", segmentIDs))
+	}
+
+	// concurrent visiting nodes
+	var wg sync.WaitGroup
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var err error
+	var resultMut sync.Mutex
+	results := make([]*internalpb.GetStatisticsResponse, 0, len(segAllocs)) // count(nodes) + 1(growing)
+
+	// detect corresponding streaming search is done
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		streamErr := withStreaming(reqCtx)
+		resultMut.Lock()
+		defer resultMut.Unlock()
+		if streamErr != nil {
+			cancel()
+			// not set cancel error
+			if !errors.Is(streamErr, context.Canceled) {
+				err = fmt.Errorf("stream operation failed: %w", streamErr)
+			}
+		}
+	}()
+
+	// dispatch request to followers
+	for nodeID, segments := range segAllocs {
+		nodeReq := &querypb.GetStatisticsRequest{
+			Req:             req.GetReq(),
+			DmlChannels:     req.GetDmlChannels(),
+			FromShardLeader: true,
+			Scope:           querypb.DataScope_Historical,
+			SegmentIDs:      segments,
+		}
+		node, ok := sc.getNode(nodeID)
+		if !ok { // meta mismatch, report error
+			return nil, fmt.Errorf("ShardCluster for %s replicaID %d is no available", sc.vchannelName, sc.replicaID)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			partialResult, nodeErr := node.client.GetStatistics(reqCtx, nodeReq)
+			resultMut.Lock()
+			defer resultMut.Unlock()
+			if nodeErr != nil || partialResult.GetStatus().GetErrorCode() != commonpb.ErrorCode_Success {
+				cancel()
+				// not set cancel error
+				if !errors.Is(nodeErr, context.Canceled) {
+					err = fmt.Errorf("GetStatistic %d failed, reason %s err %w", node.nodeID, partialResult.GetStatus().GetReason(), nodeErr)
+				}
+				return
+			}
+			results = append(results, partialResult)
+		}()
+	}
+
+	wg.Wait()
+	if err != nil {
+		log.Error(err.Error())
+		return nil, err
+	}
+
+	return results, nil
+}
+
 // Search preforms search operation on shard cluster.
 func (sc *ShardCluster) Search(ctx context.Context, req *querypb.SearchRequest, withStreaming withStreaming) ([]*internalpb.SearchResults, error) {
 	if !sc.serviceable() {
 		return nil, fmt.Errorf("ShardCluster for %s replicaID %d is no available", sc.vchannelName, sc.replicaID)
 	}
-
-	if sc.vchannelName != req.GetDmlChannel() {
-		return nil, fmt.Errorf("ShardCluster for %s does not match to request channel :%s", sc.vchannelName, req.GetDmlChannel())
+	if !funcutil.SliceContain(req.GetDmlChannels(), sc.vchannelName) {
+		return nil, fmt.Errorf("ShardCluster for %s does not match request channels :%v", sc.vchannelName, req.GetDmlChannels())
 	}
 
 	// get node allocation and maintains the inUse reference count
@@ -764,10 +862,13 @@ func (sc *ShardCluster) Search(ctx context.Context, req *querypb.SearchRequest, 
 
 	// dispatch request to followers
 	for nodeID, segments := range segAllocs {
-		nodeReq := proto.Clone(req).(*querypb.SearchRequest)
-		nodeReq.FromShardLeader = true
-		nodeReq.Scope = querypb.DataScope_Historical
-		nodeReq.SegmentIDs = segments
+		nodeReq := &querypb.SearchRequest{
+			Req:             req.Req,
+			DmlChannels:     req.DmlChannels,
+			FromShardLeader: true,
+			Scope:           querypb.DataScope_Historical,
+			SegmentIDs:      segments,
+		}
 		node, ok := sc.getNode(nodeID)
 		if !ok { // meta dismatch, report error
 			return nil, fmt.Errorf("ShardCluster for %s replicaID %d is no available", sc.vchannelName, sc.replicaID)
@@ -806,8 +907,8 @@ func (sc *ShardCluster) Query(ctx context.Context, req *querypb.QueryRequest, wi
 	}
 
 	// handles only the dml channel part, segment ids is dispatch by cluster itself
-	if sc.vchannelName != req.GetDmlChannel() {
-		return nil, fmt.Errorf("ShardCluster for %s does not match to request channel :%s", sc.vchannelName, req.GetDmlChannel())
+	if !funcutil.SliceContain(req.GetDmlChannels(), sc.vchannelName) {
+		return nil, fmt.Errorf("ShardCluster for %s does not match to request channels :%v", sc.vchannelName, req.GetDmlChannels())
 	}
 
 	// get node allocation and maintains the inUse reference count
@@ -842,10 +943,13 @@ func (sc *ShardCluster) Query(ctx context.Context, req *querypb.QueryRequest, wi
 
 	// dispatch request to followers
 	for nodeID, segments := range segAllocs {
-		nodeReq := proto.Clone(req).(*querypb.QueryRequest)
-		nodeReq.FromShardLeader = true
-		nodeReq.SegmentIDs = segments
-		nodeReq.Scope = querypb.DataScope_Historical
+		nodeReq := &querypb.QueryRequest{
+			Req:             req.Req,
+			FromShardLeader: true,
+			SegmentIDs:      segments,
+			Scope:           querypb.DataScope_Historical,
+			DmlChannels:     req.DmlChannels,
+		}
 		node, ok := sc.getNode(nodeID)
 		if !ok { // meta dismatch, report error
 			return nil, fmt.Errorf("SharcCluster for %s replicaID %d is no available", sc.vchannelName, sc.replicaID)
