@@ -28,9 +28,9 @@ import (
 	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/retry"
 	"github.com/milvus-io/milvus/internal/util/trace"
@@ -550,7 +550,7 @@ func (ms *mqMsgStream) Seek(msgPositions []*internalpb.MsgPosition) error {
 			return err
 		}
 
-		log.Info("MsgStream seek begin", zap.String("channel", mp.ChannelName), zap.Any("MessageID", messageID))
+		log.Info("MsgStream seek begin", zap.String("channel", mp.ChannelName), zap.Any("MessageID", mp.MsgID))
 		err = consumer.Seek(messageID, false)
 		if err != nil {
 			log.Warn("Failed to seek", zap.String("channel", mp.ChannelName), zap.Error(err))
@@ -669,6 +669,10 @@ func (ms *MqTtMsgStream) Close() {
 	ms.mqMsgStream.Close()
 }
 
+func isDMLMsg(msg TsMsg) bool {
+	return msg.Type() == commonpb.MsgType_Insert || msg.Type() == commonpb.MsgType_Delete
+}
+
 func (ms *MqTtMsgStream) bufMsgPackToChannel() {
 	ms.closeRWMutex.RLock()
 	defer ms.closeRWMutex.RUnlock()
@@ -760,7 +764,7 @@ func (ms *MqTtMsgStream) bufMsgPackToChannel() {
 			idset := make(typeutil.UniqueSet)
 			uniqueMsgs := make([]TsMsg, 0, len(timeTickBuf))
 			for _, msg := range timeTickBuf {
-				if idset.Contain(msg.ID()) {
+				if isDMLMsg(msg) && idset.Contain(msg.ID()) {
 					log.Warn("mqTtMsgStream, found duplicated msg", zap.Int64("msgID", msg.ID()))
 					continue
 				}
@@ -880,7 +884,7 @@ func (ms *MqTtMsgStream) Seek(msgPositions []*internalpb.MsgPosition) error {
 		if err != nil {
 			return err
 		}
-		log.Info("MsgStream begin to seek start msg: ", zap.String("channel", mp.ChannelName), zap.Any("MessageID", seekMsgID))
+		log.Info("MsgStream begin to seek start msg: ", zap.String("channel", mp.ChannelName), zap.Any("MessageID", mp.MsgID))
 		err = consumer.Seek(seekMsgID, true)
 		if err != nil {
 			log.Warn("Failed to seek", zap.String("channel", mp.ChannelName), zap.Error(err))

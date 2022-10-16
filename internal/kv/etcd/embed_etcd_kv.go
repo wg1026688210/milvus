@@ -11,8 +11,8 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
 // limitations under the License.
+// See the License for the specific language governing permissions and
 
 package etcdkv
 
@@ -23,6 +23,8 @@ import (
 	"path"
 	"sync"
 	"time"
+
+	"github.com/milvus-io/milvus/internal/common"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
@@ -199,7 +201,7 @@ func (kv *EmbedEtcdKV) Load(key string) (string, error) {
 		return "", err
 	}
 	if resp.Count <= 0 {
-		return "", fmt.Errorf("there is no value on key = %s", key)
+		return "", common.NewKeyNotExistError(key)
 	}
 
 	return string(resp.Kvs[0].Value), nil
@@ -215,7 +217,7 @@ func (kv *EmbedEtcdKV) LoadBytes(key string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.Count <= 0 {
-		return nil, fmt.Errorf("there is no value on key = %s", key)
+		return nil, common.NewKeyNotExistError(key)
 	}
 
 	return resp.Kvs[0].Value, nil

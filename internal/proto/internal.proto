@@ -5,28 +5,6 @@ option go_package = "github.com/milvus-io/milvus/internal/proto/internalpb";
 import "common.proto";
 import "schema.proto";
 
-enum StateCode {
-  Initializing = 0;
-  Healthy = 1;
-  Abnormal = 2;
-}
-
-message ComponentInfo {
-  int64 nodeID = 1;
-  string role = 2;
-  StateCode state_code = 3;
-  repeated common.KeyValuePair extra_info = 4;
-}
-
-message ComponentStates {
-  ComponentInfo state = 1;
-  repeated ComponentInfo subcomponent_states = 2;
-  common.Status status = 3;
-}
-
-message GetComponentStatesRequest {
-}
-
 message GetTimeTickChannelRequest {
 }
 
@@ -222,6 +200,7 @@ message RetrieveRequest {
   uint64 travel_timestamp = 8;
   uint64 guarantee_timestamp = 9;
   uint64 timeout_timestamp = 10;
+  int64 limit = 11; // Optional
 }
 
 message RetrieveResults {
@@ -310,4 +289,33 @@ message ListPolicyResponse {
   // Contain error_code and reason
   common.Status status = 1;
   repeated string policy_infos = 2;
+  repeated string user_roles = 3;
+}
+
+message ShowConfigurationsRequest {
+  common.MsgBase base = 1;
+  string pattern = 2;
+}
+
+message ShowConfigurationsResponse {
+  common.Status status = 1;
+  repeated common.KeyValuePair configuations = 2;
+}
+
+enum RateType {
+  DDLCollection = 0;
+  DDLPartition = 1;
+  DDLIndex = 2;
+  DDLFlush = 3;
+  DDLCompaction = 4;
+  DMLInsert = 5;
+  DMLDelete = 6;
+  DMLBulkLoad = 7;
+  DQLSearch = 8;
+  DQLQuery = 9;
+}
+
+message Rate {
+  RateType rt = 1;
+  double r = 2;
 }

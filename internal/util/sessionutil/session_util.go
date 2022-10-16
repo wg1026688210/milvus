@@ -10,7 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/blang/semver/v4"
+	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/retry"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
@@ -23,14 +26,23 @@ const (
 	DefaultServiceRoot = "session/"
 	// DefaultIDKey default id key for Session
 	DefaultIDKey = "id"
-	// DefaultRetryTimes default retry times when registerService or getServerByID
-	DefaultRetryTimes = 30
-	// DefaultTTL default ttl value when granting a lease
-	DefaultTTL = 60
 )
+
+var GlobalParams paramtable.ComponentParam
 
 // SessionEventType session event type
 type SessionEventType int
+
+func (t SessionEventType) String() string {
+	switch t {
+	case SessionAddEvent:
+		return "SessionAddEvent"
+	case SessionDelEvent:
+		return "SessionDelEvent"
+	default:
+		return ""
+	}
+}
 
 // Rewatch defines the behavior outer session watch handles ErrCompacted
 // it should process the current full list of session
@@ -60,6 +72,7 @@ type Session struct {
 	Address     string `json:"Address,omitempty"`
 	Exclusive   bool   `json:"Exclusive,omitempty"`
 	TriggerKill bool
+	Version     semver.Version `json:"Version,omitempty"`
 
 	liveCh  <-chan bool
 	etcdCli *clientv3.Client
@@ -68,6 +81,62 @@ type Session struct {
 	metaRoot string
 
 	registered atomic.Value
+
+	isStandby           atomic.Value
+	enableActiveStandBy bool
+	activeKey           string
+}
+
+// UnmarshalJSON unmarshal bytes to Session.
+func (s *Session) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ServerID    int64  `json:"ServerID,omitempty"`
+		ServerName  string `json:"ServerName,omitempty"`
+		Address     string `json:"Address,omitempty"`
+		Exclusive   bool   `json:"Exclusive,omitempty"`
+		TriggerKill bool
+		Version     string `json:"Version"`
+	}
+	err := json.Unmarshal(data, &raw)
+	if err != nil {
+		return err
+	}
+
+	if raw.Version != "" {
+		s.Version, err = semver.Parse(raw.Version)
+		if err != nil {
+			return err
+		}
+	}
+
+	s.ServerID = raw.ServerID
+	s.ServerName = raw.ServerName
+	s.Address = raw.Address
+	s.Exclusive = raw.Exclusive
+	s.TriggerKill = raw.TriggerKill
+	return nil
+}
+
+// MarshalJSON marshals session to bytes.
+func (s *Session) MarshalJSON() ([]byte, error) {
+
+	verStr := s.Version.String()
+	return json.Marshal(&struct {
+		ServerID    int64  `json:"ServerID,omitempty"`
+		ServerName  string `json:"ServerName,omitempty"`
+		Address     string `json:"Address,omitempty"`
+		Exclusive   bool   `json:"Exclusive,omitempty"`
+		TriggerKill bool
+		Version     string `json:"Version"`
+	}{
+		ServerID:    s.ServerID,
+		ServerName:  s.ServerName,
+		Address:     s.Address,
+		Exclusive:   s.Exclusive,
+		TriggerKill: s.TriggerKill,
+		Version:     verStr,
+	})
+
 }
 
 // NewSession is a helper to build Session object.
@@ -78,6 +147,7 @@ func NewSession(ctx context.Context, metaRoot string, client *clientv3.Client) *
 	session := &Session{
 		ctx:      ctx,
 		metaRoot: metaRoot,
+		Version:  common.Version,
 	}
 
 	session.UpdateRegistered(false)
@@ -115,11 +185,12 @@ func (s *Session) Init(serverName, address string, exclusive bool, triggerKill b
 		panic(err)
 	}
 	s.ServerID = serverID
+	GlobalParams.InitOnce()
 }
 
 // String makes Session struct able to be logged by zap
 func (s *Session) String() string {
-	return fmt.Sprintf("Session:<ServerID: %d, ServerName: %s>", s.ServerID, s.ServerName)
+	return fmt.Sprintf("Session:<ServerID: %d, ServerName: %s, Version: %s>", s.ServerID, s.ServerName, s.Version.String())
 }
 
 // Register will process keepAliveResponse to keep alive with etcd.
@@ -196,10 +267,18 @@ func (s *Session) getServerIDWithKey(key string) (int64, error) {
 // Exclusive means whether this service can exist two at the same time, if so,
 // it is false. Otherwise, set it to true.
 func (s *Session) registerService() (<-chan *clientv3.LeaseKeepAliveResponse, error) {
+	if s.enableActiveStandBy {
+		s.updateStandby(true)
+	}
+	key := s.ServerName
+	if !s.Exclusive || s.enableActiveStandBy {
+		key = fmt.Sprintf("%s-%d", key, s.ServerID)
+	}
+	completeKey := path.Join(s.metaRoot, DefaultServiceRoot, key)
 	var ch <-chan *clientv3.LeaseKeepAliveResponse
 	log.Debug("service begin to register to etcd", zap.String("serverName", s.ServerName), zap.Int64("ServerID", s.ServerID))
 	registerFn := func() error {
-		resp, err := s.etcdCli.Grant(s.ctx, DefaultTTL)
+		resp, err := s.etcdCli.Grant(s.ctx, GlobalParams.CommonCfg.SessionTTL)
 		if err != nil {
 			log.Error("register service", zap.Error(err))
 			return err
@@ -211,16 +290,12 @@ func (s *Session) registerService() (<-chan *clientv3.LeaseKeepAliveResponse, er
 			return err
 		}
 
-		key := s.ServerName
-		if !s.Exclusive {
-			key = fmt.Sprintf("%s-%d", key, s.ServerID)
-		}
 		txnResp, err := s.etcdCli.Txn(s.ctx).If(
 			clientv3.Compare(
-				clientv3.Version(path.Join(s.metaRoot, DefaultServiceRoot, key)),
+				clientv3.Version(completeKey),
 				"=",
 				0)).
-			Then(clientv3.OpPut(path.Join(s.metaRoot, DefaultServiceRoot, key), string(sessionJSON), clientv3.WithLease(resp.ID))).Commit()
+			Then(clientv3.OpPut(completeKey, string(sessionJSON), clientv3.WithLease(resp.ID))).Commit()
 
 		if err != nil {
 			log.Warn("compare and swap error, maybe the key has already been registered", zap.Error(err))
@@ -230,6 +305,7 @@ func (s *Session) registerService() (<-chan *clientv3.LeaseKeepAliveResponse, er
 		if !txnResp.Succeeded {
 			return fmt.Errorf("function CompareAndSwap error for compare is false for key: %s", key)
 		}
+		log.Debug("put session key into etcd", zap.String("key", completeKey), zap.String("value", string(sessionJSON)))
 
 		keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
 		s.keepAliveCancel = keepAliveCancel
@@ -241,7 +317,7 @@ func (s *Session) registerService() (<-chan *clientv3.LeaseKeepAliveResponse, er
 		log.Info("Service registered successfully", zap.String("ServerName", s.ServerName), zap.Int64("serverID", s.ServerID))
 		return nil
 	}
-	err := retry.Do(s.ctx, registerFn, retry.Attempts(DefaultRetryTimes))
+	err := retry.Do(s.ctx, registerFn, retry.Attempts(uint(GlobalParams.CommonCfg.SessionRetryTimes)))
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +380,35 @@ func (s *Session) GetSessions(prefix string) (map[string]*Session, int64, error)
 	return res, resp.Header.Revision, nil
 }
 
+// GetSessionsWithVersionRange will get all sessions with provided prefix and version range in etcd.
+// Revision is returned for WatchServices to prevent missing events.
+func (s *Session) GetSessionsWithVersionRange(prefix string, r semver.Range) (map[string]*Session, int64, error) {
+	res := make(map[string]*Session)
+	key := path.Join(s.metaRoot, DefaultServiceRoot, prefix)
+	resp, err := s.etcdCli.Get(s.ctx, key, clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, kv := range resp.Kvs {
+		session := &Session{}
+		err = json.Unmarshal(kv.Value, session)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !r(session.Version) {
+			log.Debug("Session version out of range", zap.String("version", session.Version.String()), zap.Int64("serverID", session.ServerID))
+			continue
+		}
+		_, mapKey := path.Split(string(kv.Key))
+		log.Debug("SessionUtil GetSessions ", zap.String("prefix", prefix),
+			zap.String("key", mapKey),
+			zap.String("address", session.Address))
+		res[mapKey] = session
+	}
+	return res, resp.Header.Revision, nil
+}
+
 // SessionEvent indicates the changes of other servers.
 // if a server is up, EventType is SessAddEvent.
 // if a server is down, EventType is SessDelEvent.
@@ -314,11 +419,12 @@ type SessionEvent struct {
 }
 
 type sessionWatcher struct {
-	s       *Session
-	rch     clientv3.WatchChan
-	eventCh chan *SessionEvent
-	prefix  string
-	rewatch Rewatch
+	s        *Session
+	rch      clientv3.WatchChan
+	eventCh  chan *SessionEvent
+	prefix   string
+	rewatch  Rewatch
+	validate func(*Session) bool
 }
 
 func (w *sessionWatcher) start() {
@@ -348,11 +454,31 @@ func (w *sessionWatcher) start() {
 // If a server down, an event will be add to channel with eventType SessionDelType.
 func (s *Session) WatchServices(prefix string, revision int64, rewatch Rewatch) (eventChannel <-chan *SessionEvent) {
 	w := &sessionWatcher{
-		s:       s,
-		eventCh: make(chan *SessionEvent, 100),
-		rch:     s.etcdCli.Watch(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, prefix), clientv3.WithPrefix(), clientv3.WithPrevKV(), clientv3.WithRev(revision)),
-		prefix:  prefix,
-		rewatch: rewatch,
+		s:        s,
+		eventCh:  make(chan *SessionEvent, 100),
+		rch:      s.etcdCli.Watch(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, prefix), clientv3.WithPrefix(), clientv3.WithPrevKV(), clientv3.WithRev(revision)),
+		prefix:   prefix,
+		rewatch:  rewatch,
+		validate: func(s *Session) bool { return true },
+	}
+	w.start()
+	return w.eventCh
+}
+
+// WatchServicesWithVersionRange watches the service's up and down in etcd, and sends event to event Channel.
+// Acts like WatchServices but with extra version range check.
+// prefix is a parameter to know which service to watch and can be obtained in type util.type.go.
+// revision is a etcd reversion to prevent missing key events and can be obtained in GetSessions.
+// If a server up, an event will be add to channel with eventType SessionAddType.
+// If a server down, an event will be add to channel with eventType SessionDelType.
+func (s *Session) WatchServicesWithVersionRange(prefix string, r semver.Range, revision int64, rewatch Rewatch) (eventChannel <-chan *SessionEvent) {
+	w := &sessionWatcher{
+		s:        s,
+		eventCh:  make(chan *SessionEvent, 100),
+		rch:      s.etcdCli.Watch(s.ctx, path.Join(s.metaRoot, DefaultServiceRoot, prefix), clientv3.WithPrefix(), clientv3.WithPrevKV(), clientv3.WithRev(revision)),
+		prefix:   prefix,
+		rewatch:  rewatch,
+		validate: func(s *Session) bool { return r(s.Version) },
 	}
 	w.start()
 	return w.eventCh
@@ -379,6 +505,9 @@ func (w *sessionWatcher) handleWatchResponse(wresp clientv3.WatchResponse) {
 				log.Error("watch services", zap.Error(err))
 				continue
 			}
+			if !w.validate(session) {
+				continue
+			}
 			eventType = SessionAddEvent
 		case mvccpb.DELETE:
 			log.Debug("watch services",
@@ -386,6 +515,9 @@ func (w *sessionWatcher) handleWatchResponse(wresp clientv3.WatchResponse) {
 			err := json.Unmarshal([]byte(ev.PrevKv.Value), session)
 			if err != nil {
 				log.Error("watch services", zap.Error(err))
+				continue
+			}
+			if !w.validate(session) {
 				continue
 			}
 			eventType = SessionDelEvent
@@ -485,4 +617,108 @@ func (s *Session) Registered() bool {
 		return false
 	}
 	return b
+}
+
+func (s *Session) SetEnableActiveStandBy(enable bool) {
+	s.enableActiveStandBy = enable
+}
+
+func (s *Session) updateStandby(b bool) {
+	s.isStandby.Store(b)
+}
+
+// ProcessActiveStandBy is used by coordinators to do active-standby mechanism.
+// coordinator enabled active-standby will first call Register and then call ProcessActiveStandBy.
+// steps:
+// 1, Enter STANDBY mode
+// 2, Try to register to active key.
+// 3, If 2. return true, this service becomes ACTIVE. Exit STANDBY mode.
+// 4, If 2. return false, which means an ACTIVE service already exist.
+//    Start watching the active key. Whenever active key disappears, STANDBY node will go backup to 2.
+// activateFunc is the function to re-active the service.
+func (s *Session) ProcessActiveStandBy(activateFunc func()) error {
+	s.activeKey = path.Join(s.metaRoot, DefaultServiceRoot, s.ServerName)
+
+	// try to register to the active_key.
+	// return
+	//   1. doRegistered: if registered the active_key by this session or by other session
+	//   2. revision: revision of the active_key
+	//   3. err: etcd error, should retry
+	registerActiveFn := func() (bool, int64, error) {
+		log.Info(fmt.Sprintf("try to register as ACTIVE %v service...", s.ServerName))
+		sessionJSON, err := json.Marshal(s)
+		if err != nil {
+			log.Error("json marshal error", zap.Error(err))
+			return false, -1, err
+		}
+		txnResp, err := s.etcdCli.Txn(s.ctx).If(
+			clientv3.Compare(
+				clientv3.Version(s.activeKey),
+				"=",
+				0)).
+			Then(clientv3.OpPut(s.activeKey, string(sessionJSON), clientv3.WithLease(*s.leaseID))).Commit()
+		if err != nil {
+			log.Error("register active key to etcd failed", zap.Error(err))
+			return false, -1, err
+		}
+		doRegistered := txnResp.Succeeded
+		if doRegistered {
+			log.Info(fmt.Sprintf("register ACTIVE %s", s.ServerName))
+		} else {
+			log.Info(fmt.Sprintf("ACTIVE %s has already been registered", s.ServerName))
+		}
+		revision := txnResp.Header.GetRevision()
+		return doRegistered, revision, nil
+	}
+	s.updateStandby(true)
+	log.Info(fmt.Sprintf("serverName: %v enter STANDBY mode", s.ServerName))
+	go func() {
+		for s.isStandby.Load().(bool) {
+			log.Debug(fmt.Sprintf("serverName: %v is in STANDBY ...", s.ServerName))
+			time.Sleep(10 * time.Second)
+		}
+	}()
+
+	for {
+		registered, revision, err := registerActiveFn()
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if registered {
+			break
+		}
+		log.Info(fmt.Sprintf("%s start to watch ACTIVE key", s.ServerName))
+		ctx, cancel := context.WithCancel(s.ctx)
+		watchChan := s.etcdCli.Watch(ctx, s.activeKey, clientv3.WithPrefix(), clientv3.WithPrevKV(), clientv3.WithRev(revision))
+		select {
+		case <-ctx.Done():
+			cancel()
+		case wresp, ok := <-watchChan:
+			if !ok {
+				cancel()
+			}
+			if wresp.Err() != nil {
+				cancel()
+			}
+			for _, event := range wresp.Events {
+				switch event.Type {
+				case mvccpb.PUT:
+					log.Debug("watch the ACTIVE key", zap.Any("ADD", event.Kv))
+				case mvccpb.DELETE:
+					log.Debug("watch the ACTIVE key", zap.Any("DELETE", event.Kv))
+					cancel()
+				}
+			}
+		}
+		cancel()
+		log.Info(fmt.Sprintf("stop watching ACTIVE key %v", s.activeKey))
+	}
+
+	s.updateStandby(false)
+	log.Info(fmt.Sprintf("serverName: %v quit STANDBY mode, this node will become ACTIVE", s.ServerName))
+	if activateFunc != nil {
+		activateFunc()
+	}
+	return nil
 }

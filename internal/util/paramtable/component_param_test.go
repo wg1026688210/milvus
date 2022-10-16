@@ -12,9 +12,7 @@
 package paramtable
 
 import (
-	"math"
-	"os"
-	"path"
+	"runtime"
 	"testing"
 	"time"
 
@@ -30,6 +28,16 @@ func shouldPanic(t *testing.T, name string, f func()) {
 func TestComponentParam(t *testing.T) {
 	var CParams ComponentParam
 	CParams.Init()
+
+	t.Run("test kafkaConfig", func(t *testing.T) {
+
+		params := CParams.ServiceParam.KafkaCfg
+		producerConfig := params.ProducerExtraConfig
+		assert.Equal(t, "dc", producerConfig["client.id"])
+
+		consumerConfig := params.ConsumerExtraConfig
+		assert.Equal(t, "dc1", consumerConfig["client.id"])
+	})
 
 	t.Run("test commonConfig", func(t *testing.T) {
 		Params := CParams.CommonCfg
@@ -106,6 +114,11 @@ func TestComponentParam(t *testing.T) {
 
 		assert.Equal(t, Params.DataNodeSubName, "by-dev-dataNode")
 		t.Logf("datanode subname = %s", Params.DataNodeSubName)
+
+		assert.Equal(t, Params.SessionTTL, int64(DefaultSessionTTL))
+		t.Logf("default session TTL time = %d", Params.SessionTTL)
+		assert.Equal(t, Params.SessionRetryTimes, int64(DefaultSessionRetryTimes))
+		t.Logf("default session retry times = %d", Params.SessionRetryTimes)
 	})
 
 	t.Run("test rootCoordConfig", func(t *testing.T) {
@@ -116,13 +129,9 @@ func TestComponentParam(t *testing.T) {
 		assert.NotEqual(t, Params.MinSegmentSizeToEnableIndex, 0)
 		t.Logf("master MinSegmentSizeToEnableIndex = %d", Params.MinSegmentSizeToEnableIndex)
 		assert.NotEqual(t, Params.ImportTaskExpiration, 0)
-		t.Logf("master ImportTaskExpiration = %f", Params.ImportTaskExpiration)
-		assert.NotEqual(t, Params.ImportTaskRetention, 0)
 		t.Logf("master ImportTaskRetention = %f", Params.ImportTaskRetention)
-		assert.NotEqual(t, Params.ImportIndexCheckInterval, 0)
-		t.Logf("master ImportIndexCheckInterval = %f", Params.ImportIndexCheckInterval)
-		assert.NotEqual(t, Params.ImportIndexWaitLimit, 0)
-		t.Logf("master ImportIndexWaitLimit = %f", Params.ImportIndexWaitLimit)
+		assert.Equal(t, Params.EnableActiveStandby, false)
+		t.Logf("rootCoord EnableActiveStandby = %t", Params.EnableActiveStandby)
 
 		Params.CreatedTime = time.Now()
 		Params.UpdatedTime = time.Now()
@@ -200,25 +209,26 @@ func TestComponentParam(t *testing.T) {
 			Params.Base.Save("proxy.maxTaskNum", "-asdf")
 			Params.initMaxTaskNum()
 		})
+
+		shouldPanic(t, "proxy.maxUserNum", func() {
+			Params.Base.Save("proxy.maxUserNum", "abc")
+			Params.initMaxUserNum()
+		})
+
+		shouldPanic(t, "proxy.maxRoleNum", func() {
+			Params.Base.Save("proxy.maxRoleNum", "abc")
+			Params.initMaxRoleNum()
+		})
 	})
 
 	t.Run("test queryCoordConfig", func(t *testing.T) {
-		//Params := CParams.QueryCoordCfg
+		Params := CParams.QueryCoordCfg
+		assert.Equal(t, Params.EnableActiveStandby, false)
+		t.Logf("queryCoord EnableActiveStandby = %t", Params.EnableActiveStandby)
 	})
 
 	t.Run("test queryNodeConfig", func(t *testing.T) {
 		Params := CParams.QueryNodeCfg
-
-		cacheSize := Params.CacheSize
-		assert.Equal(t, int64(32), cacheSize)
-		err := os.Setenv("CACHE_SIZE", "2")
-		assert.NoError(t, err)
-		Params.initCacheSize()
-		assert.Equal(t, int64(2), Params.CacheSize)
-		err = os.Setenv("CACHE_SIZE", "32")
-		assert.NoError(t, err)
-		Params.initCacheSize()
-		assert.Equal(t, int64(32), Params.CacheSize)
 
 		interval := Params.StatsPublishInterval
 		assert.Equal(t, 1000, interval)
@@ -242,7 +252,7 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, true, Params.GroupEnabled)
 		assert.Equal(t, int32(10240), Params.MaxReceiveChanSize)
 		assert.Equal(t, int32(10240), Params.MaxUnsolvedQueueSize)
-		assert.Equal(t, int32(math.MaxInt32), Params.MaxReadConcurrency)
+		assert.Equal(t, int32(runtime.GOMAXPROCS(0)*2), Params.MaxReadConcurrency)
 		assert.Equal(t, int64(1000), Params.MaxGroupNQ)
 		assert.Equal(t, 10.0, Params.TopKMergeRatio)
 		assert.Equal(t, 10.0, Params.CPURatio)
@@ -278,8 +288,9 @@ func TestComponentParam(t *testing.T) {
 	t.Run("test dataCoordConfig", func(t *testing.T) {
 		Params := CParams.DataCoordCfg
 		assert.Equal(t, 24*60*60*time.Second, Params.SegmentMaxLifetime)
-
 		assert.True(t, Params.EnableGarbageCollection)
+		assert.Equal(t, Params.EnableActiveStandby, false)
+		t.Logf("dataCoord EnableActiveStandby = %t", Params.EnableActiveStandby)
 	})
 
 	t.Run("test dataNodeConfig", func(t *testing.T) {
@@ -302,18 +313,11 @@ func TestComponentParam(t *testing.T) {
 		size := Params.FlushInsertBufferSize
 		t.Logf("FlushInsertBufferSize: %d", size)
 
-		path1 := Params.InsertBinlogRootPath
-		t.Logf("InsertBinlogRootPath: %s", path1)
-
 		Params.CreatedTime = time.Now()
 		t.Logf("CreatedTime: %v", Params.CreatedTime)
 
 		Params.UpdatedTime = time.Now()
 		t.Logf("UpdatedTime: %v", Params.UpdatedTime)
-
-		assert.Equal(t, path.Join("files", "insert_log"), Params.InsertBinlogRootPath)
-
-		assert.Equal(t, path.Join("files", "stats_log"), Params.StatsBinlogRootPath)
 	})
 
 	t.Run("test indexCoordConfig", func(t *testing.T) {
@@ -329,7 +333,13 @@ func TestComponentParam(t *testing.T) {
 		Params.UpdatedTime = time.Now()
 		t.Logf("UpdatedTime: %v", Params.UpdatedTime)
 
-		t.Logf("IndexStorageRootPath: %v", Params.IndexStorageRootPath)
+		assert.False(t, Params.BindIndexNodeMode)
+		assert.Equal(t, "localhost:22930", Params.IndexNodeAddress)
+		assert.False(t, Params.WithCredential)
+		assert.Equal(t, int64(0), Params.IndexNodeID)
+
+		assert.Equal(t, Params.EnableActiveStandby, false)
+		t.Logf("indexCoord EnableActiveStandby = %t", Params.EnableActiveStandby)
 	})
 
 	t.Run("test indexNodeConfig", func(t *testing.T) {
@@ -350,7 +360,5 @@ func TestComponentParam(t *testing.T) {
 
 		Params.UpdatedTime = time.Now()
 		t.Logf("UpdatedTime: %v", Params.UpdatedTime)
-
-		t.Logf("IndexStorageRootPath: %v", Params.IndexStorageRootPath)
 	})
 }

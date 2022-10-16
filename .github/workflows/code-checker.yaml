@@ -32,92 +32,41 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - name: Code Checker AMD64 Ubuntu 18.04
-          os: ubuntu-18.04
-        - name: Code Checker MacOS 11
-          os: macos-11
+        - name: Code Checker AMD64 Ubuntu 20.04
+          os: ubuntu-20.04
     env:
-      UBUNTU: 18.04
+      UBUNTU: 20.04
     steps:
       - name: Checkout
         uses: actions/checkout@v2
       - name: Cache CCache Volumes
-        if: ${{  matrix.os == 'ubuntu-18.04' }}
         uses: actions/cache@v3
         with:
-          path: .docker/amd64-ubuntu18.04-ccache
-          key: ubuntu18.04-ccache-${{ hashFiles('internal/core/**') }}
-          restore-keys: ubuntu18.04-ccache-
+          path: .docker/amd64-ubuntu20.04-ccache
+          key: ubuntu20.04-ccache-${{ hashFiles('internal/core/**') }}
+          restore-keys: ubuntu20.04-ccache-
       - name: Cache Third Party
-        if: ${{  matrix.os == 'ubuntu-18.04' }}
         uses: actions/cache@v3
         with:
           path: .docker/thirdparty
-          key: ubuntu18.04-thirdparty-${{ hashFiles('internal/core/thirdparty/**') }}
-          restore-keys: ubuntu18.04-thirdparty-
-      - name: Mac Cache Third Party
-        if: ${{  matrix.os == 'macos-11' }}
-        uses: actions/cache@v3
-        with:
-          path: |
-            /tmp/thirdparty 
-            cmake_build/3rdparty_download/download
-          key: macos-11-thirdparty-${{ hashFiles('internal/core/thirdparty/**') }}
-          restore-keys: macos-11-thirdparty-
-      - name: Mac Cache CCache Volumes
-        if: ${{  matrix.os == 'macos-11' }}
-        uses: actions/cache@v3
-        with:
-          path: /var/tmp/ccache
-          key: macos-11-ccache-${{ hashFiles('internal/core/**') }}
-          restore-keys: macos-11-ccache-
+          key: ubuntu20.04-thirdparty-${{ hashFiles('internal/core/thirdparty/**') }}
+          restore-keys: ubuntu20.04-thirdparty-
       - name: Cache Go Mod Volumes
-        if: ${{  matrix.os == 'ubuntu-18.04' }}
         uses: actions/cache@v3
         with:
-          path: .docker/amd64-ubuntu18.04-go-mod
-          key: ubuntu18.04-go-mod-${{ hashFiles('**/go.sum') }}
-          restore-keys: ubuntu18.04-go-mod-
-      - name: Setup Go environment
-        uses: actions/setup-go@v2.2.0
-        if: ${{  matrix.os == 'macos-11' }}
-        with:
-          go-version: '~1.17.1'
-      - name: Mac Cache Go Mod Volumes
-        if: ${{  matrix.os == 'macos-11' }}
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: macos-11-go-mod-${{ hashFiles('**/go.sum') }}
-          restore-keys: macos-11-go-mod-
+          path: .docker/amd64-ubuntu20.04-go-mod
+          key: ubuntu20.04-go-mod-${{ hashFiles('**/go.sum') }}
+          restore-keys: ubuntu20.04-go-mod-
       - name: Code Check
-        if: ${{  matrix.os == 'ubuntu-18.04' }}
         env:
-          CHECK_BUILDER: "1"
+#          CHECK_BUILDER: "1"
+          OS_NAME: "ubuntu20.04"
         run: |
            ./build/builder.sh /bin/bash -c "make check-proto-product && make verifiers"
-      - name: Code Check
-        if: ${{  matrix.os == 'macos-11' }}
-        env:
-          CCACHE_DIR: /var/tmp/ccache
-          CCACHE_COMPILERCHECK: content
-          CCACHE_COMPRESS: 1
-          CCACHE_COMPRESSLEVEL: 5
-          CCACHE_MAXSIZE: 2G
-          CUSTOM_THIRDPARTY_PATH: /tmp/thirdparty          
-        run: |
-          if [[ ! -d "/var/tmp/ccache" ]];then
-            mkdir -p /var/tmp/ccache
-          fi
-          brew install boost libomp ninja tbb openblas ccache
-          if [[ ! -d "/usr/local/opt/llvm" ]]; then
-            ln -s /usr/local/opt/llvm@13 /usr/local/opt/llvm
-          fi
-          make install && sh scripts/collect_arrow_dep.sh -f /tmp/thirdparty
   centos:
     name: Code Checker CentOS 7
     # Run in centos docker 
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -142,7 +91,6 @@ jobs:
           restore-keys: centos7-go-mod-
       - name: Code Check
         env:
-          CHECK_BUILDER: "1"
           OS_NAME: "centos7"
         run: |
            ./build/builder.sh /bin/bash -c "make install"
@@ -179,7 +127,7 @@ jobs:
           key: ${{ runner.os }}-ccache-${{ hashFiles('internal/core/**') }}
           restore-keys: ${{ runner.os }}-ccache-
       - name: Configure Toolchain
-        uses: msys2/setup-msys2@v2.10.3
+        uses: msys2/setup-msys2@v2.12.0
         with:
           msystem: mingw64
       - name: Install Deps
@@ -195,4 +143,5 @@ jobs:
           CCACHE_MAXSIZE: 2G
           CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
-          mingw32-make verifiers build-go
+          go version
+          mingw32-make verifiers milvus

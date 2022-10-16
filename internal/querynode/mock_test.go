@@ -24,30 +24,32 @@ import (
 	"math"
 	"math/rand"
 	"path"
+	"runtime"
 	"strconv"
-
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
 
 	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
+	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/planpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util"
+	"github.com/milvus-io/milvus/internal/util/concurrency"
+	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
 
 // ---------- unittest util functions ----------
@@ -57,7 +59,7 @@ const debugUT = false
 
 const (
 	dimKey        = "dim"
-	metricTypeKey = "metric_type"
+	metricTypeKey = common.MetricTypeKey
 
 	defaultPKFieldName  = "pk"
 	defaultTopK         = int64(10)
@@ -73,6 +75,8 @@ const (
 	defaultSubName      = "query-node-unittest-sub-name-0"
 
 	defaultLocalStorage = "/tmp/milvus_test/querynode"
+
+	defaultSegmentVersion = int64(1001)
 )
 
 const (
@@ -274,7 +278,7 @@ func genVectorFieldSchema(param vecFieldParam) *schemapb.FieldSchema {
 func genIndexBinarySet() ([][]byte, error) {
 	typeParams, indexParams := genIndexParams(IndexFaissIVFPQ, L2)
 
-	index, err := indexcgowrapper.NewCgoIndex(schemapb.DataType_FloatVector, typeParams, indexParams)
+	index, err := indexcgowrapper.NewCgoIndex(schemapb.DataType_FloatVector, typeParams, indexParams, genStorageConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +345,7 @@ func loadIndexForSegment(ctx context.Context, node *QueryNode, segmentID UniqueI
 		},
 	}
 
-	err = loader.LoadSegment(req, segmentTypeSealed)
+	err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 	if err != nil {
 		return err
 	}
@@ -371,7 +375,7 @@ func generateAndSaveIndex(segmentID UniqueID, msgLength int, indexType, metricTy
 		})
 	}
 
-	index, err := indexcgowrapper.NewCgoIndex(schemapb.DataType_FloatVector, typeParams, indexParams)
+	index, err := indexcgowrapper.NewCgoIndex(schemapb.DataType_FloatVector, typeParams, indexParams, genStorageConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -411,13 +415,26 @@ func generateAndSaveIndex(segmentID UniqueID, msgLength int, indexType, metricTy
 	for _, index := range serializedIndexBlobs {
 		p := strconv.Itoa(int(segmentID)) + "/" + index.Key
 		indexPaths = append(indexPaths, p)
-		err := cm.Write(p, index.Value)
+		err := cm.Write(context.Background(), p, index.Value)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	return indexPaths, nil
+}
+
+func genStorageConfig() *indexpb.StorageConfig {
+	return &indexpb.StorageConfig{
+		Address:         Params.MinioCfg.Address,
+		AccessKeyID:     Params.MinioCfg.AccessKeyID,
+		SecretAccessKey: Params.MinioCfg.SecretAccessKey,
+		BucketName:      Params.MinioCfg.BucketName,
+		RootPath:        Params.MinioCfg.RootPath,
+		IAMEndpoint:     Params.MinioCfg.IAMEndpoint,
+		UseSSL:          Params.MinioCfg.UseSSL,
+		UseIAM:          Params.MinioCfg.UseIAM,
+	}
 }
 
 func genIndexParams(indexType, metricType string) (map[string]string, map[string]string) {
@@ -611,7 +628,7 @@ func genVectorChunkManager(ctx context.Context, col *Collection) (*storage.Vecto
 		return nil, err
 	}
 
-	vcm, err := storage.NewVectorChunkManager(lcm, rcm, &etcdpb.CollectionMeta{
+	vcm, err := storage.NewVectorChunkManager(ctx, lcm, rcm, &etcdpb.CollectionMeta{
 		ID:     col.id,
 		Schema: col.schema,
 	}, Params.QueryNodeCfg.CacheMemoryLimit, false)
@@ -982,7 +999,7 @@ func genSimpleInsertMsg(schema *schemapb.CollectionSchema, numRows int) (*msgstr
 	return &msgstream.InsertMsg{
 		BaseMsg: genMsgStreamBaseMsg(),
 		InsertRequest: internalpb.InsertRequest{
-			Base:           genCommonMsgBase(commonpb.MsgType_Insert),
+			Base:           genCommonMsgBase(commonpb.MsgType_Insert, 0),
 			CollectionName: defaultCollectionName,
 			PartitionName:  defaultPartitionName,
 			CollectionID:   defaultCollectionID,
@@ -1055,7 +1072,7 @@ func saveBinLog(ctx context.Context,
 	log.Debug("[query node unittest] save statsLog file to MinIO/S3")
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(defaultLocalStorage))
-	err = cm.MultiWrite(kvs)
+	err = cm.MultiWrite(ctx, kvs)
 	return fieldBinlog, statsBinlog, err
 }
 
@@ -1103,7 +1120,7 @@ func saveDeltaLog(collectionID UniqueID,
 	})
 	log.Debug("[query node unittest] save delta log file to MinIO/S3")
 
-	return fieldBinlog, storage.NewLocalChunkManager(storage.RootPath(defaultLocalStorage)).MultiWrite(kvs)
+	return fieldBinlog, storage.NewLocalChunkManager(storage.RootPath(defaultLocalStorage)).MultiWrite(context.Background(), kvs)
 }
 
 func genSimpleTimestampFieldData(numRows int) []Timestamp {
@@ -1178,10 +1195,11 @@ func genMsgStreamBaseMsg() msgstream.BaseMsg {
 	}
 }
 
-func genCommonMsgBase(msgType commonpb.MsgType) *commonpb.MsgBase {
+func genCommonMsgBase(msgType commonpb.MsgType, targetID int64) *commonpb.MsgBase {
 	return &commonpb.MsgBase{
-		MsgType: msgType,
-		MsgID:   rand.Int63(),
+		MsgType:  msgType,
+		MsgID:    rand.Int63(),
+		TargetID: targetID,
 	}
 }
 
@@ -1189,7 +1207,7 @@ func genDeleteMsg(collectionID int64, pkType schemapb.DataType, numRows int) *ms
 	return &msgstream.DeleteMsg{
 		BaseMsg: genMsgStreamBaseMsg(),
 		DeleteRequest: internalpb.DeleteRequest{
-			Base:           genCommonMsgBase(commonpb.MsgType_Delete),
+			Base:           genCommonMsgBase(commonpb.MsgType_Delete, 0),
 			CollectionName: defaultCollectionName,
 			PartitionName:  defaultPartitionName,
 			CollectionID:   collectionID,
@@ -1210,12 +1228,19 @@ func genSealedSegment(schema *schemapb.CollectionSchema,
 	vChannel Channel,
 	msgLength int) (*Segment, error) {
 	col := newCollection(collectionID, schema)
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	if err != nil {
+		return nil, err
+	}
+
 	seg, err := newSegment(col,
 		segmentID,
 		partitionID,
 		collectionID,
 		vChannel,
-		segmentTypeSealed)
+		segmentTypeSealed,
+		defaultSegmentVersion,
+		pool)
 	if err != nil {
 		return nil, err
 	}
@@ -1252,20 +1277,28 @@ func genSimpleSealedSegment(msgLength int) (*Segment, error) {
 }
 
 func genSimpleReplica() (ReplicaInterface, error) {
-	r := newCollectionReplica()
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	if err != nil {
+		return nil, err
+	}
+	r := newCollectionReplica(pool)
 	schema := genTestCollectionSchema()
 	r.addCollection(defaultCollectionID, schema)
-	err := r.addPartition(defaultCollectionID, defaultPartitionID)
+	err = r.addPartition(defaultCollectionID, defaultPartitionID)
 	return r, err
 }
 
 func genSimpleSegmentLoaderWithMqFactory(metaReplica ReplicaInterface, factory msgstream.Factory) (*segmentLoader, error) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(1))
+	if err != nil {
+		return nil, err
+	}
 	kv, err := genEtcdKV()
 	if err != nil {
 		return nil, err
 	}
 	cm := storage.NewLocalChunkManager(storage.RootPath(defaultLocalStorage))
-	return newSegmentLoader(metaReplica, kv, cm, factory), nil
+	return newSegmentLoader(metaReplica, kv, cm, factory, pool), nil
 }
 
 func genSimpleReplicaWithSealSegment(ctx context.Context) (ReplicaInterface, error) {
@@ -1300,6 +1333,7 @@ func genSimpleReplicaWithGrowingSegment() (ReplicaInterface, error) {
 		defaultPartitionID,
 		defaultCollectionID,
 		defaultDMLChannel,
+		defaultSegmentVersion,
 		segmentTypeGrowing)
 	if err != nil {
 		return nil, err
@@ -1511,7 +1545,7 @@ func genSimpleRetrievePlan(collection *Collection) (*RetrievePlan, error) {
 
 func genGetCollectionStatisticRequest() (*internalpb.GetStatisticsRequest, error) {
 	return &internalpb.GetStatisticsRequest{
-		Base:         genCommonMsgBase(commonpb.MsgType_GetCollectionStatistics),
+		Base:         genCommonMsgBase(commonpb.MsgType_GetCollectionStatistics, 0),
 		DbID:         0,
 		CollectionID: defaultCollectionID,
 	}, nil
@@ -1519,7 +1553,7 @@ func genGetCollectionStatisticRequest() (*internalpb.GetStatisticsRequest, error
 
 func genGetPartitionStatisticRequest() (*internalpb.GetStatisticsRequest, error) {
 	return &internalpb.GetStatisticsRequest{
-		Base:         genCommonMsgBase(commonpb.MsgType_GetPartitionStatistics),
+		Base:         genCommonMsgBase(commonpb.MsgType_GetPartitionStatistics, 0),
 		DbID:         0,
 		CollectionID: defaultCollectionID,
 		PartitionIDs: []UniqueID{defaultPartitionID},
@@ -1536,7 +1570,7 @@ func genSearchRequest(nq int64, indexType string, schema *schemapb.CollectionSch
 		return nil, err2
 	}
 	return &internalpb.SearchRequest{
-		Base:             genCommonMsgBase(commonpb.MsgType_Search),
+		Base:             genCommonMsgBase(commonpb.MsgType_Search, 0),
 		CollectionID:     defaultCollectionID,
 		PartitionIDs:     []UniqueID{defaultPartitionID},
 		Dsl:              simpleDSL,
@@ -1616,7 +1650,7 @@ func checkSearchResult(nq int64, plan *SearchPlan, searchResult *SearchResult) e
 		if result.TopK != sliceTopKs[i] {
 			return fmt.Errorf("unexpected topK when checkSearchResult")
 		}
-		if result.NumQueries != int64(sInfo.sliceNQs[i]) {
+		if result.NumQueries != sInfo.sliceNQs[i] {
 			return fmt.Errorf("unexpected nq when checkSearchResult")
 		}
 		// search empty segment, return empty result.IDs
@@ -1664,7 +1698,7 @@ func genSimpleChangeInfo() *querypb.SealedSegmentsChangeInfo {
 	}
 
 	return &querypb.SealedSegmentsChangeInfo{
-		Base:  genCommonMsgBase(commonpb.MsgType_LoadBalanceSegments),
+		Base:  genCommonMsgBase(commonpb.MsgType_LoadBalanceSegments, 0),
 		Infos: []*querypb.SegmentChangeInfo{changeInfo},
 	}
 }
@@ -1713,15 +1747,22 @@ func genSimpleQueryNodeWithMQFactory(ctx context.Context, fac dependency.Factory
 
 	// start task scheduler
 	go node.scheduler.Start()
+	err = node.initRateCollector()
+	if err != nil {
+		return nil, err
+	}
 
 	// init shard cluster service
 	node.ShardClusterService = newShardClusterService(node.etcdCli, node.session, node)
 
-	node.queryShardService = newQueryShardService(node.queryNodeLoopCtx,
+	node.queryShardService, err = newQueryShardService(node.queryNodeLoopCtx,
 		node.metaReplica, node.tSafeReplica,
 		node.ShardClusterService, node.factory, node.scheduler)
+	if err != nil {
+		return nil, err
+	}
 
-	node.UpdateStateCode(internalpb.StateCode_Healthy)
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
 
 	return node, nil
 }
@@ -1810,6 +1851,22 @@ func genFieldData(fieldName string, fieldID int64, fieldType schemapb.DataType, 
 			},
 			FieldId: fieldID,
 		}
+	case schemapb.DataType_VarChar:
+		fieldData = &schemapb.FieldData{
+			Type:      schemapb.DataType_VarChar,
+			FieldName: fieldName,
+			Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_StringData{
+						StringData: &schemapb.StringArray{
+							Data: fieldValue.([]string),
+						},
+					},
+				},
+			},
+			FieldId: fieldID,
+		}
+
 	case schemapb.DataType_BinaryVector:
 		fieldData = &schemapb.FieldData{
 			Type:      schemapb.DataType_BinaryVector,
@@ -1868,7 +1925,7 @@ func (mm *mockMsgStreamFactory) NewQueryMsgStream(ctx context.Context) (msgstrea
 func (mm *mockMsgStreamFactory) NewCacheStorageChunkManager(ctx context.Context) (storage.ChunkManager, error) {
 	return nil, nil
 }
-func (mm *mockMsgStreamFactory) NewVectorStorageChunkManager(ctx context.Context) (storage.ChunkManager, error) {
+func (mm *mockMsgStreamFactory) NewPersistentStorageChunkManager(ctx context.Context) (storage.ChunkManager, error) {
 	return nil, nil
 }
 
@@ -1991,14 +2048,14 @@ func newMockChunkManager(opts ...mockChunkManagerOpt) storage.ChunkManager {
 	return ret
 }
 
-func (m *mockChunkManager) ReadAt(path string, offset int64, length int64) ([]byte, error) {
+func (m *mockChunkManager) ReadAt(ctx context.Context, path string, offset int64, length int64) ([]byte, error) {
 	if m.readAt != nil {
 		return m.readAt(path, offset, length)
 	}
 	return defaultReadAt(path, offset, length)
 }
 
-func (m *mockChunkManager) Read(path string) ([]byte, error) {
+func (m *mockChunkManager) Read(ctx context.Context, path string) ([]byte, error) {
 	if m.read != nil {
 		return m.read(path)
 	}

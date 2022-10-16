@@ -28,16 +28,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/milvus-io/milvus/internal/util/metricsinfo"
+
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
@@ -64,23 +66,23 @@ func (m *MockBase) On(methodName string, arguments ...interface{}) *mock.Call {
 	return m.Mock.On(methodName, arguments...)
 }
 
-func (m *MockBase) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
+func (m *MockBase) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
 	if m.isMockGetComponentStatesOn {
-		ret1 := &internalpb.ComponentStates{}
+		ret1 := &milvuspb.ComponentStates{}
 		var ret2 error
 		args := m.Called(ctx)
 		arg1 := args.Get(0)
 		arg2 := args.Get(1)
 		if arg1 != nil {
-			ret1 = arg1.(*internalpb.ComponentStates)
+			ret1 = arg1.(*milvuspb.ComponentStates)
 		}
 		if arg2 != nil {
 			ret2 = arg2.(error)
 		}
 		return ret1, ret2
 	}
-	return &internalpb.ComponentStates{
-		State:  &internalpb.ComponentInfo{StateCode: internalpb.StateCode_Healthy},
+	return &milvuspb.ComponentStates{
+		State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
 		Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
 	}, nil
 }
@@ -138,6 +140,10 @@ func (m *MockRootCoord) ShowCollections(ctx context.Context, req *milvuspb.ShowC
 	return nil, nil
 }
 
+func (m *MockRootCoord) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
 func (m *MockRootCoord) CreatePartition(ctx context.Context, req *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
@@ -151,22 +157,6 @@ func (m *MockRootCoord) HasPartition(ctx context.Context, req *milvuspb.HasParti
 }
 
 func (m *MockRootCoord) ShowPartitions(ctx context.Context, req *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
-	return nil, nil
-}
-
-func (m *MockRootCoord) CreateIndex(ctx context.Context, req *milvuspb.CreateIndexRequest) (*commonpb.Status, error) {
-	return nil, nil
-}
-
-func (m *MockRootCoord) DescribeIndex(ctx context.Context, req *milvuspb.DescribeIndexRequest) (*milvuspb.DescribeIndexResponse, error) {
-	return nil, nil
-}
-
-func (m *MockRootCoord) GetIndexState(ctx context.Context, req *milvuspb.GetIndexStateRequest) (*indexpb.GetIndexStatesResponse, error) {
-	return nil, nil
-}
-
-func (m *MockRootCoord) DropIndex(ctx context.Context, req *milvuspb.DropIndexRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -194,19 +184,7 @@ func (m *MockRootCoord) UpdateChannelTimeTick(ctx context.Context, req *internal
 	return nil, nil
 }
 
-func (m *MockRootCoord) DescribeSegment(ctx context.Context, req *milvuspb.DescribeSegmentRequest) (*milvuspb.DescribeSegmentResponse, error) {
-	return nil, nil
-}
-
 func (m *MockRootCoord) ShowSegments(ctx context.Context, req *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error) {
-	return nil, nil
-}
-
-func (m *MockRootCoord) DescribeSegments(ctx context.Context, req *rootcoordpb.DescribeSegmentsRequest) (*rootcoordpb.DescribeSegmentsResponse, error) {
-	return nil, nil
-}
-
-func (m *MockRootCoord) ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -214,7 +192,7 @@ func (m *MockRootCoord) InvalidateCollectionMetaCache(ctx context.Context, in *p
 	return nil, nil
 }
 
-func (m *MockRootCoord) SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg) (*commonpb.Status, error) {
+func (m *MockRootCoord) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	return nil, nil
 }
 
@@ -258,6 +236,38 @@ func (m *MockRootCoord) GetCredential(ctx context.Context, req *rootcoordpb.GetC
 	return nil, nil
 }
 
+func (m *MockRootCoord) CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) DropRole(ctx context.Context, in *milvuspb.DropRoleRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) OperateUserRole(ctx context.Context, in *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) SelectRole(ctx context.Context, in *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) SelectUser(ctx context.Context, in *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) OperatePrivilege(ctx context.Context, in *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) SelectGrant(ctx context.Context, in *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error) {
+	return nil, nil
+}
+
+func (m *MockRootCoord) ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest) (*internalpb.ListPolicyResponse, error) {
+	return nil, nil
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 type MockIndexCoord struct {
 	MockBase
@@ -283,7 +293,7 @@ func (m *MockIndexCoord) Register() error {
 	return m.regErr
 }
 
-func (m *MockIndexCoord) BuildIndex(ctx context.Context, req *indexpb.BuildIndexRequest) (*indexpb.BuildIndexResponse, error) {
+func (m *MockIndexCoord) CreateIndex(ctx context.Context, req *indexpb.CreateIndexRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -291,15 +301,27 @@ func (m *MockIndexCoord) DropIndex(ctx context.Context, req *indexpb.DropIndexRe
 	return nil, nil
 }
 
-func (m *MockIndexCoord) RemoveIndex(ctx context.Context, req *indexpb.RemoveIndexRequest) (*commonpb.Status, error) {
+func (m *MockIndexCoord) GetIndexState(ctx context.Context, req *indexpb.GetIndexStateRequest) (*indexpb.GetIndexStateResponse, error) {
 	return nil, nil
 }
 
-func (m *MockIndexCoord) GetIndexStates(ctx context.Context, req *indexpb.GetIndexStatesRequest) (*indexpb.GetIndexStatesResponse, error) {
+func (m *MockIndexCoord) GetSegmentIndexState(ctx context.Context, req *indexpb.GetSegmentIndexStateRequest) (*indexpb.GetSegmentIndexStateResponse, error) {
 	return nil, nil
 }
 
-func (m *MockIndexCoord) GetIndexFilePaths(ctx context.Context, req *indexpb.GetIndexFilePathsRequest) (*indexpb.GetIndexFilePathsResponse, error) {
+func (m *MockIndexCoord) GetIndexInfos(ctx context.Context, req *indexpb.GetIndexInfoRequest) (*indexpb.GetIndexInfoResponse, error) {
+	return nil, nil
+}
+
+func (m *MockIndexCoord) DescribeIndex(ctx context.Context, req *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error) {
+	return nil, nil
+}
+
+func (m *MockIndexCoord) GetIndexBuildProgress(ctx context.Context, req *indexpb.GetIndexBuildProgressRequest) (*indexpb.GetIndexBuildProgressResponse, error) {
+	return nil, nil
+}
+
+func (m *MockIndexCoord) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	return nil, nil
 }
 
@@ -332,7 +354,7 @@ func (m *MockQueryCoord) Register() error {
 	return m.regErr
 }
 
-func (m *MockQueryCoord) UpdateStateCode(code internalpb.StateCode) {
+func (m *MockQueryCoord) UpdateStateCode(code commonpb.StateCode) {
 }
 
 func (m *MockQueryCoord) SetRootCoord(types.RootCoord) error {
@@ -343,12 +365,12 @@ func (m *MockQueryCoord) SetDataCoord(types.DataCoord) error {
 	return nil
 }
 
-func (m *MockQueryCoord) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
-	return &internalpb.ComponentStates{
-		State: &internalpb.ComponentInfo{
+func (m *MockQueryCoord) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+	return &milvuspb.ComponentStates{
+		State: &milvuspb.ComponentInfo{
 			NodeID:    int64(uniquegenerator.GetUniqueIntGeneratorIns().GetInt()),
 			Role:      "MockQueryCoord",
-			StateCode: internalpb.StateCode_Healthy,
+			StateCode: commonpb.StateCode_Healthy,
 			ExtraInfo: nil,
 		},
 		SubcomponentStates: nil,
@@ -412,6 +434,10 @@ func (m *MockQueryCoord) GetShardLeaders(ctx context.Context, req *querypb.GetSh
 	return nil, nil
 }
 
+func (m *MockQueryCoord) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return nil, nil
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 type MockDataCoord struct {
 	MockBase
@@ -446,7 +472,19 @@ func (m *MockDataCoord) Flush(ctx context.Context, req *datapb.FlushRequest) (*d
 	return nil, nil
 }
 
-func (m *MockDataCoord) AddSegment(ctx context.Context, req *datapb.AddSegmentRequest) (*commonpb.Status, error) {
+func (m *MockDataCoord) SaveImportSegment(ctx context.Context, req *datapb.SaveImportSegmentRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockDataCoord) UnsetIsImportingState(ctx context.Context, req *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockDataCoord) MarkSegmentsDropped(ctx context.Context, req *datapb.MarkSegmentsDroppedRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockDataCoord) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -483,6 +521,14 @@ func (m *MockDataCoord) GetRecoveryInfo(ctx context.Context, req *datapb.GetReco
 }
 
 func (m *MockDataCoord) GetFlushedSegments(ctx context.Context, req *datapb.GetFlushedSegmentsRequest) (*datapb.GetFlushedSegmentsResponse, error) {
+	return nil, nil
+}
+
+func (m *MockDataCoord) GetSegmentsByStates(ctx context.Context, req *datapb.GetSegmentsByStatesRequest) (*datapb.GetSegmentsByStatesResponse, error) {
+	return nil, nil
+}
+
+func (m *MockDataCoord) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	return nil, nil
 }
 
@@ -538,6 +584,10 @@ func (m *MockDataCoord) ReleaseSegmentLock(ctx context.Context, req *datapb.Rele
 	return nil, nil
 }
 
+func (m *MockDataCoord) BroadcastAlteredCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 type MockProxy struct {
 	MockBase
@@ -566,10 +616,6 @@ func (m *MockProxy) Register() error {
 }
 
 func (m *MockProxy) InvalidateCollectionMetaCache(ctx context.Context, request *proxypb.InvalidateCollMetaCacheRequest) (*commonpb.Status, error) {
-	return nil, nil
-}
-
-func (m *MockProxy) ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -605,6 +651,10 @@ func (m *MockProxy) ShowCollections(ctx context.Context, request *milvuspb.ShowC
 	return nil, nil
 }
 
+func (m *MockProxy) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
 func (m *MockProxy) CreatePartition(ctx context.Context, request *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
@@ -630,6 +680,10 @@ func (m *MockProxy) GetPartitionStatistics(ctx context.Context, request *milvusp
 }
 
 func (m *MockProxy) ShowPartitions(ctx context.Context, request *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) GetLoadingProgress(ctx context.Context, request *milvuspb.GetLoadingProgressRequest) (*milvuspb.GetLoadingProgressResponse, error) {
 	return nil, nil
 }
 
@@ -717,6 +771,14 @@ func (m *MockProxy) AlterAlias(ctx context.Context, request *milvuspb.AlterAlias
 	return nil, nil
 }
 
+func (m *MockProxy) SetRates(ctx context.Context, request *proxypb.SetRatesRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) GetProxyMetrics(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+	return nil, nil
+}
+
 func (m *MockProxy) SetRootCoordClient(rootCoord types.RootCoord) {
 
 }
@@ -733,7 +795,11 @@ func (m *MockProxy) SetQueryCoordClient(queryCoord types.QueryCoord) {
 
 }
 
-func (m *MockProxy) UpdateStateCode(stateCode internalpb.StateCode) {
+func (m *MockProxy) GetRateLimiter() (types.Limiter, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) UpdateStateCode(stateCode commonpb.StateCode) {
 
 }
 
@@ -753,14 +819,6 @@ func (m *MockProxy) GetCompactionStateWithPlans(ctx context.Context, req *milvus
 }
 
 func (m *MockProxy) GetFlushState(ctx context.Context, req *milvuspb.GetFlushStateRequest) (*milvuspb.GetFlushStateResponse, error) {
-	return nil, nil
-}
-
-func (m *MockProxy) SendSearchResult(ctx context.Context, req *internalpb.SearchResults) (*commonpb.Status, error) {
-	return nil, nil
-}
-
-func (m *MockProxy) SendRetrieveResult(ctx context.Context, req *internalpb.RetrieveResults) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -801,6 +859,38 @@ func (m *MockProxy) DeleteCredential(ctx context.Context, req *milvuspb.DeleteCr
 }
 
 func (m *MockProxy) ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersRequest) (*milvuspb.ListCredUsersResponse, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) DropRole(ctx context.Context, req *milvuspb.DropRoleRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) OperateUserRole(ctx context.Context, req *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) SelectRole(ctx context.Context, req *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) SelectGrant(ctx context.Context, in *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error) {
+	return nil, nil
+}
+
+func (m *MockProxy) RefreshPolicyInfoCache(ctx context.Context, req *proxypb.RefreshPolicyInfoCacheRequest) (*commonpb.Status, error) {
 	return nil, nil
 }
 
@@ -954,11 +1044,6 @@ func Test_NewServer(t *testing.T) {
 		assert.Nil(t, err)
 	})
 
-	t.Run("ReleaseDQLMessageStream", func(t *testing.T) {
-		_, err := server.ReleaseDQLMessageStream(ctx, nil)
-		assert.Nil(t, err)
-	})
-
 	t.Run("CreateCollection", func(t *testing.T) {
 		_, err := server.CreateCollection(ctx, nil)
 		assert.Nil(t, err)
@@ -1031,6 +1116,11 @@ func Test_NewServer(t *testing.T) {
 
 	t.Run("ShowPartitions", func(t *testing.T) {
 		_, err := server.ShowPartitions(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("GetLoadingProgress", func(t *testing.T) {
+		_, err := server.GetLoadingProgress(ctx, nil)
 		assert.Nil(t, err)
 	})
 
@@ -1184,6 +1274,46 @@ func Test_NewServer(t *testing.T) {
 		assert.Nil(t, err)
 	})
 
+	t.Run("CreateRole", func(t *testing.T) {
+		_, err := server.CreateRole(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("DropRole", func(t *testing.T) {
+		_, err := server.DropRole(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("OperateUserRole", func(t *testing.T) {
+		_, err := server.OperateUserRole(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("SelectRole", func(t *testing.T) {
+		_, err := server.SelectRole(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("SelectUser", func(t *testing.T) {
+		_, err := server.SelectUser(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("OperatePrivilege", func(t *testing.T) {
+		_, err := server.OperatePrivilege(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("SelectGrant", func(t *testing.T) {
+		_, err := server.SelectGrant(ctx, nil)
+		assert.Nil(t, err)
+	})
+
+	t.Run("RefreshPrivilegeInfoCache", func(t *testing.T) {
+		_, err := server.RefreshPolicyInfoCache(ctx, nil)
+		assert.Nil(t, err)
+	})
+
 	err = server.Stop()
 	assert.Nil(t, err)
 
@@ -1220,13 +1350,13 @@ func TestServer_Check(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, ret.Status)
 
-	componentInfo := &internalpb.ComponentInfo{
+	componentInfo := &milvuspb.ComponentInfo{
 		NodeID:    0,
 		Role:      "proxy",
-		StateCode: internalpb.StateCode_Abnormal,
+		StateCode: commonpb.StateCode_Abnormal,
 	}
 	status := &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError}
-	componentState := &internalpb.ComponentStates{
+	componentState := &milvuspb.ComponentStates{
 		State:  componentInfo,
 		Status: status,
 	}
@@ -1241,12 +1371,12 @@ func TestServer_Check(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, ret.Status)
 
-	componentInfo.StateCode = internalpb.StateCode_Initializing
+	componentInfo.StateCode = commonpb.StateCode_Initializing
 	ret, err = server.Check(ctx, req)
 	assert.Nil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, ret.Status)
 
-	componentInfo.StateCode = internalpb.StateCode_Healthy
+	componentInfo.StateCode = commonpb.StateCode_Healthy
 	ret, err = server.Check(ctx, req)
 	assert.Nil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_SERVING, ret.Status)
@@ -1282,13 +1412,13 @@ func TestServer_Watch(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, ret.Status)
 
-	componentInfo := &internalpb.ComponentInfo{
+	componentInfo := &milvuspb.ComponentInfo{
 		NodeID:    0,
 		Role:      "proxy",
-		StateCode: internalpb.StateCode_Abnormal,
+		StateCode: commonpb.StateCode_Abnormal,
 	}
 	status := &commonpb.Status{ErrorCode: commonpb.ErrorCode_UnexpectedError}
-	componentState := &internalpb.ComponentStates{
+	componentState := &milvuspb.ComponentStates{
 		State:  componentInfo,
 		Status: status,
 	}
@@ -1305,13 +1435,13 @@ func TestServer_Watch(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, ret.Status)
 
-	componentInfo.StateCode = internalpb.StateCode_Initializing
+	componentInfo.StateCode = commonpb.StateCode_Initializing
 	err = server.Watch(req, watchServer)
 	ret = <-resultChan
 	assert.Nil(t, err)
 	assert.Equal(t, grpc_health_v1.HealthCheckResponse_NOT_SERVING, ret.Status)
 
-	componentInfo.StateCode = internalpb.StateCode_Healthy
+	componentInfo.StateCode = commonpb.StateCode_Healthy
 	err = server.Watch(req, watchServer)
 	ret = <-resultChan
 	assert.Nil(t, err)
@@ -1425,4 +1555,23 @@ func Test_NewServer_TLS_FileNotExisted(t *testing.T) {
 	err = runAndWaitForServerReady(server)
 	assert.NotNil(t, err)
 	server.Stop()
+}
+
+func Test_NewServer_GetVersion(t *testing.T) {
+	req := &milvuspb.GetVersionRequest{}
+	t.Run("test get version failed", func(t *testing.T) {
+		server := getServer(t)
+		resp, err := server.GetVersion(context.TODO(), req)
+		assert.Empty(t, resp.GetVersion())
+		assert.Nil(t, err)
+	})
+
+	t.Run("test get version failed", func(t *testing.T) {
+		server := getServer(t)
+		err := os.Setenv(metricsinfo.GitBuildTagsEnvKey, "v1")
+		assert.NoError(t, err)
+		resp, err := server.GetVersion(context.TODO(), req)
+		assert.Equal(t, "v1", resp.GetVersion())
+		assert.Nil(t, err)
+	})
 }

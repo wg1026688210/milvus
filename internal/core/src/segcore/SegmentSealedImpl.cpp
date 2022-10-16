@@ -39,30 +39,6 @@ SegmentSealedImpl::PreDelete(int64_t size) {
 }
 
 void
-print(const std::map<std::string, std::string>& m) {
-    for (const auto& [k, v] : m) {
-        std::cout << k << ": " << v << std::endl;
-    }
-}
-
-void
-print(const LoadIndexInfo& info) {
-    std::cout << "------------------LoadIndexInfo----------------------" << std::endl;
-    std::cout << "field_id: " << info.field_id << std::endl;
-    std::cout << "field_type: " << info.field_type << std::endl;
-    std::cout << "index_params:" << std::endl;
-    print(info.index_params);
-    std::cout << "------------------LoadIndexInfo----------------------" << std::endl;
-}
-
-void
-print(const LoadFieldDataInfo& info) {
-    std::cout << "------------------LoadFieldDataInfo----------------------" << std::endl;
-    std::cout << "field_id: " << info.field_id << std::endl;
-    std::cout << "------------------LoadFieldDataInfo----------------------" << std::endl;
-}
-
-void
 SegmentSealedImpl::LoadIndex(const LoadIndexInfo& info) {
     // print(info);
     // NOTE: lock only when data is ready to avoid starvation
@@ -82,10 +58,9 @@ SegmentSealedImpl::LoadVecIndex(const LoadIndexInfo& info) {
     auto field_id = FieldId(info.field_id);
     auto& field_meta = schema_->operator[](field_id);
 
-    auto index = std::dynamic_pointer_cast<knowhere::VecIndex>(info.index);
     AssertInfo(info.index_params.count("metric_type"), "Can't get metric_type in index_params");
     auto metric_type = info.index_params.at("metric_type");
-    auto row_count = index->Count();
+    auto row_count = info.index->Count();
     AssertInfo(row_count > 0, "Index count is 0");
 
     std::unique_lock lck(mutex_);
@@ -101,7 +76,7 @@ SegmentSealedImpl::LoadVecIndex(const LoadIndexInfo& info) {
                        std::to_string(row_count_opt_.value()) + ")");
     }
     AssertInfo(!vector_indexings_.is_ready(field_id), "vec index is not ready");
-    vector_indexings_.append_field_indexing(field_id, metric_type, index);
+    vector_indexings_.append_field_indexing(field_id, metric_type, std::move(const_cast<LoadIndexInfo&>(info).index));
 
     set_bit(index_ready_bitset_, field_id, true);
     update_row_count(row_count);
@@ -114,8 +89,7 @@ SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
     auto field_id = FieldId(info.field_id);
     auto& field_meta = schema_->operator[](field_id);
 
-    auto index = std::dynamic_pointer_cast<scalar::IndexBase>(info.index);
-    auto row_count = index->Count();
+    auto row_count = info.index->Count();
     AssertInfo(row_count > 0, "Index count is 0");
 
     std::unique_lock lck(mutex_);
@@ -131,24 +105,26 @@ SegmentSealedImpl::LoadScalarIndex(const LoadIndexInfo& info) {
                        std::to_string(row_count_opt_.value()) + ")");
     }
 
-    scalar_indexings_[field_id] = index;
+    scalar_indexings_[field_id] = std::move(const_cast<LoadIndexInfo&>(info).index);
     // reverse pk from scalar index and set pks to offset
     if (schema_->get_primary_field_id() == field_id) {
         AssertInfo(field_id.get() != -1, "Primary key is -1");
         AssertInfo(insert_record_.empty_pks(), "already exists");
         switch (field_meta.get_data_type()) {
             case DataType::INT64: {
-                auto int64_index = std::dynamic_pointer_cast<scalar::ScalarIndex<int64_t>>(info.index);
+                auto int64_index = dynamic_cast<index::ScalarIndex<int64_t>*>(scalar_indexings_[field_id].get());
                 for (int i = 0; i < row_count; ++i) {
                     insert_record_.insert_pk(int64_index->Reverse_Lookup(i), i);
                 }
+                insert_record_.seal_pks();
                 break;
             }
             case DataType::VARCHAR: {
-                auto string_index = std::dynamic_pointer_cast<scalar::ScalarIndex<std::string>>(info.index);
+                auto string_index = dynamic_cast<index::ScalarIndex<std::string>*>(scalar_indexings_[field_id].get());
                 for (int i = 0; i < row_count; ++i) {
                     insert_record_.insert_pk(string_index->Reverse_Lookup(i), i);
                 }
+                insert_record_.seal_pks();
                 break;
             }
             default: {
@@ -232,6 +208,7 @@ SegmentSealedImpl::LoadFieldData(const LoadFieldDataInfo& info) {
             for (int i = 0; i < size; ++i) {
                 insert_record_.insert_pk(pks[i], i);
             }
+            insert_record_.seal_pks();
         }
 
         set_bit(field_data_ready_bitset_, field_id, true);
@@ -300,7 +277,7 @@ SegmentSealedImpl::chunk_data_impl(FieldId field_id, int64_t chunk_id) const {
     return field_data->get_span_base(0);
 }
 
-const knowhere::Index*
+const index::IndexBase*
 SegmentSealedImpl::chunk_index_impl(FieldId field_id, int64_t chunk_id) const {
     AssertInfo(scalar_indexings_.find(field_id) != scalar_indexings_.end(),
                "Cannot find scalar_indexing with field_id: " + std::to_string(field_id.get()));
@@ -349,8 +326,7 @@ SegmentSealedImpl::mask_with_delete(BitsetType& bitset, int64_t ins_barrier, Tim
 }
 
 void
-SegmentSealedImpl::vector_search(int64_t vec_count,
-                                 query::SearchInfo& search_info,
+SegmentSealedImpl::vector_search(SearchInfo& search_info,
                                  const void* query_data,
                                  int64_t query_count,
                                  Timestamp timestamp,
@@ -364,37 +340,15 @@ SegmentSealedImpl::vector_search(int64_t vec_count,
     if (get_bit(index_ready_bitset_, field_id)) {
         AssertInfo(vector_indexings_.is_ready(field_id),
                    "vector indexes isn't ready for field " + std::to_string(field_id.get()));
-        query::SearchOnSealed(*schema_, vector_indexings_, search_info, query_data, query_count, bitset, output, id_);
-        return;
-    } else if (!get_bit(field_data_ready_bitset_, field_id)) {
-        PanicInfo("Field Data is not loaded");
+        query::SearchOnSealedIndex(*schema_, vector_indexings_, search_info, query_data, query_count, bitset, output);
+    } else {
+        AssertInfo(get_bit(field_data_ready_bitset_, field_id),
+                   "Field Data is not loaded: " + std::to_string(field_id.get()));
+        AssertInfo(row_count_opt_.has_value(), "Can't get row count value");
+        auto row_count = row_count_opt_.value();
+        query::SearchOnSealed(*schema_, insert_record_, search_info, query_data, query_count, row_count, bitset,
+                              output);
     }
-
-    query::dataset::SearchDataset dataset;
-    dataset.query_data = query_data;
-    dataset.num_queries = query_count;
-    // if(field_meta.is)
-    dataset.metric_type = search_info.metric_type_;
-    dataset.topk = search_info.topk_;
-    dataset.dim = field_meta.get_dim();
-    dataset.round_decimal = search_info.round_decimal_;
-
-    AssertInfo(get_bit(field_data_ready_bitset_, field_id),
-               "Can't get bitset element at " + std::to_string(field_id.get()));
-    AssertInfo(row_count_opt_.has_value(), "Can't get row count value");
-    auto row_count = row_count_opt_.value();
-    auto vec_data = insert_record_.get_field_data_base(field_id);
-    AssertInfo(vec_data->num_chunk() == 1, "num chunk not equal to 1 for sealed segment");
-    auto chunk_data = vec_data->get_chunk_data(0);
-    auto sub_qr = query::BruteForceSearch(dataset, chunk_data, row_count, bitset);
-
-    SearchResult results;
-    results.distances_ = std::move(sub_qr.mutable_distances());
-    results.seg_offsets_ = std::move(sub_qr.mutable_seg_offsets());
-    results.unity_topK_ = dataset.topk;
-    results.total_nq_ = dataset.num_queries;
-
-    output = std::move(results);
 }
 
 void

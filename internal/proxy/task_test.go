@@ -27,6 +27,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/milvus-io/milvus/internal/mocks"
+	"github.com/stretchr/testify/mock"
+
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
 
@@ -35,11 +38,11 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 
 	"github.com/milvus-io/milvus/internal/util/distance"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
@@ -321,7 +324,7 @@ func constructSearchRequest(
 		OutputFields:     nil,
 		SearchParams: []*commonpb.KeyValuePair{
 			{
-				Key:   MetricTypeKey,
+				Key:   common.MetricTypeKey,
 				Value: distance.L2,
 			},
 			{
@@ -747,79 +750,6 @@ func TestCreateCollectionTask(t *testing.T) {
 	})
 }
 
-func TestDropCollectionTask(t *testing.T) {
-	Params.InitOnce()
-
-	prefix := "TestDropCollectionTask"
-	dbName := ""
-	collectionName := prefix + funcutil.GenRandomStr()
-	ctx := context.Background()
-
-	task := &dropCollectionTask{
-		Condition: NewTaskCondition(ctx),
-		DropCollectionRequest: &milvuspb.DropCollectionRequest{
-			Base: &commonpb.MsgBase{
-				MsgType:   commonpb.MsgType_DropCollection,
-				MsgID:     100,
-				Timestamp: 100,
-			},
-			DbName:         dbName,
-			CollectionName: collectionName,
-		},
-		ctx:    ctx,
-		result: nil,
-	}
-
-	task.SetID(100)
-	assert.Equal(t, UniqueID(100), task.ID())
-	assert.Equal(t, DropCollectionTaskName, task.Name())
-	assert.Equal(t, commonpb.MsgType_DropCollection, task.Type())
-	task.SetTs(100)
-	assert.Equal(t, Timestamp(100), task.BeginTs())
-	assert.Equal(t, Timestamp(100), task.EndTs())
-
-	err := task.PreExecute(ctx)
-	assert.NoError(t, err)
-	assert.Equal(t, Params.ProxyCfg.GetNodeID(), task.GetBase().GetSourceID())
-
-	task.CollectionName = "#0xc0de"
-	err = task.PreExecute(ctx)
-	assert.Error(t, err)
-	task.CollectionName = collectionName
-
-	cache := newMockCache()
-	chMgr := newMockChannelsMgr()
-	rc := newMockRootCoord()
-
-	globalMetaCache = cache
-	task.chMgr = chMgr
-	task.rootCoord = rc
-
-	cache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return 0, errors.New("mock")
-	})
-	err = task.Execute(ctx)
-	assert.Error(t, err)
-	cache.setGetIDFunc(func(ctx context.Context, collectionName string) (typeutil.UniqueID, error) {
-		return 0, nil
-	})
-
-	rc.DropCollectionFunc = func(ctx context.Context, request *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
-		return nil, errors.New("mock")
-	}
-	err = task.Execute(ctx)
-	assert.Error(t, err)
-	rc.DropCollectionFunc = func(ctx context.Context, request *milvuspb.DropCollectionRequest) (*commonpb.Status, error) {
-		return &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}, nil
-	}
-
-	// normal case
-	err = task.Execute(ctx)
-	assert.NoError(t, err)
-	err = task.PostExecute(ctx)
-	assert.NoError(t, err)
-}
-
 func TestHasCollectionTask(t *testing.T) {
 	Params.InitOnce()
 	rc := NewRootCoordMock()
@@ -830,7 +760,7 @@ func TestHasCollectionTask(t *testing.T) {
 	defer qc.Stop()
 	ctx := context.Background()
 	mgr := newShardClientMgr()
-	InitMetaCache(rc, qc, mgr)
+	InitMetaCache(ctx, rc, qc, mgr)
 	prefix := "TestHasCollectionTask"
 	dbName := ""
 	collectionName := prefix + funcutil.GenRandomStr()
@@ -897,7 +827,7 @@ func TestHasCollectionTask(t *testing.T) {
 	err = task.PreExecute(ctx)
 	assert.NotNil(t, err)
 
-	rc.updateState(internalpb.StateCode_Abnormal)
+	rc.updateState(commonpb.StateCode_Abnormal)
 	task.CollectionName = collectionName
 	err = task.PreExecute(ctx)
 	assert.Nil(t, err)
@@ -916,7 +846,7 @@ func TestDescribeCollectionTask(t *testing.T) {
 	defer qc.Stop()
 	ctx := context.Background()
 	mgr := newShardClientMgr()
-	InitMetaCache(rc, qc, mgr)
+	InitMetaCache(ctx, rc, qc, mgr)
 	prefix := "TestDescribeCollectionTask"
 	dbName := ""
 	collectionName := prefix + funcutil.GenRandomStr()
@@ -979,7 +909,7 @@ func TestDescribeCollectionTask_ShardsNum1(t *testing.T) {
 	defer qc.Stop()
 	ctx := context.Background()
 	mgr := newShardClientMgr()
-	InitMetaCache(rc, qc, mgr)
+	InitMetaCache(ctx, rc, qc, mgr)
 	prefix := "TestDescribeCollectionTask"
 	dbName := ""
 	collectionName := prefix + funcutil.GenRandomStr()
@@ -1031,7 +961,7 @@ func TestDescribeCollectionTask_ShardsNum1(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, task.result.Status.ErrorCode)
 	assert.Equal(t, shardsNum, task.result.ShardsNum)
-
+	assert.Equal(t, collectionName, task.result.GetCollectionName())
 }
 
 func TestDescribeCollectionTask_ShardsNum2(t *testing.T) {
@@ -1044,7 +974,7 @@ func TestDescribeCollectionTask_ShardsNum2(t *testing.T) {
 	defer qc.Stop()
 	ctx := context.Background()
 	mgr := newShardClientMgr()
-	InitMetaCache(rc, qc, mgr)
+	InitMetaCache(ctx, rc, qc, mgr)
 	prefix := "TestDescribeCollectionTask"
 	dbName := ""
 	collectionName := prefix + funcutil.GenRandomStr()
@@ -1097,6 +1027,7 @@ func TestDescribeCollectionTask_ShardsNum2(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, task.result.Status.ErrorCode)
 	assert.Equal(t, common.DefaultShardsNum, task.result.ShardsNum)
+	assert.Equal(t, collectionName, task.result.GetCollectionName())
 	rc.Stop()
 }
 
@@ -1311,7 +1242,7 @@ func TestTask_Int64PrimaryKey(t *testing.T) {
 	ctx := context.Background()
 
 	mgr := newShardClientMgr()
-	err = InitMetaCache(rc, qc, mgr)
+	err = InitMetaCache(ctx, rc, qc, mgr)
 	assert.NoError(t, err)
 
 	shardsNum := int32(2)
@@ -1565,7 +1496,7 @@ func TestTask_VarCharPrimaryKey(t *testing.T) {
 	ctx := context.Background()
 
 	mgr := newShardClientMgr()
-	err = InitMetaCache(rc, qc, mgr)
+	err = InitMetaCache(ctx, rc, qc, mgr)
 	assert.NoError(t, err)
 
 	shardsNum := int32(2)
@@ -1935,7 +1866,7 @@ func Test_createIndexTask_getIndexedField(t *testing.T) {
 	fieldName := "test"
 
 	cit := &createIndexTask{
-		CreateIndexRequest: &milvuspb.CreateIndexRequest{
+		req: &milvuspb.CreateIndexRequest{
 			CollectionName: collectionName,
 			FieldName:      fieldName,
 		},
@@ -2130,7 +2061,7 @@ func Test_createIndexTask_PreExecute(t *testing.T) {
 	fieldName := "test"
 
 	cit := &createIndexTask{
-		CreateIndexRequest: &milvuspb.CreateIndexRequest{
+		req: &milvuspb.CreateIndexRequest{
 			Base: &commonpb.MsgBase{
 				MsgType: commonpb.MsgType_CreateIndex,
 			},
@@ -2165,7 +2096,7 @@ func Test_createIndexTask_PreExecute(t *testing.T) {
 			}, nil
 		})
 		globalMetaCache = cache
-		cit.CreateIndexRequest.ExtraParams = []*commonpb.KeyValuePair{
+		cit.req.ExtraParams = []*commonpb.KeyValuePair{
 			{
 				Key:   "index_type",
 				Value: "IVF_FLAT",
@@ -2190,4 +2121,55 @@ func Test_createIndexTask_PreExecute(t *testing.T) {
 		globalMetaCache = cache
 		assert.Error(t, cit.PreExecute(context.Background()))
 	})
+}
+
+func Test_dropCollectionTask_PreExecute(t *testing.T) {
+	Params.InitOnce()
+	dct := &dropCollectionTask{DropCollectionRequest: &milvuspb.DropCollectionRequest{
+		Base:           &commonpb.MsgBase{},
+		CollectionName: "0xffff", // invalid
+	}}
+	ctx := context.Background()
+	err := dct.PreExecute(ctx)
+	assert.Error(t, err)
+	dct.DropCollectionRequest.CollectionName = "valid"
+	err = dct.PreExecute(ctx)
+	assert.NoError(t, err)
+}
+
+func Test_dropCollectionTask_Execute(t *testing.T) {
+	mockRC := mocks.NewRootCoord(t)
+	mockRC.On("DropCollection",
+		mock.Anything, // context.Context
+		mock.Anything, // *milvuspb.DropCollectionRequest
+	).Return(&commonpb.Status{}, func(ctx context.Context, request *milvuspb.DropCollectionRequest) error {
+		switch request.GetCollectionName() {
+		case "c1":
+			return errors.New("error mock DropCollection")
+		case "c2":
+			return common.NewStatusError(commonpb.ErrorCode_CollectionNotExists, "collection not exist")
+		default:
+			return nil
+		}
+	})
+
+	ctx := context.Background()
+
+	dct := &dropCollectionTask{rootCoord: mockRC, DropCollectionRequest: &milvuspb.DropCollectionRequest{CollectionName: "normal"}}
+	err := dct.Execute(ctx)
+	assert.NoError(t, err)
+
+	dct.DropCollectionRequest.CollectionName = "c1"
+	err = dct.Execute(ctx)
+	assert.Error(t, err)
+
+	dct.DropCollectionRequest.CollectionName = "c2"
+	err = dct.Execute(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, commonpb.ErrorCode_Success, dct.result.GetErrorCode())
+}
+
+func Test_dropCollectionTask_PostExecute(t *testing.T) {
+	dct := &dropCollectionTask{}
+	assert.NoError(t, dct.PostExecute(context.Background()))
 }

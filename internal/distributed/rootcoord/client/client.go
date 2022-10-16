@@ -20,13 +20,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
@@ -123,17 +120,17 @@ func (c *Client) Register() error {
 }
 
 // GetComponentStates TODO: timeout need to be propagated through ctx
-func (c *Client) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
+func (c *Client) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
 	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
 		if !funcutil.CheckCtxValid(ctx) {
 			return nil, ctx.Err()
 		}
-		return client.(rootcoordpb.RootCoordClient).GetComponentStates(ctx, &internalpb.GetComponentStatesRequest{})
+		return client.(rootcoordpb.RootCoordClient).GetComponentStates(ctx, &milvuspb.GetComponentStatesRequest{})
 	})
 	if err != nil || ret == nil {
 		return nil, err
 	}
-	return ret.(*internalpb.ComponentStates), err
+	return ret.(*milvuspb.ComponentStates), err
 }
 
 // GetTimeTickChannel get timetick channel name
@@ -234,6 +231,19 @@ func (c *Client) ShowCollections(ctx context.Context, in *milvuspb.ShowCollectio
 	return ret.(*milvuspb.ShowCollectionsResponse), err
 }
 
+func (c *Client) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
+		if !funcutil.CheckCtxValid(ctx) {
+			return nil, ctx.Err()
+		}
+		return client.(rootcoordpb.RootCoordClient).AlterCollection(ctx, request)
+	})
+	if err != nil || ret == nil {
+		return nil, err
+	}
+	return ret.(*commonpb.Status), err
+}
+
 // CreatePartition create partition
 func (c *Client) CreatePartition(ctx context.Context, in *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
 	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
@@ -290,61 +300,6 @@ func (c *Client) ShowPartitions(ctx context.Context, in *milvuspb.ShowPartitions
 	return ret.(*milvuspb.ShowPartitionsResponse), err
 }
 
-// CreateIndex create index
-func (c *Client) CreateIndex(ctx context.Context, in *milvuspb.CreateIndexRequest) (*commonpb.Status, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).CreateIndex(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*commonpb.Status), err
-}
-
-// DropIndex drop index
-func (c *Client) DropIndex(ctx context.Context, in *milvuspb.DropIndexRequest) (*commonpb.Status, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).DropIndex(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*commonpb.Status), err
-}
-
-// DescribeIndex return index info
-func (c *Client) DescribeIndex(ctx context.Context, in *milvuspb.DescribeIndexRequest) (*milvuspb.DescribeIndexResponse, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).DescribeIndex(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*milvuspb.DescribeIndexResponse), err
-}
-
-func (c *Client) GetIndexState(ctx context.Context, in *milvuspb.GetIndexStateRequest) (*indexpb.GetIndexStatesResponse, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).GetIndexState(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*indexpb.GetIndexStatesResponse), err
-}
-
 // AllocTimestamp global timestamp allocator
 func (c *Client) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestampRequest) (*rootcoordpb.AllocTimestampResponse, error) {
 	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
@@ -387,20 +342,6 @@ func (c *Client) UpdateChannelTimeTick(ctx context.Context, in *internalpb.Chann
 	return ret.(*commonpb.Status), err
 }
 
-// DescribeSegment receiver time tick from proxy service, and put it into this channel
-func (c *Client) DescribeSegment(ctx context.Context, in *milvuspb.DescribeSegmentRequest) (*milvuspb.DescribeSegmentResponse, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).DescribeSegment(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*milvuspb.DescribeSegmentResponse), err
-}
-
 // ShowSegments list all segments
 func (c *Client) ShowSegments(ctx context.Context, in *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error) {
 	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
@@ -413,33 +354,6 @@ func (c *Client) ShowSegments(ctx context.Context, in *milvuspb.ShowSegmentsRequ
 		return nil, err
 	}
 	return ret.(*milvuspb.ShowSegmentsResponse), err
-}
-
-func (c *Client) DescribeSegments(ctx context.Context, in *rootcoordpb.DescribeSegmentsRequest) (*rootcoordpb.DescribeSegmentsResponse, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).DescribeSegments(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*rootcoordpb.DescribeSegmentsResponse), err
-}
-
-// ReleaseDQLMessageStream release DQL msgstream
-func (c *Client) ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).ReleaseDQLMessageStream(ctx, in)
-	})
-	if err != nil || ret == nil {
-		return nil, err
-	}
-	return ret.(*commonpb.Status), err
 }
 
 // InvalidateCollectionMetaCache notifies RootCoord to release the collection cache in Proxies.
@@ -456,18 +370,19 @@ func (c *Client) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.
 	return ret.(*commonpb.Status), err
 }
 
-// SegmentFlushCompleted check whether segment flush is completed
-func (c *Client) SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg) (*commonpb.Status, error) {
+// ShowConfigurations gets specified configurations para of RootCoord
+func (c *Client) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
 		if !funcutil.CheckCtxValid(ctx) {
 			return nil, ctx.Err()
 		}
-		return client.(rootcoordpb.RootCoordClient).SegmentFlushCompleted(ctx, in)
+		return client.(rootcoordpb.RootCoordClient).ShowConfigurations(ctx, req)
 	})
 	if err != nil || ret == nil {
 		return nil, err
 	}
-	return ret.(*commonpb.Status), err
+
+	return ret.(*internalpb.ShowConfigurationsResponse), err
 }
 
 // GetMetrics get metrics
@@ -710,19 +625,6 @@ func (c *Client) SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest
 		return nil, err
 	}
 	return ret.(*milvuspb.SelectUserResponse), err
-}
-
-func (c *Client) SelectResource(ctx context.Context, req *milvuspb.SelectResourceRequest) (*milvuspb.SelectResourceResponse, error) {
-	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
-		if !funcutil.CheckCtxValid(ctx) {
-			return nil, ctx.Err()
-		}
-		return client.(rootcoordpb.RootCoordClient).SelectResource(ctx, req)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return ret.(*milvuspb.SelectResourceResponse), err
 }
 
 func (c *Client) OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {

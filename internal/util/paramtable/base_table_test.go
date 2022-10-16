@@ -12,13 +12,10 @@
 package paramtable
 
 import (
-	"fmt"
 	"os"
+	"strings"
 	"testing"
 
-	"path/filepath"
-
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/grpclog"
 )
@@ -29,6 +26,25 @@ func TestMain(m *testing.M) {
 	baseParams.Init()
 	code := m.Run()
 	os.Exit(code)
+}
+
+func TestBaseTable_GetConfigSubSet(t *testing.T) {
+	prefix := "rootcoord."
+	configs := baseParams.mgr.Configs()
+
+	configsWithPrefix := make(map[string]string)
+	for k, v := range configs {
+		if strings.HasPrefix(k, prefix) {
+			configsWithPrefix[k] = v
+		}
+	}
+
+	subSet := baseParams.GetConfigSubSet(prefix)
+
+	for k := range configs {
+		assert.Equal(t, subSet[k], configs[prefix+k])
+	}
+	assert.Equal(t, len(subSet), len(configsWithPrefix))
 }
 
 func TestBaseTable_SaveAndLoad(t *testing.T) {
@@ -58,61 +74,6 @@ func TestBaseTable_SaveAndLoad(t *testing.T) {
 
 	err6 := baseParams.Remove("float")
 	assert.Nil(t, err6)
-}
-
-func TestBaseTable_LoadFromKVPair(t *testing.T) {
-	var kvPairs []*commonpb.KeyValuePair
-	kvPairs = append(kvPairs, &commonpb.KeyValuePair{Key: "k1", Value: "v1"}, &commonpb.KeyValuePair{Key: "k2", Value: "v2"})
-
-	err := baseParams.LoadFromKVPair(kvPairs)
-	assert.Nil(t, err)
-
-	v, err := baseParams.Load("k1")
-	assert.Nil(t, err)
-	assert.Equal(t, "v1", v)
-
-	v, err = baseParams.Load("k2")
-	assert.Nil(t, err)
-	assert.Equal(t, "v2", v)
-
-	v, err = baseParams.LoadWithPriority([]string{"k2_new"})
-	assert.NotNil(t, err)
-	assert.Equal(t, "", v)
-
-	v, err = baseParams.LoadWithPriority([]string{"k2_new", "k2"})
-	assert.Nil(t, err)
-	assert.Equal(t, "v2", v)
-
-	v = baseParams.LoadWithDefault("k2_new", "v2_new")
-	assert.Equal(t, "v2_new", v)
-
-	v = baseParams.LoadWithDefault2([]string{"k2_new"}, "v2_new")
-	assert.Equal(t, "v2_new", v)
-
-	v = baseParams.LoadWithDefault2([]string{"k2_new", "k2"}, "v2_new")
-	assert.Equal(t, "v2", v)
-}
-
-func TestBaseTable_LoadRange(t *testing.T) {
-	_ = baseParams.Save("xxxaab", "10")
-	_ = baseParams.Save("xxxfghz", "20")
-	_ = baseParams.Save("xxxbcde", "1.1")
-	_ = baseParams.Save("xxxabcd", "testSaveAndLoad")
-	_ = baseParams.Save("xxxzhi", "12")
-
-	keys, values, err := baseParams.LoadRange("xxxa", "xxxg", 10)
-	assert.Nil(t, err)
-	assert.Equal(t, 4, len(keys))
-	assert.Equal(t, "10", values[0])
-	assert.Equal(t, "testSaveAndLoad", values[1])
-	assert.Equal(t, "1.1", values[2])
-	assert.Equal(t, "20", values[3])
-
-	_ = baseParams.Remove("abc")
-	_ = baseParams.Remove("fghz")
-	_ = baseParams.Remove("bcde")
-	_ = baseParams.Remove("abcd")
-	_ = baseParams.Remove("zhi")
 }
 
 func TestBaseTable_Remove(t *testing.T) {
@@ -146,58 +107,50 @@ func TestBaseTable_Get(t *testing.T) {
 	assert.Equal(t, "", v2)
 }
 
-func TestBaseTable_LoadYaml(t *testing.T) {
-	err := baseParams.LoadYaml("milvus.yaml")
-	assert.Nil(t, err)
-	assert.Panics(t, func() { baseParams.LoadYaml("advanced/not_exist.yaml") })
-
-	_, err = baseParams.Load("etcd.endpoints")
-	assert.Nil(t, err)
-	_, err = baseParams.Load("pulsar.port")
-	assert.Nil(t, err)
-}
-
 func TestBaseTable_Pulsar(t *testing.T) {
 	//test PULSAR ADDRESS
-	os.Setenv("PULSAR_ADDRESS", "pulsar://localhost:6650")
-	baseParams.loadPulsarConfig()
+	t.Setenv("PULSAR_ADDRESS", "pulsar://localhost:6650")
+	baseParams.Init()
 
-	address := baseParams.Get("_PulsarAddress")
+	address := baseParams.Get("pulsar.address")
 	assert.Equal(t, "pulsar://localhost:6650", address)
+
+	port := baseParams.Get("pulsar.port")
+	assert.NotEqual(t, "", port)
 }
 
-func TestBaseTable_ConfDir(t *testing.T) {
-	rightConfig := baseParams.configDir
-	// fake dir
-	baseParams.configDir = "./"
+// func TestBaseTable_ConfDir(t *testing.T) {
+// 	rightConfig := baseParams.configDir
+// 	// fake dir
+// 	baseParams.configDir = "./"
 
-	assert.Panics(t, func() { baseParams.loadFromYaml(defaultYaml) })
+// 	assert.Panics(t, func() { baseParams.loadFromYaml(defaultYaml) })
 
-	baseParams.configDir = rightConfig
-	baseParams.loadFromYaml(defaultYaml)
-	baseParams.GlobalInitWithYaml(defaultYaml)
-}
+// 	baseParams.configDir = rightConfig
+// 	baseParams.loadFromYaml(defaultYaml)
+// 	baseParams.GlobalInitWithYaml(defaultYaml)
+// }
 
-func TestBateTable_ConfPath(t *testing.T) {
-	os.Setenv("MILVUSCONF", "test")
-	config := baseParams.initConfPath()
-	assert.Equal(t, config, "test")
+// func TestBateTable_ConfPath(t *testing.T) {
+// 	os.Setenv("MILVUSCONF", "test")
+// 	config := baseParams.initConfPath()
+// 	assert.Equal(t, config, "test")
 
-	os.Unsetenv("MILVUSCONF")
-	dir, _ := os.Getwd()
-	config = baseParams.initConfPath()
-	assert.Equal(t, filepath.Clean(config), filepath.Clean(dir+"/../../../configs/"))
+// 	os.Unsetenv("MILVUSCONF")
+// 	dir, _ := os.Getwd()
+// 	config = baseParams.initConfPath()
+// 	assert.Equal(t, filepath.Clean(config), filepath.Clean(dir+"/../../../configs/"))
 
-	// test use get dir
-	os.Chdir(dir + "/../../../")
-	defer os.Chdir(dir)
-	config = baseParams.initConfPath()
-	assert.Equal(t, filepath.Clean(config), filepath.Clean(dir+"/../../../configs/"))
-}
+// 	// test use get dir
+// 	os.Chdir(dir + "/../../../")
+// 	defer os.Chdir(dir)
+// 	config = baseParams.initConfPath()
+// 	assert.Equal(t, filepath.Clean(config), filepath.Clean(dir+"/../../../configs/"))
+// }
 
 func TestBaseTable_Env(t *testing.T) {
-	os.Setenv("milvus.test", "test")
-	os.Setenv("milvus.test.test2", "test2")
+	t.Setenv("milvus.test", "test")
+	t.Setenv("milvus.test.test2", "test2")
 
 	baseParams.Init()
 	result, _ := baseParams.Load("test")
@@ -206,11 +159,7 @@ func TestBaseTable_Env(t *testing.T) {
 	result, _ = baseParams.Load("test.test2")
 	assert.Equal(t, result, "test2")
 
-	err := os.Setenv("milvus.invalid=xxx", "test")
-	assert.Error(t, err)
-
-	err = os.Setenv("milvus.invalid", "xxx=test")
-	assert.NoError(t, err)
+	t.Setenv("milvus.invalid", "xxx=test")
 
 	baseParams.Init()
 	result, _ = baseParams.Load("invalid")
@@ -313,7 +262,6 @@ func Test_SetLogger(t *testing.T) {
 		baseParams.RoleName = "rootcoord"
 		baseParams.Save("log.file.rootPath", ".")
 		baseParams.SetLogger(UniqueID(-1))
-		fmt.Println(baseParams.Log.File.Filename)
 		assert.Equal(t, "rootcoord.log", baseParams.Log.File.Filename)
 
 		baseParams.RoleName = "datanode"
@@ -334,4 +282,12 @@ func Test_SetLogger(t *testing.T) {
 		assert.Equal(t, true, grpclog.V(1))
 		assert.Equal(t, true, grpclog.V(2))
 	})
+}
+
+func TestNewBaseTableFromYamlOnly(t *testing.T) {
+	var yaml string
+	var gp *BaseTable
+	yaml = "not_exist.yaml"
+	gp = NewBaseTableFromYamlOnly(yaml)
+	assert.Empty(t, gp.Get("key"))
 }

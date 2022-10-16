@@ -17,7 +17,6 @@
 package etcdkv_test
 
 import (
-	"os"
 	"testing"
 	"time"
 
@@ -31,16 +30,15 @@ import (
 )
 
 func TestEmbedEtcd(te *testing.T) {
-	os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
+	te.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
 	param := new(paramtable.ServiceParam)
-	param.Init()
-	param.BaseTable.Save("etcd.use.embed", "true")
-	param.BaseTable.Save("etcd.config.path", "../../../configs/advanced/etcd.yaml")
+	te.Setenv("etcd.use.embed", "true")
+	te.Setenv("etcd.config.path", "../../../configs/advanced/etcd.yaml")
 
 	dir := te.TempDir()
-	param.BaseTable.Save("etcd.data.dir", dir)
+	te.Setenv("etcd.data.dir", dir)
 
-	param.EtcdCfg.LoadCfgToMemory()
+	param.Init()
 
 	te.Run("EtcdKV SaveAndLoad", func(t *testing.T) {
 		rootPath := "/etcd/test/root/saveandload"

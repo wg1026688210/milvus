@@ -19,12 +19,14 @@ package rootcoord
 import (
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/common"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
+
+	"github.com/milvus-io/milvus/api/milvuspb"
 
 	"github.com/milvus-io/milvus/internal/metastore/model"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -75,26 +77,6 @@ func Test_GetFieldSchemaByID(t *testing.T) {
 	assert.NotNil(t, err)
 }
 
-func Test_GetFieldSchemaByIndexID(t *testing.T) {
-	coll := &model.Collection{
-		Fields: []*model.Field{
-			{
-				FieldID: 1,
-			},
-		},
-		FieldIDToIndexID: []common.Int64Tuple{
-			{
-				Key:   1,
-				Value: 2,
-			},
-		},
-	}
-	_, err := GetFieldSchemaByIndexID(coll, 2)
-	assert.Nil(t, err)
-	_, err = GetFieldSchemaByIndexID(coll, 3)
-	assert.NotNil(t, err)
-}
-
 func Test_EncodeMsgPositions(t *testing.T) {
 	mp := &msgstream.MsgPosition{
 		ChannelName: "test",
@@ -129,4 +111,23 @@ func Test_DecodeMsgPositions(t *testing.T) {
 
 	err = DecodeMsgPositions("null", &mpOut)
 	assert.Nil(t, err)
+}
+
+func Test_getTravelTs(t *testing.T) {
+	type args struct {
+		req TimeTravelRequest
+	}
+	tests := []struct {
+		name string
+		args args
+		want Timestamp
+	}{
+		{args: args{req: &milvuspb.HasCollectionRequest{}}, want: typeutil.MaxTimestamp},
+		{args: args{req: &milvuspb.DescribeCollectionRequest{TimeStamp: 100}}, want: 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equalf(t, tt.want, getTravelTs(tt.args.req), "getTravelTs(%v)", tt.args.req)
+		})
+	}
 }

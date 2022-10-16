@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 
@@ -28,13 +29,13 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/metrics"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/milvus-io/milvus/internal/util/retry"
@@ -108,6 +109,8 @@ type BufferData struct {
 	buffer *InsertData
 	size   int64
 	limit  int64
+	tsFrom Timestamp
+	tsTo   Timestamp
 }
 
 // newBufferData needs an input dimension to calculate the limit of this buffer
@@ -133,7 +136,12 @@ func newBufferData(dimension int64) (*BufferData, error) {
 	limit := Params.DataNodeCfg.FlushInsertBufferSize / (dimension * 4)
 
 	//TODO::xige-16 eval vec and string field
-	return &BufferData{&InsertData{Data: make(map[UniqueID]storage.FieldData)}, 0, limit}, nil
+	return &BufferData{
+		buffer: &InsertData{Data: make(map[UniqueID]storage.FieldData)},
+		size:   0,
+		limit:  limit,
+		tsFrom: math.MaxUint64,
+		tsTo:   0}, nil
 }
 
 func (bd *BufferData) effectiveCap() int64 {
@@ -142,6 +150,16 @@ func (bd *BufferData) effectiveCap() int64 {
 
 func (bd *BufferData) updateSize(no int64) {
 	bd.size += no
+}
+
+// updateTimeRange update BufferData tsFrom, tsTo range according to input time range
+func (bd *BufferData) updateTimeRange(tr TimeRange) {
+	if tr.timestampMin < bd.tsFrom {
+		bd.tsFrom = tr.timestampMin
+	}
+	if tr.timestampMax > bd.tsTo {
+		bd.tsTo = tr.timestampMax
+	}
 }
 
 func (ibNode *insertBufferNode) Name() string {
@@ -157,7 +175,10 @@ func (ibNode *insertBufferNode) Close() {
 }
 
 func (ibNode *insertBufferNode) Operate(in []Msg) []Msg {
-	// log.Debug("InsertBufferNode Operating")
+	if in == nil {
+		log.Debug("type assertion failed for flowGraphMsg because it's nil")
+		return []Msg{}
+	}
 
 	if len(in) != 1 {
 		log.Error("Invalid operate message input in insertBufferNode", zap.Int("input length", len(in)))
@@ -166,11 +187,7 @@ func (ibNode *insertBufferNode) Operate(in []Msg) []Msg {
 
 	fgMsg, ok := in[0].(*flowGraphMsg)
 	if !ok {
-		if in[0] == nil {
-			log.Debug("type assertion failed for flowGraphMsg because it's nil")
-		} else {
-			log.Warn("type assertion failed for flowGraphMsg", zap.String("name", reflect.TypeOf(in[0]).Name()))
-		}
+		log.Warn("type assertion failed for flowGraphMsg", zap.String("name", reflect.TypeOf(in[0]).Name()))
 		return []Msg{}
 	}
 
@@ -384,13 +401,21 @@ func (ibNode *insertBufferNode) Operate(in []Msg) []Msg {
 			zap.Bool("dropped", task.dropped),
 			zap.Any("pos", endPositions[0]),
 		)
+
+		segStats, err := ibNode.replica.getSegmentStatslog(task.segmentID)
+		if err != nil {
+			log.Error("failed to get segment stats log", zap.Int64("segmentID", task.segmentID), zap.Error(err))
+			panic(err)
+		}
+
 		err = retry.Do(ibNode.ctx, func() error {
 			return ibNode.flushManager.flushBufferData(task.buffer,
+				segStats,
 				task.segmentID,
 				task.flushed,
 				task.dropped,
 				endPositions[0])
-		}, flowGraphRetryOpt)
+		}, getFlowGraphRetryOpt())
 		if err != nil {
 			metrics.DataNodeFlushBufferCount.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.FailLabel).Inc()
 			metrics.DataNodeFlushBufferCount.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.TotalLabel).Inc()
@@ -450,8 +475,16 @@ func (ibNode *insertBufferNode) updateSegStatesInReplica(insertMsgs []*msgstream
 		partitionID := msg.GetPartitionID()
 
 		if !ibNode.replica.hasSegment(currentSegID, true) {
-			err = ibNode.replica.addNewSegment(currentSegID, collID, partitionID, msg.GetShardName(),
-				startPos, endPos)
+			err = ibNode.replica.addSegment(
+				addSegmentReq{
+					segType:     datapb.SegmentType_New,
+					segID:       currentSegID,
+					collID:      collID,
+					partitionID: partitionID,
+					channelName: msg.GetShardName(),
+					startPos:    startPos,
+					endPos:      endPos,
+				})
 			if err != nil {
 				log.Error("add segment wrong",
 					zap.Int64("segID", currentSegID),
@@ -536,8 +569,17 @@ func (ibNode *insertBufferNode) bufferInsertMsg(msg *msgstream.InsertMsg, endPos
 	// Maybe there are large write zoom if frequent insert requests are met.
 	buffer.buffer = storage.MergeInsertData(buffer.buffer, addedBuffer)
 
+	tsData, err := storage.GetTimestampFromInsertData(addedBuffer)
+	if err != nil {
+		log.Warn("no timestamp field found in insert msg", zap.Error(err))
+		return err
+	}
+
 	// update buffer size
 	buffer.updateSize(int64(msg.NRows()))
+	// update timestamp range
+	buffer.updateTimeRange(ibNode.getTimestampRange(tsData))
+
 	metrics.DataNodeConsumeMsgRowsCount.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID()), metrics.InsertLabel).Add(float64(len(msg.RowData)))
 
 	// store in buffer
@@ -549,10 +591,28 @@ func (ibNode *insertBufferNode) bufferInsertMsg(msg *msgstream.InsertMsg, endPos
 	return nil
 }
 
+func (ibNode *insertBufferNode) getTimestampRange(tsData *storage.Int64FieldData) TimeRange {
+	tr := TimeRange{
+		timestampMin: math.MaxUint64,
+		timestampMax: 0,
+	}
+
+	for _, data := range tsData.Data {
+		if uint64(data) < tr.timestampMin {
+			tr.timestampMin = Timestamp(data)
+		}
+		if uint64(data) > tr.timestampMax {
+			tr.timestampMax = Timestamp(data)
+		}
+	}
+	return tr
+}
+
 // writeHardTimeTick writes timetick once insertBufferNode operates.
 func (ibNode *insertBufferNode) writeHardTimeTick(ts Timestamp, segmentIDs []int64) {
 	ibNode.ttLogger.LogTs(ts)
 	ibNode.ttMerger.bufferTs(ts, segmentIDs)
+	rateCol.updateFlowGraphTt(ibNode.channelName, ts)
 }
 
 func (ibNode *insertBufferNode) getCollectionandPartitionIDbySegID(segmentID UniqueID) (collID, partitionID UniqueID, err error) {

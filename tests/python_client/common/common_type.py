@@ -21,6 +21,8 @@ max_partition_num = 4096  # 256
 default_segment_row_limit = 1000
 default_server_segment_row_limit = 1024 * 512
 default_alias = "default"
+default_user = "root"
+default_password = "Milvus"
 default_bool_field_name = "bool"
 default_int8_field_name = "int8"
 default_int16_field_name = "int16"
@@ -46,6 +48,7 @@ float_field_desc = "float type field"
 float_vec_field_desc = "float vector type field"
 binary_vec_field_desc = "binary vector type field"
 max_dim = 32768
+min_dim = 1
 gracefulTime = 1
 default_nlist = 128
 compact_segment_num_threshold = 4
@@ -54,6 +57,8 @@ compact_retention_duration = 40  # compaction travel time retention range 20s
 max_compaction_interval = 60  # the max time interval (s) from the last compaction
 max_field_num = 256  # Maximum number of fields in a collection
 default_replica_num = 1
+IMAGE_REPOSITORY_MILVUS = "harbor.milvus.io/dockerhub/milvusdb/milvus"
+NAMESPACE_CHAOS_TESTING = "chaos-testing"
 
 Not_Exist = "Not_Exist"
 Connect_Object_Name = True
@@ -63,6 +68,7 @@ value_content = "value_content"
 
 err_code = "err_code"
 err_msg = "err_msg"
+in_cluster_env = "IN_CLUSTER"
 
 """" List of parameters used to pass """
 get_invalid_strs = [
@@ -158,20 +164,16 @@ get_wrong_format_dict = [
 ]
 
 """ Specially defined list """
-all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "HNSW", "ANNOY", "RHNSW_FLAT", "RHNSW_PQ", "RHNSW_SQ",
-                   "BIN_FLAT", "BIN_IVF_FLAT"]
+all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "HNSW", "ANNOY", "BIN_FLAT", "BIN_IVF_FLAT"]
 
 default_index_params = [{"nlist": 128}, {"nlist": 128}, {"nlist": 128}, {"nlist": 128, "m": 16, "nbits": 8},
-                        {"M": 48, "efConstruction": 500}, {"n_trees": 50}, {"M": 48, "efConstruction": 500},
-                        {"M": 48, "efConstruction": 500, "PQM": 8}, {"M": 48, "efConstruction": 500}, {"nlist": 128},
-                        {"nlist": 128}]
+                        {"M": 48, "efConstruction": 500}, {"n_trees": 50}, {"nlist": 128}, {"nlist": 128}]
 
 Handler_type = ["GRPC", "HTTP"]
-index_cpu_not_support = ["IVF_SQ8_HYBRID"]
 binary_support = ["BIN_FLAT", "BIN_IVF_FLAT"]
-delete_support = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_SQ8_HYBRID", "IVF_PQ"]
-ivf = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_SQ8_HYBRID", "IVF_PQ"]
-skip_pq = ["IVF_PQ", "RHNSW_PQ", "RHNSW_SQ"]
+delete_support = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"]
+ivf = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"]
+skip_pq = ["IVF_PQ"]
 binary_metrics = ["JACCARD", "HAMMING", "TANIMOTO", "SUBSTRUCTURE", "SUPERSTRUCTURE"]
 structure_metrics = ["SUBSTRUCTURE", "SUPERSTRUCTURE"]
 
@@ -190,6 +192,8 @@ class CheckTasks:
     check_distance = "check_distance"
     check_delete_compact = "check_delete_compact"
     check_merge_compact = "check_merge_compact"
+    check_role_property = "check_role_property"
+    check_permission_deny = "check_permission_deny"
 
 
 class BulkLoadStates:

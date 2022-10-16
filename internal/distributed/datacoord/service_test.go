@@ -21,46 +21,53 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
+	"github.com/milvus-io/milvus/internal/types"
 	"github.com/stretchr/testify/assert"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 type MockDataCoord struct {
-	states               *internalpb.ComponentStates
-	status               *commonpb.Status
-	err                  error
-	initErr              error
-	startErr             error
-	stopErr              error
-	regErr               error
-	strResp              *milvuspb.StringResponse
-	infoResp             *datapb.GetSegmentInfoResponse
-	flushResp            *datapb.FlushResponse
-	assignResp           *datapb.AssignSegmentIDResponse
-	segStateResp         *datapb.GetSegmentStatesResponse
-	binResp              *datapb.GetInsertBinlogPathsResponse
-	colStatResp          *datapb.GetCollectionStatisticsResponse
-	partStatResp         *datapb.GetPartitionStatisticsResponse
-	recoverResp          *datapb.GetRecoveryInfoResponse
-	flushSegResp         *datapb.GetFlushedSegmentsResponse
-	metricResp           *milvuspb.GetMetricsResponse
-	compactionStateResp  *milvuspb.GetCompactionStateResponse
-	manualCompactionResp *milvuspb.ManualCompactionResponse
-	compactionPlansResp  *milvuspb.GetCompactionPlansResponse
-	watchChannelsResp    *datapb.WatchChannelsResponse
-	getFlushStateResp    *milvuspb.GetFlushStateResponse
-	dropVChanResp        *datapb.DropVirtualChannelResponse
-	setSegmentStateResp  *datapb.SetSegmentStateResponse
-	importResp           *datapb.ImportTaskResponse
-	updateSegStatResp    *commonpb.Status
-	acquireSegLockResp   *commonpb.Status
-	releaseSegLockResp   *commonpb.Status
-	addSegmentResp       *commonpb.Status
+	states                    *milvuspb.ComponentStates
+	status                    *commonpb.Status
+	err                       error
+	initErr                   error
+	startErr                  error
+	stopErr                   error
+	regErr                    error
+	strResp                   *milvuspb.StringResponse
+	infoResp                  *datapb.GetSegmentInfoResponse
+	flushResp                 *datapb.FlushResponse
+	assignResp                *datapb.AssignSegmentIDResponse
+	segStateResp              *datapb.GetSegmentStatesResponse
+	binResp                   *datapb.GetInsertBinlogPathsResponse
+	colStatResp               *datapb.GetCollectionStatisticsResponse
+	partStatResp              *datapb.GetPartitionStatisticsResponse
+	recoverResp               *datapb.GetRecoveryInfoResponse
+	flushSegResp              *datapb.GetFlushedSegmentsResponse
+	SegByStatesResp           *datapb.GetSegmentsByStatesResponse
+	configResp                *internalpb.ShowConfigurationsResponse
+	metricResp                *milvuspb.GetMetricsResponse
+	compactionStateResp       *milvuspb.GetCompactionStateResponse
+	manualCompactionResp      *milvuspb.ManualCompactionResponse
+	compactionPlansResp       *milvuspb.GetCompactionPlansResponse
+	watchChannelsResp         *datapb.WatchChannelsResponse
+	getFlushStateResp         *milvuspb.GetFlushStateResponse
+	dropVChanResp             *datapb.DropVirtualChannelResponse
+	setSegmentStateResp       *datapb.SetSegmentStateResponse
+	importResp                *datapb.ImportTaskResponse
+	updateSegStatResp         *commonpb.Status
+	acquireSegLockResp        *commonpb.Status
+	releaseSegLockResp        *commonpb.Status
+	addSegmentResp            *commonpb.Status
+	unsetIsImportingStateResp *commonpb.Status
+	markSegmentsDroppedResp   *commonpb.Status
+	broadCastResp             *commonpb.Status
 }
 
 func (m *MockDataCoord) Init() error {
@@ -82,7 +89,10 @@ func (m *MockDataCoord) Register() error {
 func (m *MockDataCoord) SetEtcdClient(etcdClient *clientv3.Client) {
 }
 
-func (m *MockDataCoord) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
+func (m *MockDataCoord) SetIndexCoord(indexCoord types.IndexCoord) {
+}
+
+func (m *MockDataCoord) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
 	return m.states, m.err
 }
 
@@ -138,6 +148,14 @@ func (m *MockDataCoord) GetFlushedSegments(ctx context.Context, req *datapb.GetF
 	return m.flushSegResp, m.err
 }
 
+func (m *MockDataCoord) GetSegmentsByStates(ctx context.Context, req *datapb.GetSegmentsByStatesRequest) (*datapb.GetSegmentsByStatesResponse, error) {
+	return m.SegByStatesResp, m.err
+}
+
+func (m *MockDataCoord) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return m.configResp, m.err
+}
+
 func (m *MockDataCoord) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	return m.metricResp, m.err
 }
@@ -190,8 +208,20 @@ func (m *MockDataCoord) ReleaseSegmentLock(ctx context.Context, req *datapb.Rele
 	return m.releaseSegLockResp, m.err
 }
 
-func (m *MockDataCoord) AddSegment(ctx context.Context, req *datapb.AddSegmentRequest) (*commonpb.Status, error) {
+func (m *MockDataCoord) SaveImportSegment(ctx context.Context, req *datapb.SaveImportSegmentRequest) (*commonpb.Status, error) {
 	return m.addSegmentResp, m.err
+}
+
+func (m *MockDataCoord) UnsetIsImportingState(context.Context, *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error) {
+	return m.unsetIsImportingStateResp, m.err
+}
+
+func (m *MockDataCoord) MarkSegmentsDropped(ctx context.Context, req *datapb.MarkSegmentsDroppedRequest) (*commonpb.Status, error) {
+	return m.markSegmentsDroppedResp, m.err
+}
+
+func (m *MockDataCoord) BroadcastAlteredCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return m.broadCastResp, m.err
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -202,13 +232,17 @@ func Test_NewServer(t *testing.T) {
 
 	t.Run("Run", func(t *testing.T) {
 		server.dataCoord = &MockDataCoord{}
+		indexCoord := mocks.NewMockIndexCoord(t)
+		indexCoord.EXPECT().Init().Return(nil)
+		server.indexCoord = indexCoord
+
 		err := server.Run()
 		assert.Nil(t, err)
 	})
 
 	t.Run("GetComponentStates", func(t *testing.T) {
 		server.dataCoord = &MockDataCoord{
-			states: &internalpb.ComponentStates{},
+			states: &milvuspb.ComponentStates{},
 		}
 		states, err := server.GetComponentStates(ctx, nil)
 		assert.Nil(t, err)
@@ -332,6 +366,15 @@ func Test_NewServer(t *testing.T) {
 		assert.NotNil(t, resp)
 	})
 
+	t.Run("ShowConfigurations", func(t *testing.T) {
+		server.dataCoord = &MockDataCoord{
+			configResp: &internalpb.ShowConfigurationsResponse{},
+		}
+		resp, err := server.ShowConfigurations(ctx, nil)
+		assert.Nil(t, err)
+		assert.NotNil(t, resp)
+	})
+
 	t.Run("GetMetrics", func(t *testing.T) {
 		server.dataCoord = &MockDataCoord{
 			metricResp: &milvuspb.GetMetricsResponse{},
@@ -364,15 +407,6 @@ func Test_NewServer(t *testing.T) {
 			dropVChanResp: &datapb.DropVirtualChannelResponse{},
 		}
 		resp, err := server.DropVirtualChannel(ctx, nil)
-		assert.Nil(t, err)
-		assert.NotNil(t, resp)
-	})
-
-	t.Run("CompleteCompaction", func(t *testing.T) {
-		server.dataCoord = &MockDataCoord{
-			status: &commonpb.Status{},
-		}
-		resp, err := server.CompleteCompaction(ctx, nil)
 		assert.Nil(t, err)
 		assert.NotNil(t, resp)
 	})
@@ -457,13 +491,44 @@ func Test_NewServer(t *testing.T) {
 		assert.NotNil(t, resp)
 	})
 
-	t.Run("add segment", func(t *testing.T) {
+	t.Run("save import segment", func(t *testing.T) {
 		server.dataCoord = &MockDataCoord{
 			addSegmentResp: &commonpb.Status{
 				ErrorCode: commonpb.ErrorCode_Success,
 			},
 		}
-		resp, err := server.AddSegment(ctx, nil)
+		resp, err := server.SaveImportSegment(ctx, nil)
+		assert.Nil(t, err)
+		assert.NotNil(t, resp)
+	})
+
+	t.Run("unset isImporting state", func(t *testing.T) {
+		server.dataCoord = &MockDataCoord{
+			unsetIsImportingStateResp: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_Success,
+			},
+		}
+		resp, err := server.UnsetIsImportingState(ctx, nil)
+		assert.Nil(t, err)
+		assert.NotNil(t, resp)
+	})
+
+	t.Run("mark segments dropped", func(t *testing.T) {
+		server.dataCoord = &MockDataCoord{
+			markSegmentsDroppedResp: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_Success,
+			},
+		}
+		resp, err := server.MarkSegmentsDropped(ctx, nil)
+		assert.Nil(t, err)
+		assert.NotNil(t, resp)
+	})
+
+	t.Run("broadcast altered collection", func(t *testing.T) {
+		server.dataCoord = &MockDataCoord{
+			broadCastResp: &commonpb.Status{},
+		}
+		resp, err := server.BroadcastAlteredCollection(ctx, nil)
 		assert.Nil(t, err)
 		assert.NotNil(t, resp)
 	})

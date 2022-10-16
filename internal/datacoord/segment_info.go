@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 )
@@ -38,19 +38,22 @@ type SegmentInfo struct {
 	lastFlushTime time.Time
 	isCompacting  bool
 	// a cache to avoid calculate twice
-	size int64
+	size            int64
+	lastWrittenTime time.Time
 }
 
 // NewSegmentInfo create `SegmentInfo` wrapper from `datapb.SegmentInfo`
-// assign current rows to 0 and pre-allocate `allocations` slice
+// assign current rows to last checkpoint and pre-allocate `allocations` slice
 // Note that the allocation information is not preserved,
 // the worst case scenario is to have a segment with twice size we expects
 func NewSegmentInfo(info *datapb.SegmentInfo) *SegmentInfo {
 	return &SegmentInfo{
 		SegmentInfo:   info,
-		currRows:      0,
+		currRows:      info.GetNumOfRows(),
 		allocations:   make([]*Allocation, 0, 16),
 		lastFlushTime: time.Now().Add(-1 * flushInterval),
+		// A growing segment from recovery can be also considered idle.
+		lastWrittenTime: getZeroTime(),
 	}
 }
 
@@ -103,6 +106,13 @@ func (s *SegmentsInfo) SetRowCount(segmentID UniqueID, rowCount int64) {
 func (s *SegmentsInfo) SetState(segmentID UniqueID, state commonpb.SegmentState) {
 	if segment, ok := s.segments[segmentID]; ok {
 		s.segments[segmentID] = segment.Clone(SetState(state))
+	}
+}
+
+// SetIsImporting sets the import status for a segment.
+func (s *SegmentsInfo) SetIsImporting(segmentID UniqueID, isImporting bool) {
+	if segment, ok := s.segments[segmentID]; ok {
+		s.segments[segmentID] = segment.Clone(SetIsImporting(isImporting))
 	}
 }
 
@@ -176,7 +186,7 @@ func (s *SegmentsInfo) AddSegmentBinlogs(segmentID UniqueID, field2Binlogs map[U
 	}
 }
 
-// SetIsCompacting sets compactino status for segment
+// SetIsCompacting sets compaction status for segment
 func (s *SegmentsInfo) SetIsCompacting(segmentID UniqueID, isCompacting bool) {
 	if segment, ok := s.segments[segmentID]; ok {
 		s.segments[segmentID] = segment.ShadowClone(SetIsCompacting(isCompacting))
@@ -193,6 +203,7 @@ func (s *SegmentInfo) Clone(opts ...SegmentInfoOption) *SegmentInfo {
 		lastFlushTime: s.lastFlushTime,
 		isCompacting:  s.isCompacting,
 		//cannot copy size, since binlog may be changed
+		lastWrittenTime: s.lastWrittenTime,
 	}
 	for _, opt := range opts {
 		opt(cloned)
@@ -203,12 +214,13 @@ func (s *SegmentInfo) Clone(opts ...SegmentInfoOption) *SegmentInfo {
 // ShadowClone shadow clone the segment and return a new instance
 func (s *SegmentInfo) ShadowClone(opts ...SegmentInfoOption) *SegmentInfo {
 	cloned := &SegmentInfo{
-		SegmentInfo:   s.SegmentInfo,
-		currRows:      s.currRows,
-		allocations:   s.allocations,
-		lastFlushTime: s.lastFlushTime,
-		isCompacting:  s.isCompacting,
-		size:          s.size,
+		SegmentInfo:     s.SegmentInfo,
+		currRows:        s.currRows,
+		allocations:     s.allocations,
+		lastFlushTime:   s.lastFlushTime,
+		isCompacting:    s.isCompacting,
+		size:            s.size,
+		lastWrittenTime: s.lastWrittenTime,
 	}
 
 	for _, opt := range opts {
@@ -238,6 +250,13 @@ func SetExpireTime(expireTs Timestamp) SegmentInfoOption {
 func SetState(state commonpb.SegmentState) SegmentInfoOption {
 	return func(segment *SegmentInfo) {
 		segment.State = state
+	}
+}
+
+// SetIsImporting is the option to set import state for segment info.
+func SetIsImporting(isImporting bool) SegmentInfoOption {
+	return func(segment *SegmentInfo) {
+		segment.IsImporting = isImporting
 	}
 }
 
@@ -274,6 +293,7 @@ func AddAllocation(allocation *Allocation) SegmentInfoOption {
 func SetCurrentRows(rows int64) SegmentInfoOption {
 	return func(segment *SegmentInfo) {
 		segment.currRows = rows
+		segment.lastWrittenTime = time.Now()
 	}
 }
 

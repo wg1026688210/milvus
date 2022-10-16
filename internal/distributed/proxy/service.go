@@ -25,46 +25,45 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/credentials"
-
-	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
-
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 
 	"github.com/gin-gonic/gin"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
-	"github.com/opentracing/opentracing-go"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/keepalive"
-
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	dcc "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
 	icc "github.com/milvus-io/milvus/internal/distributed/indexcoord/client"
 	"github.com/milvus-io/milvus/internal/distributed/proxy/httpserver"
 	qcc "github.com/milvus-io/milvus/internal/distributed/querycoord/client"
 	rcc "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/trace"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/opentracing/opentracing-go"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 var Params paramtable.GrpcServerConfig
@@ -161,6 +160,14 @@ func (s *Server) startExternalGrpc(grpcPort int, errChan chan error) {
 	}
 	log.Debug("Proxy server already listen on tcp", zap.Int("port", grpcPort))
 
+	limiter, err := s.proxy.GetRateLimiter()
+	if err != nil {
+		log.Error("Get proxy rate limiter failed", zap.Int("port", grpcPort), zap.Error(err))
+		errChan <- err
+		return
+	}
+	log.Debug("Get proxy rate limiter done", zap.Int("port", grpcPort))
+
 	opts := trace.GetInterceptorOpts()
 	grpcOpts := []grpc.ServerOption{
 		grpc.KeepaliveEnforcementPolicy(kaep),
@@ -170,10 +177,11 @@ func (s *Server) startExternalGrpc(grpcPort int, errChan chan error) {
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
 			ot.UnaryServerInterceptor(opts...),
 			grpc_auth.UnaryServerInterceptor(proxy.AuthenticationInterceptor),
+			proxy.UnaryServerHookInterceptor(),
+			proxy.UnaryServerInterceptor(proxy.PrivilegeInterceptor),
+			logutil.UnaryTraceLoggerInterceptor,
+			proxy.RateLimitInterceptor(limiter),
 		)),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			ot.StreamServerInterceptor(opts...),
-			grpc_auth.StreamServerInterceptor(proxy.AuthenticationInterceptor))),
 	}
 
 	if Params.TLSMode == 1 {
@@ -259,11 +267,7 @@ func (s *Server) startInternalGrpc(grpcPort int, errChan chan error) {
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
 			ot.UnaryServerInterceptor(opts...),
-			grpc_auth.UnaryServerInterceptor(proxy.AuthenticationInterceptor),
-		)),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			ot.StreamServerInterceptor(opts...),
-			grpc_auth.StreamServerInterceptor(proxy.AuthenticationInterceptor),
+			logutil.UnaryTraceLoggerInterceptor,
 		)),
 	)
 	proxypb.RegisterProxyServer(s.grpcInternalServer, s)
@@ -468,8 +472,8 @@ func (s *Server) init() error {
 	s.proxy.SetQueryCoordClient(s.queryCoordClient)
 	log.Debug("set QueryCoord client for Proxy done")
 
-	log.Debug(fmt.Sprintf("update Proxy's state to %s", internalpb.StateCode_Initializing.String()))
-	s.proxy.UpdateStateCode(internalpb.StateCode_Initializing)
+	log.Debug(fmt.Sprintf("update Proxy's state to %s", commonpb.StateCode_Initializing.String()))
+	s.proxy.UpdateStateCode(commonpb.StateCode_Initializing)
 
 	log.Debug("init Proxy")
 	if err := s.proxy.Init(); err != nil {
@@ -538,7 +542,7 @@ func (s *Server) Stop() error {
 }
 
 // GetComponentStates get the component states
-func (s *Server) GetComponentStates(ctx context.Context, request *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, request *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return s.proxy.GetComponentStates(ctx)
 }
 
@@ -550,11 +554,6 @@ func (s *Server) GetStatisticsChannel(ctx context.Context, request *internalpb.G
 // InvalidateCollectionMetaCache notifies Proxy to clear all the meta cache of specific collection.
 func (s *Server) InvalidateCollectionMetaCache(ctx context.Context, request *proxypb.InvalidateCollMetaCacheRequest) (*commonpb.Status, error) {
 	return s.proxy.InvalidateCollectionMetaCache(ctx, request)
-}
-
-// ReleaseDQLMessageStream notifies Proxy to release and close the search message stream of specific collection.
-func (s *Server) ReleaseDQLMessageStream(ctx context.Context, request *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error) {
-	return s.proxy.ReleaseDQLMessageStream(ctx, request)
 }
 
 // CreateCollection notifies Proxy to create a collection
@@ -596,6 +595,10 @@ func (s *Server) ShowCollections(ctx context.Context, request *milvuspb.ShowColl
 	return s.proxy.ShowCollections(ctx, request)
 }
 
+func (s *Server) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return s.proxy.AlterCollection(ctx, request)
+}
+
 // CreatePartition notifies Proxy to create a partition
 func (s *Server) CreatePartition(ctx context.Context, request *milvuspb.CreatePartitionRequest) (*commonpb.Status, error) {
 	return s.proxy.CreatePartition(ctx, request)
@@ -631,6 +634,10 @@ func (s *Server) ShowPartitions(ctx context.Context, request *milvuspb.ShowParti
 	return s.proxy.ShowPartitions(ctx, request)
 }
 
+func (s *Server) GetLoadingProgress(ctx context.Context, request *milvuspb.GetLoadingProgressRequest) (*milvuspb.GetLoadingProgressResponse, error) {
+	return s.proxy.GetLoadingProgress(ctx, request)
+}
+
 // CreateIndex notifies Proxy to create index
 func (s *Server) CreateIndex(ctx context.Context, request *milvuspb.CreateIndexRequest) (*commonpb.Status, error) {
 	return s.proxy.CreateIndex(ctx, request)
@@ -648,11 +655,13 @@ func (s *Server) DescribeIndex(ctx context.Context, request *milvuspb.DescribeIn
 
 // GetIndexBuildProgress gets index build progress with filed_name and index_name.
 // IndexRows is the num of indexed rows. And TotalRows is the total number of segment rows.
+// Deprecated: use DescribeIndex instead
 func (s *Server) GetIndexBuildProgress(ctx context.Context, request *milvuspb.GetIndexBuildProgressRequest) (*milvuspb.GetIndexBuildProgressResponse, error) {
 	return s.proxy.GetIndexBuildProgress(ctx, request)
 }
 
-// GetIndexStates gets the index states from proxy.
+// GetIndexState gets the index states from proxy.
+// Deprecated: use DescribeIndex instead
 func (s *Server) GetIndexState(ctx context.Context, request *milvuspb.GetIndexStateRequest) (*milvuspb.GetIndexStateResponse, error) {
 	return s.proxy.GetIndexState(ctx, request)
 }
@@ -747,14 +756,6 @@ func (s *Server) GetFlushState(ctx context.Context, req *milvuspb.GetFlushStateR
 	return s.proxy.GetFlushState(ctx, req)
 }
 
-func (s *Server) SendSearchResult(ctx context.Context, results *internalpb.SearchResults) (*commonpb.Status, error) {
-	return s.proxy.SendSearchResult(ctx, results)
-}
-
-func (s *Server) SendRetrieveResult(ctx context.Context, results *internalpb.RetrieveResults) (*commonpb.Status, error) {
-	return s.proxy.SendRetrieveResult(ctx, results)
-}
-
 func (s *Server) Import(ctx context.Context, req *milvuspb.ImportRequest) (*milvuspb.ImportResponse, error) {
 	return s.proxy.Import(ctx, req)
 }
@@ -783,7 +784,7 @@ func (s *Server) Check(ctx context.Context, req *grpc_health_v1.HealthCheckReque
 	if state.Status.ErrorCode != commonpb.ErrorCode_Success {
 		return ret, nil
 	}
-	if state.State.StateCode != internalpb.StateCode_Healthy {
+	if state.State.StateCode != commonpb.StateCode_Healthy {
 		return ret, nil
 	}
 	ret.Status = grpc_health_v1.HealthCheckResponse_SERVING
@@ -802,7 +803,7 @@ func (s *Server) Watch(req *grpc_health_v1.HealthCheckRequest, server grpc_healt
 	if state.Status.ErrorCode != commonpb.ErrorCode_Success {
 		return server.Send(ret)
 	}
-	if state.State.StateCode != internalpb.StateCode_Healthy {
+	if state.State.StateCode != commonpb.StateCode_Healthy {
 		return server.Send(ret)
 	}
 	ret.Status = grpc_health_v1.HealthCheckResponse_SERVING
@@ -833,47 +834,51 @@ func (s *Server) ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersR
 	return s.proxy.ListCredUsers(ctx, req)
 }
 
-func (s *Server) CreateRole(ctx context.Context, request *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
+	return s.proxy.CreateRole(ctx, req)
 }
 
-func (s *Server) DropRole(ctx context.Context, request *milvuspb.DropRoleRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) DropRole(ctx context.Context, req *milvuspb.DropRoleRequest) (*commonpb.Status, error) {
+	return s.proxy.DropRole(ctx, req)
 }
 
-func (s *Server) OperateUserRole(ctx context.Context, request *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) OperateUserRole(ctx context.Context, req *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error) {
+	return s.proxy.OperateUserRole(ctx, req)
 }
 
-func (s *Server) SelectRole(ctx context.Context, request *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) SelectRole(ctx context.Context, req *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error) {
+	return s.proxy.SelectRole(ctx, req)
 }
 
-func (s *Server) SelectUser(ctx context.Context, request *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error) {
+	return s.proxy.SelectUser(ctx, req)
 }
 
-func (s *Server) SelectResource(ctx context.Context, request *milvuspb.SelectResourceRequest) (*milvuspb.SelectResourceResponse, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
+	return s.proxy.OperatePrivilege(ctx, req)
 }
 
-func (s *Server) OperatePrivilege(ctx context.Context, request *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) SelectGrant(ctx context.Context, req *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error) {
+	return s.proxy.SelectGrant(ctx, req)
 }
 
-func (s *Server) SelectGrant(ctx context.Context, request *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) RefreshPolicyInfoCache(ctx context.Context, req *proxypb.RefreshPolicyInfoCacheRequest) (*commonpb.Status, error) {
+	return s.proxy.RefreshPolicyInfoCache(ctx, req)
 }
 
-func (s *Server) RefreshPolicyInfoCache(ctx context.Context, request *proxypb.RefreshPolicyInfoCacheRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+// SetRates notifies Proxy to limit rates of requests.
+func (s *Server) SetRates(ctx context.Context, request *proxypb.SetRatesRequest) (*commonpb.Status, error) {
+	return s.proxy.SetRates(ctx, request)
+}
+
+// GetProxyMetrics gets the metrics of proxy.
+func (s *Server) GetProxyMetrics(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+	return s.proxy.GetProxyMetrics(ctx, request)
+}
+
+func (s *Server) GetVersion(ctx context.Context, request *milvuspb.GetVersionRequest) (*milvuspb.GetVersionResponse, error) {
+	buildTags := os.Getenv(metricsinfo.GitBuildTagsEnvKey)
+	return &milvuspb.GetVersionResponse{
+		Version: buildTags,
+	}, nil
 }

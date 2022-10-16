@@ -19,14 +19,18 @@ package datacoord
 import (
 	"context"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/minio/minio-go/v7"
+	"github.com/samber/lo"
 	"go.uber.org/zap"
 )
 
@@ -39,21 +43,21 @@ const (
 
 // GcOption garbage collection options
 type GcOption struct {
-	cli              *minio.Client // OSS client
-	enabled          bool          // enable switch
-	checkInterval    time.Duration // each interval
-	missingTolerance time.Duration // key missing in meta tolerace time
-	dropTolerance    time.Duration // dropped segment related key tolerance time
-	bucketName       string
-	rootPath         string
+	cli              storage.ChunkManager // client
+	enabled          bool                 // enable switch
+	checkInterval    time.Duration        // each interval
+	missingTolerance time.Duration        // key missing in meta tolerance time
+	dropTolerance    time.Duration        // dropped segment related key tolerance time
 }
 
 // garbageCollector handles garbage files in object storage
 // which could be dropped collection remanent or data node failure traces
 type garbageCollector struct {
-	option   GcOption
-	meta     *meta
-	segRefer *SegmentReferenceManager
+	option     GcOption
+	meta       *meta
+	handler    Handler
+	segRefer   *SegmentReferenceManager
+	indexCoord types.IndexCoord
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -62,14 +66,16 @@ type garbageCollector struct {
 }
 
 // newGarbageCollector create garbage collector with meta and option
-func newGarbageCollector(meta *meta, segRefer *SegmentReferenceManager, opt GcOption) *garbageCollector {
+func newGarbageCollector(meta *meta, handler Handler, segRefer *SegmentReferenceManager, indexCoord types.IndexCoord, opt GcOption) *garbageCollector {
 	log.Info("GC with option", zap.Bool("enabled", opt.enabled), zap.Duration("interval", opt.checkInterval),
 		zap.Duration("missingTolerance", opt.missingTolerance), zap.Duration("dropTolerance", opt.dropTolerance))
 	return &garbageCollector{
-		meta:     meta,
-		segRefer: segRefer,
-		option:   opt,
-		closeCh:  make(chan struct{}),
+		meta:       meta,
+		handler:    handler,
+		segRefer:   segRefer,
+		indexCoord: indexCoord,
+		option:     opt,
+		closeCh:    make(chan struct{}),
 	}
 }
 
@@ -113,69 +119,129 @@ func (gc *garbageCollector) close() {
 // scan load meta file info and compares OSS keys
 // if missing found, performs gc cleanup
 func (gc *garbageCollector) scan() {
-	var total, valid, missing int
-	segmentFiles := gc.meta.ListSegmentFiles()
-	filesMap := make(map[string]struct{})
-	for _, k := range segmentFiles {
-		filesMap[k.GetLogPath()] = struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		total   = 0
+		valid   = 0
+		missing = 0
+
+		segmentMap = typeutil.NewUniqueSet()
+		filesMap   = typeutil.NewSet[string]()
+	)
+	segments := gc.meta.GetAllSegmentsUnsafe()
+	for _, segment := range segments {
+		segmentMap.Insert(segment.GetID())
+		for _, log := range getLogs(segment) {
+			filesMap.Insert(log.GetLogPath())
+		}
 	}
 
 	// walk only data cluster related prefixes
 	prefixes := make([]string, 0, 3)
-	prefixes = append(prefixes, path.Join(gc.option.rootPath, insertLogPrefix))
-	prefixes = append(prefixes, path.Join(gc.option.rootPath, statsLogPrefix))
-	prefixes = append(prefixes, path.Join(gc.option.rootPath, deltaLogPrefix))
+	prefixes = append(prefixes, path.Join(gc.option.cli.RootPath(), insertLogPrefix))
+	prefixes = append(prefixes, path.Join(gc.option.cli.RootPath(), statsLogPrefix))
+	prefixes = append(prefixes, path.Join(gc.option.cli.RootPath(), deltaLogPrefix))
 	var removedKeys []string
 
 	for _, prefix := range prefixes {
-		for info := range gc.option.cli.ListObjects(context.TODO(), gc.option.bucketName, minio.ListObjectsOptions{
-			Prefix:    prefix,
-			Recursive: true,
-		}) {
+		infoKeys, modTimes, err := gc.option.cli.ListWithPrefix(ctx, prefix, true)
+		if err != nil {
+			log.Error("failed to list files with prefix",
+				zap.String("prefix", prefix),
+				zap.String("error", err.Error()),
+			)
+		}
+		for i, infoKey := range infoKeys {
 			total++
-			_, has := filesMap[info.Key]
+			_, has := filesMap[infoKey]
 			if has {
 				valid++
 				continue
 			}
 
-			segmentID, err := storage.ParseSegmentIDByBinlog(info.Key)
+			segmentID, err := storage.ParseSegmentIDByBinlog(gc.option.cli.RootPath(), infoKey)
 			if err != nil {
-				log.Error("parse segment id error", zap.String("infoKey", info.Key), zap.Error(err))
+				missing++
+				log.Warn("parse segment id error",
+					zap.String("infoKey", infoKey),
+					zap.Error(err))
 				continue
 			}
+
 			if gc.segRefer.HasSegmentLock(segmentID) {
 				valid++
 				continue
 			}
-			missing++
+
+			if strings.Contains(prefix, statsLogPrefix) &&
+				segmentMap.Contain(segmentID) {
+				valid++
+				continue
+			}
+
 			// not found in meta, check last modified time exceeds tolerance duration
-			if time.Since(info.LastModified) > gc.option.missingTolerance {
+			if time.Since(modTimes[i]) > gc.option.missingTolerance {
 				// ignore error since it could be cleaned up next time
-				removedKeys = append(removedKeys, info.Key)
-				err = gc.option.cli.RemoveObject(context.TODO(), gc.option.bucketName, info.Key, minio.RemoveObjectOptions{})
+				removedKeys = append(removedKeys, infoKey)
+				err = gc.option.cli.Remove(ctx, infoKey)
 				if err != nil {
-					log.Error("failed to remove object", zap.String("infoKey", info.Key), zap.Error(err))
+					missing++
+					log.Error("failed to remove object",
+						zap.String("infoKey", infoKey),
+						zap.Error(err))
 				}
 			}
 		}
 	}
-	log.Info("scan file to do garbage collection", zap.Int("total", total),
-		zap.Int("valid", valid), zap.Int("missing", missing), zap.Strings("removed keys", removedKeys))
+	log.Info("scan file to do garbage collection",
+		zap.Int("total", total),
+		zap.Int("valid", valid),
+		zap.Int("missing", missing),
+		zap.Strings("removedKeys", removedKeys))
 }
 
 func (gc *garbageCollector) clearEtcd() {
-	drops := gc.meta.SelectSegments(func(segment *SegmentInfo) bool {
-		return segment.GetState() == commonpb.SegmentState_Dropped && !gc.segRefer.HasSegmentLock(segment.ID)
-	})
-
-	for _, sinfo := range drops {
-		if !gc.isExpire(sinfo.GetDroppedAt()) {
+	all := gc.meta.SelectSegments(func(si *SegmentInfo) bool { return true })
+	drops := make(map[int64]*SegmentInfo, 0)
+	compactTo := make(map[int64]*SegmentInfo)
+	for _, segment := range all {
+		if segment.GetState() == commonpb.SegmentState_Dropped && !gc.segRefer.HasSegmentLock(segment.ID) {
+			drops[segment.GetID()] = segment
 			continue
 		}
-		logs := getLogs(sinfo)
+		for _, from := range segment.GetCompactionFrom() {
+			compactTo[from] = segment
+		}
+	}
+
+	droppedCompactTo := make(map[*SegmentInfo]struct{})
+	for id := range drops {
+		if to, ok := compactTo[id]; ok {
+			droppedCompactTo[to] = struct{}{}
+		}
+	}
+	indexedSegments := FilterInIndexedSegments(gc.handler, gc.indexCoord, lo.Keys(droppedCompactTo)...)
+	indexedSet := make(typeutil.UniqueSet)
+	for _, segment := range indexedSegments {
+		indexedSet.Insert(segment.GetID())
+	}
+
+	for _, segment := range drops {
+		if !gc.isExpire(segment.GetDroppedAt()) {
+			continue
+		}
+		// For compact A, B -> C, don't GC A or B if C is not indexed,
+		// guarantee replacing A, B with C won't downgrade performance
+		if to, ok := compactTo[segment.GetID()]; ok && !indexedSet.Contain(to.GetID()) {
+			continue
+		}
+		logs := getLogs(segment)
+		log.Info("GC segment",
+			zap.Int64("segmentID", segment.GetID()))
 		if gc.removeLogs(logs) {
-			_ = gc.meta.DropSegment(sinfo.GetID())
+			_ = gc.meta.DropSegment(segment.GetID())
 		}
 	}
 }
@@ -202,12 +268,21 @@ func getLogs(sinfo *SegmentInfo) []*datapb.Binlog {
 }
 
 func (gc *garbageCollector) removeLogs(logs []*datapb.Binlog) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	delFlag := true
 	for _, l := range logs {
-		err := gc.option.cli.RemoveObject(context.TODO(), gc.option.bucketName, l.GetLogPath(), minio.RemoveObjectOptions{})
-		errResp := minio.ToErrorResponse(err)
-		if errResp.Code != "" && errResp.Code != "NoSuchKey" {
-			delFlag = false
+		err := gc.option.cli.Remove(ctx, l.GetLogPath())
+		if err != nil {
+			switch err.(type) {
+			case minio.ErrorResponse:
+				errResp := minio.ToErrorResponse(err)
+				if errResp.Code != "" && errResp.Code != "NoSuchKey" {
+					delFlag = false
+				}
+			default:
+				delFlag = false
+			}
 		}
 	}
 	return delFlag

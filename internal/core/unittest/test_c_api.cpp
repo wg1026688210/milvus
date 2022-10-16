@@ -29,16 +29,22 @@
 #include "segcore/reduce_c.h"
 #include "segcore/Reduce.h"
 #include "test_utils/DataGen.h"
+#include "index/IndexFactory.h"
+#include "test_utils/indexbuilder_test_utils.h"
 
 namespace chrono = std::chrono;
 
 using namespace milvus;
 using namespace milvus::segcore;
+using namespace milvus::index;
 using namespace knowhere;
+using milvus::index::VectorIndex;
+using milvus::segcore::LoadIndexInfo;
 
 namespace {
-const int DIM = 16;
+// const int DIM = 16;
 const int64_t ROW_COUNT = 100 * 1000;
+const CStorageConfig c_storage_config = get_default_cstorage_config();
 
 const char*
 get_default_schema_config() {
@@ -110,7 +116,6 @@ generate_max_float_query_data(int all_nq, int max_float_nq) {
     }
     auto blob = raw_group.SerializeAsString();
     return blob;
-
 }
 
 std::string
@@ -172,19 +177,38 @@ generate_collection_schema(std::string metric_type, int dim, bool is_binary) {
     return schema_string;
 }
 
-VecIndexPtr
+// VecIndexPtr
+// generate_index(
+//    void* raw_data, knowhere::Config conf, int64_t dim, int64_t topK, int64_t N, knowhere::IndexType index_type) {
+//    auto indexing = knowhere::VecIndexFactory::GetInstance().CreateVecIndex(index_type,
+//    knowhere::IndexMode::MODE_CPU);
+//
+//    auto database = knowhere::GenDataset(N, dim, raw_data);
+//    indexing->Train(database, conf);
+//    indexing->AddWithoutIds(database, conf);
+//    EXPECT_EQ(indexing->Count(), N);
+//    EXPECT_EQ(indexing->Dim(), dim);
+//
+//    EXPECT_EQ(indexing->Count(), N);
+//    EXPECT_EQ(indexing->Dim(), dim);
+//    return indexing;
+//}
+//}  // namespace
+
+IndexBasePtr
 generate_index(
-    void* raw_data, knowhere::Config conf, int64_t dim, int64_t topK, int64_t N, knowhere::IndexType index_type) {
-    auto indexing = knowhere::VecIndexFactory::GetInstance().CreateVecIndex(index_type, knowhere::IndexMode::MODE_CPU);
+    void* raw_data, DataType field_type, MetricType metric_type, IndexType index_type, int64_t dim, int64_t N) {
+    CreateIndexInfo create_index_info{field_type, index_type, metric_type};
+    auto indexing = milvus::index::IndexFactory::GetInstance().CreateIndex(create_index_info, nullptr);
 
     auto database = knowhere::GenDataset(N, dim, raw_data);
-    indexing->Train(database, conf);
-    indexing->AddWithoutIds(database, conf);
-    EXPECT_EQ(indexing->Count(), N);
-    EXPECT_EQ(indexing->Dim(), dim);
+    auto build_config = generate_build_conf(index_type, metric_type);
+    indexing->BuildWithDataset(database, build_config);
 
-    EXPECT_EQ(indexing->Count(), N);
-    EXPECT_EQ(indexing->Dim(), dim);
+    auto vec_indexing = dynamic_cast<VectorIndex*>(indexing.get());
+    EXPECT_EQ(vec_indexing->Count(), N);
+    EXPECT_EQ(vec_indexing->GetDim(), dim);
+
     return indexing;
 }
 }  // namespace
@@ -825,11 +849,11 @@ TEST(CApiTest, SearchTest) {
     placeholderGroups.push_back(placeholderGroup);
 
     CSearchResult search_result;
-    auto res = Search(segment, plan, placeholderGroup, N + ts_offset, &search_result, -1);
+    auto res = Search(segment, plan, placeholderGroup, N + ts_offset, &search_result);
     ASSERT_EQ(res.error_code, Success);
 
     CSearchResult search_result2;
-    auto res2 = Search(segment, plan, placeholderGroup, ts_offset, &search_result2, -1);
+    auto res2 = Search(segment, plan, placeholderGroup, ts_offset, &search_result2);
     ASSERT_EQ(res2.error_code, Success);
 
     DeleteSearchPlan(plan);
@@ -884,7 +908,7 @@ TEST(CApiTest, SearchTestWithExpr) {
     dataset.timestamps_.push_back(1);
 
     CSearchResult search_result;
-    auto res = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &search_result, -1);
+    auto res = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &search_result);
     ASSERT_EQ(res.error_code, Success);
 
     DeleteSearchPlan(plan);
@@ -1056,36 +1080,23 @@ TEST(CApiTest, GetRealCount) {
 
 void
 CheckSearchResultDuplicate(const std::vector<CSearchResult>& results) {
-    auto sr = (SearchResult*)results[0];
-    auto topk = sr->unity_topK_;
-    auto num_queries = sr->total_nq_;
+    auto nq = ((SearchResult*)results[0])->total_nq_;
 
-    // fill primary keys
-    std::vector<PkType> result_pks(num_queries * topk);
-    for (int i = 0; i < results.size(); i++) {
-        auto search_result = (SearchResult*)results[i];
-        auto size = search_result->result_offsets_.size();
-        if (size == 0) {
-            continue;
-        }
-        for (int j = 0; j < size; j++) {
-            auto offset = search_result->result_offsets_[j];
-            result_pks[offset] = search_result->primary_keys_[j];
+    std::unordered_set<PkType> pk_set;
+    for (int qi = 0; qi < nq; qi++) {
+        pk_set.clear();
+        for (int i = 0; i < results.size(); i++) {
+            auto search_result = (SearchResult*)results[i];
+            ASSERT_EQ(nq, search_result->total_nq_);
+            auto topk_beg = search_result->topk_per_nq_prefix_sum_[qi];
+            auto topk_end = search_result->topk_per_nq_prefix_sum_[qi + 1];
+            for (int ki = topk_beg; ki < topk_end; ki++) {
+                ASSERT_NE(search_result->seg_offsets_[ki], INVALID_SEG_OFFSET);
+                auto ret = pk_set.insert(search_result->primary_keys_[ki]);
+                ASSERT_TRUE(ret.second);
+            }
         }
     }
-
-    // check primary key duplicates
-    // int64_t cnt = 0;
-    // std::unordered_set<PkType> pk_set;
-    // for (int qi = 0; qi < num_queries; qi++) {
-    //     pk_set.clear();
-    //     for (int k = 0; k < topk; k++) {
-    //         int64_t idx = topk * qi + k;
-    //         pk_set.insert(result_pks[idx]);
-    //     }
-    //     cnt += pk_set.size();
-    // }
-    // assert(cnt == topk * num_queries);
 }
 
 TEST(CApiTest, ReudceNullResult) {
@@ -1138,11 +1149,11 @@ TEST(CApiTest, ReudceNullResult) {
     dataset.timestamps_.push_back(1);
 
     {
-        auto slice_nqs = std::vector<int32_t>{10};
-        auto slice_topKs = std::vector<int32_t>{1};
+        auto slice_nqs = std::vector<int64_t>{10};
+        auto slice_topKs = std::vector<int64_t>{1};
         std::vector<CSearchResult> results;
         CSearchResult res;
-        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res, -1);
+        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res);
         assert(status.error_code == Success);
         results.push_back(res);
         CSearchResultDataBlobs cSearchResultData;
@@ -1155,14 +1166,12 @@ TEST(CApiTest, ReudceNullResult) {
         EXPECT_EQ(size, num_queries / 2);
 
         DeleteSearchResult(res);
-
     }
 
     DeleteSearchPlan(plan);
     DeletePlaceholderGroup(placeholderGroup);
     DeleteCollection(collection);
     DeleteSegment(segment);
-
 }
 
 TEST(CApiTest, ReduceRemoveDuplicates) {
@@ -1217,13 +1226,13 @@ TEST(CApiTest, ReduceRemoveDuplicates) {
     dataset.timestamps_.push_back(1);
 
     {
-        auto slice_nqs = std::vector<int32_t>{num_queries / 2, num_queries / 2};
-        auto slice_topKs = std::vector<int32_t>{topK / 2, topK};
+        auto slice_nqs = std::vector<int64_t>{num_queries / 2, num_queries / 2};
+        auto slice_topKs = std::vector<int64_t>{topK / 2, topK};
         std::vector<CSearchResult> results;
         CSearchResult res1, res2;
-        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res1, -1);
+        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res1);
         assert(status.error_code == Success);
-        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res2, -1);
+        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res2);
         assert(status.error_code == Success);
         results.push_back(res1);
         results.push_back(res2);
@@ -1242,15 +1251,15 @@ TEST(CApiTest, ReduceRemoveDuplicates) {
         int nq1 = num_queries / 3;
         int nq2 = num_queries / 3;
         int nq3 = num_queries - nq1 - nq2;
-        auto slice_nqs = std::vector<int32_t>{nq1, nq2, nq3};
-        auto slice_topKs = std::vector<int32_t>{topK / 2, topK, topK};
+        auto slice_nqs = std::vector<int64_t>{nq1, nq2, nq3};
+        auto slice_topKs = std::vector<int64_t>{topK / 2, topK, topK};
         std::vector<CSearchResult> results;
         CSearchResult res1, res2, res3;
-        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res1, -1);
+        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res1);
         assert(status.error_code == Success);
-        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res2, -1);
+        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res2);
         assert(status.error_code == Success);
-        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res3, -1);
+        status = Search(segment, plan, placeholderGroup, dataset.timestamps_[0], &res3);
         assert(status.error_code == Success);
         results.push_back(res1);
         results.push_back(res2);
@@ -1320,20 +1329,20 @@ testReduceSearchWithExpr(int N, int topK, int num_queries) {
     std::vector<CSearchResult> results;
     CSearchResult res1;
     CSearchResult res2;
-    auto res = Search(segment, plan, placeholderGroup, dataset.timestamps_[N - 1], &res1, -1);
+    auto res = Search(segment, plan, placeholderGroup, dataset.timestamps_[N - 1], &res1);
     assert(res.error_code == Success);
-    res = Search(segment, plan, placeholderGroup, dataset.timestamps_[N - 1], &res2, -1);
+    res = Search(segment, plan, placeholderGroup, dataset.timestamps_[N - 1], &res2);
     assert(res.error_code == Success);
     results.push_back(res1);
     results.push_back(res2);
 
-    auto slice_nqs = std::vector<int32_t>{num_queries / 2, num_queries / 2};
+    auto slice_nqs = std::vector<int64_t>{num_queries / 2, num_queries / 2};
     if (num_queries == 1) {
-        slice_nqs = std::vector<int32_t>{num_queries};
+        slice_nqs = std::vector<int64_t>{num_queries};
     }
-    auto slice_topKs = std::vector<int32_t>{topK / 2, topK};
+    auto slice_topKs = std::vector<int64_t>{topK / 2, topK};
     if (topK == 1) {
-        slice_topKs = std::vector<int32_t>{topK, topK};
+        slice_topKs = std::vector<int64_t>{topK, topK};
     }
 
     // 1. reduce
@@ -1350,25 +1359,16 @@ testReduceSearchWithExpr(int N, int topK, int num_queries) {
         auto suc = search_result_data.ParseFromArray(search_result_data_blobs->blobs[i].data(),
                                                      search_result_data_blobs->blobs[i].size());
         assert(suc);
-
-        assert(suc);
         assert(search_result_data.num_queries() == slice_nqs[i]);
         assert(search_result_data.top_k() == slice_topKs[i]);
-        assert(search_result_data.scores().size() == slice_topKs[i] * slice_nqs[i]);
-        assert(search_result_data.ids().int_id().data_size() == slice_topKs[i] * slice_nqs[i]);
+        assert(search_result_data.scores().size() == search_result_data.topks().at(0) * slice_nqs[i]);
+        assert(search_result_data.ids().int_id().data_size() == search_result_data.topks().at(0) * slice_nqs[i]);
 
-        // check topKs
+        // check real topks
         assert(search_result_data.topks().size() == slice_nqs[i]);
-        for (int j = 0; j < search_result_data.topks().size(); j++) {
-            assert(search_result_data.topks().at(j) == slice_topKs[i]);
+        for (auto real_topk : search_result_data.topks()) {
+            assert(real_topk <= slice_topKs[i]);
         }
-
-        // assert(search_result_data.scores().size() == slice_topKs[i] * slice_nqs[i]);
-        // assert(search_result_data.ids().int_id().data_size() == slice_topKs[i] * slice_nqs[i]);
-        // assert(search_result_data.top_k() == topK);
-        // assert(search_result_data.num_queries() == req_sizes[i]);
-        // assert(search_result_data.scores().size() == topK * req_sizes[i]);
-        // assert(search_result_data.ids().int_id().data_size() == topK * req_sizes[i]);
     }
 
     DeleteSearchResultDataBlobs(cSearchResultData);
@@ -1381,6 +1381,8 @@ testReduceSearchWithExpr(int N, int topK, int num_queries) {
 }
 
 TEST(CApiTest, ReduceSearchWithExpr) {
+    testReduceSearchWithExpr(2, 1, 1);
+    testReduceSearchWithExpr(2, 10, 10);
     testReduceSearchWithExpr(100, 1, 1);
     testReduceSearchWithExpr(100, 10, 10);
     testReduceSearchWithExpr(10000, 1, 1);
@@ -1412,7 +1414,7 @@ TEST(CApiTest, LoadIndexInfo) {
     CBinarySet c_binary_set = (CBinarySet)&binary_set;
 
     void* c_load_index_info = nullptr;
-    auto status = NewLoadIndexInfo(&c_load_index_info);
+    auto status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_param_key1 = "index_type";
     std::string index_param_value1 = "IVF_PQ";
@@ -1421,8 +1423,12 @@ TEST(CApiTest, LoadIndexInfo) {
     std::string index_param_value2 = "cpu";
     status = AppendIndexParam(c_load_index_info, index_param_key2.data(), index_param_value2.data());
     assert(status.error_code == Success);
+    std::string index_param_key3 = knowhere::meta::METRIC_TYPE;
+    std::string index_param_value3 = knowhere::metric::L2;
+    status = AppendIndexParam(c_load_index_info, index_param_key3.data(), index_param_value3.data());
+    assert(status.error_code == Success);
     std::string field_name = "field0";
-    status = AppendFieldInfo(c_load_index_info, 0, CDataType::FloatVector);
+    status = AppendFieldInfo(c_load_index_info, 0, 0, 0, 0, CDataType::FloatVector);
     assert(status.error_code == Success);
     status = AppendIndex(c_load_index_info, c_binary_set);
     assert(status.error_code == Success);
@@ -1457,12 +1463,12 @@ TEST(CApiTest, LoadIndex_Search) {
     auto binary_set = indexing->Serialize(conf);
 
     // fill loadIndexInfo
-    LoadIndexInfo load_index_info;
+    milvus::segcore::LoadIndexInfo load_index_info;
     auto& index_params = load_index_info.index_params;
     index_params["index_type"] = "IVF_PQ";
     index_params["index_mode"] = "CPU";
     auto mode = knowhere::IndexMode::MODE_CPU;
-    load_index_info.index = knowhere::VecIndexFactory::GetInstance().CreateVecIndex(index_params["index_type"], mode);
+    load_index_info.index = std::make_unique<VectorMemIndex>(index_params["index_type"], knowhere::metric::L2, mode);
     load_index_info.index->Load(binary_set);
 
     // search
@@ -1535,25 +1541,21 @@ TEST(CApiTest, Indexing_Without_Predicate) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -1564,9 +1566,9 @@ TEST(CApiTest, Indexing_Without_Predicate) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -1578,7 +1580,7 @@ TEST(CApiTest, Indexing_Without_Predicate) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -1588,7 +1590,7 @@ TEST(CApiTest, Indexing_Without_Predicate) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_raw_index_json = SearchResultToJson(*search_result_on_raw_index);
@@ -1660,25 +1662,21 @@ TEST(CApiTest, Indexing_Expr_Without_Predicate) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -1689,9 +1687,9 @@ TEST(CApiTest, Indexing_Expr_Without_Predicate) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -1703,7 +1701,7 @@ TEST(CApiTest, Indexing_Expr_Without_Predicate) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -1713,7 +1711,7 @@ TEST(CApiTest, Indexing_Expr_Without_Predicate) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_raw_index_json = SearchResultToJson(*search_result_on_raw_index);
@@ -1802,26 +1800,21 @@ TEST(CApiTest, Indexing_With_float_Predicate_Range) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -1832,9 +1825,9 @@ TEST(CApiTest, Indexing_With_float_Predicate_Range) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -1846,7 +1839,7 @@ TEST(CApiTest, Indexing_With_float_Predicate_Range) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -1856,7 +1849,7 @@ TEST(CApiTest, Indexing_With_float_Predicate_Range) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -1959,26 +1952,21 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Range) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -1989,9 +1977,9 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Range) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -2003,7 +1991,7 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Range) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2013,7 +2001,7 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Range) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -2100,26 +2088,21 @@ TEST(CApiTest, Indexing_With_float_Predicate_Term) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -2130,9 +2113,9 @@ TEST(CApiTest, Indexing_With_float_Predicate_Term) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -2144,7 +2127,7 @@ TEST(CApiTest, Indexing_With_float_Predicate_Term) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2154,7 +2137,7 @@ TEST(CApiTest, Indexing_With_float_Predicate_Term) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -2250,26 +2233,21 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Term) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -2280,9 +2258,9 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Term) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -2294,7 +2272,7 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Term) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2304,7 +2282,7 @@ TEST(CApiTest, Indexing_Expr_With_float_Predicate_Term) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -2392,27 +2370,22 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Range) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{
-        {knowhere::meta::METRIC_TYPE, knowhere::metric::JACCARD},
-        {knowhere::meta::DIM, DIM},
-        {knowhere::meta::TOPK, TOPK},
-        {knowhere::indexparam::NPROBE, 10},
-        {knowhere::indexparam::NLIST, 100},
-        {knowhere::indexparam::M, 4},
-        {knowhere::indexparam::NBITS, 8},
-    };
 
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_BIN_IVFFLAT);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_BINARY, knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -2423,9 +2396,9 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Range) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "BIN_IVF_FLAT";
@@ -2437,7 +2410,7 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Range) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::BinaryVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::BinaryVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2447,7 +2420,7 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Range) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -2548,27 +2521,21 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Range) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     ASSERT_TRUE(res_before_load_index.error_code == Success) << res_before_load_index.error_msg;
 
     // load index to segment
-    auto conf = knowhere::Config{
-        {knowhere::meta::METRIC_TYPE, knowhere::metric::JACCARD},
-        {knowhere::meta::DIM, DIM},
-        {knowhere::meta::TOPK, TOPK},
-        {knowhere::indexparam::NPROBE, 10},
-        {knowhere::indexparam::NLIST, 100},
-        {knowhere::indexparam::M, 4},
-        {knowhere::indexparam::NBITS, 8},
-    };
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_BIN_IVFFLAT);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_BINARY, knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -2579,9 +2546,9 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Range) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "BIN_IVF_FLAT";
@@ -2593,7 +2560,7 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Range) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::BinaryVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::BinaryVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2603,7 +2570,7 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Range) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -2691,27 +2658,21 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Term) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{
-        {knowhere::meta::METRIC_TYPE, knowhere::metric::JACCARD},
-        {knowhere::meta::DIM, DIM},
-        {knowhere::meta::TOPK, TOPK},
-        {knowhere::indexparam::NPROBE, 10},
-        {knowhere::indexparam::NLIST, 100},
-        {knowhere::indexparam::M, 4},
-        {knowhere::indexparam::NBITS, 8},
-    };
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_BIN_IVFFLAT);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_BINARY, knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -2722,9 +2683,9 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Term) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "BIN_IVF_FLAT";
@@ -2736,7 +2697,7 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Term) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::BinaryVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::BinaryVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2746,14 +2707,14 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Term) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     std::vector<CSearchResult> results;
     results.push_back(c_search_result_on_bigIndex);
 
-    auto slice_nqs = std::vector<int32_t>{num_queries};
-    auto slice_topKs = std::vector<int32_t>{topK};
+    auto slice_nqs = std::vector<int64_t>{num_queries};
+    auto slice_topKs = std::vector<int64_t>{topK};
 
     CSearchResultDataBlobs cSearchResultData;
     status = ReduceSearchResultsAndFillData(&cSearchResultData, plan, results.data(), results.size(), slice_nqs.data(),
@@ -2765,7 +2726,8 @@ TEST(CApiTest, Indexing_With_binary_Predicate_Term) {
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
     for (int i = 0; i < num_queries; ++i) {
-        auto offset = search_result_on_bigIndex->get_result_count(i);
+        ASSERT_EQ(search_result_on_bigIndex->topk_per_nq_prefix_sum_.size(), search_result_on_bigIndex->total_nq_ + 1);
+        auto offset = search_result_on_bigIndex->topk_per_nq_prefix_sum_[i];
         ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], 42000 + i);
         ASSERT_EQ(search_result_on_bigIndex->distances_[offset], search_result_on_raw_index->distances_[i * TOPK]);
     }
@@ -2856,27 +2818,21 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Term) {
     Timestamp time = 10000000;
 
     CSearchResult c_search_result_on_smallIndex;
-    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex, -1);
+    auto res_before_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_smallIndex);
     assert(res_before_load_index.error_code == Success);
 
     // load index to segment
-    auto conf = knowhere::Config{
-        {knowhere::meta::METRIC_TYPE, knowhere::metric::JACCARD},
-        {knowhere::meta::DIM, DIM},
-        {knowhere::meta::TOPK, TOPK},
-        {knowhere::indexparam::NPROBE, 10},
-        {knowhere::indexparam::NLIST, 100},
-        {knowhere::indexparam::M, 4},
-        {knowhere::indexparam::NBITS, 8},
-    };
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_BIN_IVFFLAT);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_BINARY, knowhere::metric::JACCARD,
+                                   IndexEnum::INDEX_FAISS_BIN_IVFFLAT, DIM, N);
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -2887,9 +2843,9 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Term) {
     search_result_on_raw_index->seg_offsets_ = vec_ids;
     search_result_on_raw_index->distances_ = vec_dis;
 
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "BIN_IVF_FLAT";
@@ -2901,7 +2857,7 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Term) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::BinaryVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::BinaryVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load index for vec field, load raw data for scalar filed
@@ -2911,14 +2867,14 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Term) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     std::vector<CSearchResult> results;
     results.push_back(c_search_result_on_bigIndex);
 
-    auto slice_nqs = std::vector<int32_t>{num_queries};
-    auto slice_topKs = std::vector<int32_t>{topK};
+    auto slice_nqs = std::vector<int64_t>{num_queries};
+    auto slice_topKs = std::vector<int64_t>{topK};
 
     CSearchResultDataBlobs cSearchResultData;
     status = ReduceSearchResultsAndFillData(&cSearchResultData, plan, results.data(), results.size(), slice_nqs.data(),
@@ -2930,7 +2886,8 @@ TEST(CApiTest, Indexing_Expr_With_binary_Predicate_Term) {
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
     for (int i = 0; i < num_queries; ++i) {
-        auto offset = search_result_on_bigIndex->get_result_count(i);
+        ASSERT_EQ(search_result_on_bigIndex->topk_per_nq_prefix_sum_.size(), search_result_on_bigIndex->total_nq_ + 1);
+        auto offset = search_result_on_bigIndex->topk_per_nq_prefix_sum_[i];
         ASSERT_EQ(search_result_on_bigIndex->seg_offsets_[offset], 42000 + i);
         ASSERT_EQ(search_result_on_bigIndex->distances_[offset], search_result_on_raw_index->distances_[i * TOPK]);
     }
@@ -3043,31 +3000,11 @@ TEST(CApiTest, SealedSegment_search_float_Predicate_Range) {
     Timestamp time = 10000000;
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
-
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
-
-    // gen query dataset
-    auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
-    std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
-    std::vector<float> vec_dis;
-    for (int j = 0; j < TOPK * num_queries; ++j) {
-        vec_dis.push_back(dis[j] * -1);
-    }
-
-    auto binary_set = indexing->Serialize(conf);
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -3079,15 +3016,18 @@ TEST(CApiTest, SealedSegment_search_float_Predicate_Range) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     auto load_index_info = (LoadIndexInfo*)c_load_index_info;
-    auto query_dataset2 = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto index = std::dynamic_pointer_cast<knowhere::VecIndex>(load_index_info->index);
-    auto result_on_index2 = index->Query(query_dataset2, conf, nullptr);
-    auto ids2 = knowhere::GetDatasetIDs(result_on_index2);
-    auto dis2 = knowhere::GetDatasetDistance(result_on_index2);
+    auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    SearchInfo search_info;
+    search_info.topk_ = TOPK;
+    search_info.metric_type_ = knowhere::metric::L2;
+    search_info.search_params_ = generate_search_conf(IndexEnum::INDEX_FAISS_IVFPQ, knowhere::metric::L2);
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    EXPECT_EQ(result_on_index->distances_.size(), num_queries * TOPK);
 
     auto c_counter_field_data = CLoadFieldDataInfo{
         101,
@@ -3123,7 +3063,7 @@ TEST(CApiTest, SealedSegment_search_float_Predicate_Range) {
 
     CSearchResult c_search_result_on_bigIndex;
     auto res_after_load_index =
-        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+        Search(sealed_segment.get(), plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -3236,12 +3176,12 @@ TEST(CApiTest, SealedSegment_search_without_predicates) {
     std::vector<CPlaceholderGroup> placeholderGroups;
     placeholderGroups.push_back(placeholderGroup);
     CSearchResult search_result;
-    auto res = Search(segment, plan, placeholderGroup, N + ts_offset, &search_result, -1);
+    auto res = Search(segment, plan, placeholderGroup, N + ts_offset, &search_result);
     std::cout << res.error_msg << std::endl;
     ASSERT_EQ(res.error_code, Success);
 
     CSearchResult search_result2;
-    auto res2 = Search(segment, plan, placeholderGroup, ts_offset, &search_result2, -1);
+    auto res2 = Search(segment, plan, placeholderGroup, ts_offset, &search_result2);
     ASSERT_EQ(res2.error_code, Success);
 
     DeleteSearchPlan(plan);
@@ -3338,20 +3278,12 @@ TEST(CApiTest, SealedSegment_search_float_With_Expr_Predicate_Range) {
     Timestamp time = 10000000;
 
     // load index to segment
-    auto conf = knowhere::Config{{knowhere::meta::METRIC_TYPE, knowhere::metric::L2},
-                                 {knowhere::meta::DIM, DIM},
-                                 {knowhere::meta::TOPK, TOPK},
-                                 {knowhere::indexparam::NLIST, 100},
-                                 {knowhere::indexparam::NPROBE, 10},
-                                 {knowhere::indexparam::M, 4},
-                                 {knowhere::indexparam::NBITS, 8},
-                                 {knowhere::meta::DEVICE_ID, 0}};
+    auto indexing = generate_index(vec_col.data(), DataType::VECTOR_FLOAT, knowhere::metric::L2,
+                                   IndexEnum::INDEX_FAISS_IVFPQ, DIM, N);
 
-    auto indexing = generate_index(vec_col.data(), conf, DIM, TOPK, N, IndexEnum::INDEX_FAISS_IVFPQ);
-
-    auto binary_set = indexing->Serialize(conf);
+    auto binary_set = indexing->Serialize(milvus::Config{});
     void* c_load_index_info = nullptr;
-    status = NewLoadIndexInfo(&c_load_index_info);
+    status = NewLoadIndexInfo(&c_load_index_info, c_storage_config);
     assert(status.error_code == Success);
     std::string index_type_key = "index_type";
     std::string index_type_value = "IVF_PQ";
@@ -3363,16 +3295,10 @@ TEST(CApiTest, SealedSegment_search_float_With_Expr_Predicate_Range) {
     AppendIndexParam(c_load_index_info, index_type_key.c_str(), index_type_value.c_str());
     AppendIndexParam(c_load_index_info, index_mode_key.c_str(), index_mode_value.c_str());
     AppendIndexParam(c_load_index_info, metric_type_key.c_str(), metric_type_value.c_str());
-    AppendFieldInfo(c_load_index_info, 100, CDataType::FloatVector);
+    AppendFieldInfo(c_load_index_info, 0, 0, 0, 100, CDataType::FloatVector);
     AppendIndex(c_load_index_info, (CBinarySet)&binary_set);
 
     // load vec index
-    auto load_index_info = (LoadIndexInfo*)c_load_index_info;
-    auto query_dataset2 = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto index = std::dynamic_pointer_cast<knowhere::VecIndex>(load_index_info->index);
-    auto result_on_index2 = index->Query(query_dataset2, conf, nullptr);
-    auto ids2 = knowhere::GetDatasetIDs(result_on_index2);
-    auto dis2 = knowhere::GetDatasetDistance(result_on_index2);
     status = UpdateSealedSegmentIndex(segment, c_load_index_info);
     assert(status.error_code == Success);
 
@@ -3406,9 +3332,12 @@ TEST(CApiTest, SealedSegment_search_float_With_Expr_Predicate_Range) {
 
     // gen query dataset
     auto query_dataset = knowhere::GenDataset(num_queries, DIM, query_ptr);
-    auto result_on_index = indexing->Query(query_dataset, conf, nullptr);
-    auto ids = knowhere::GetDatasetIDs(result_on_index);
-    auto dis = knowhere::GetDatasetDistance(result_on_index);
+    auto vec_index = dynamic_cast<VectorIndex*>(indexing.get());
+    auto search_plan = reinterpret_cast<milvus::query::Plan*>(plan);
+    SearchInfo search_info = search_plan->plan_node_->search_info_;
+    auto result_on_index = vec_index->Query(query_dataset, search_info, nullptr);
+    auto ids = result_on_index->seg_offsets_.data();
+    auto dis = result_on_index->distances_.data();
     std::vector<int64_t> vec_ids(ids, ids + TOPK * num_queries);
     std::vector<float> vec_dis;
     for (int j = 0; j < TOPK * num_queries; ++j) {
@@ -3416,7 +3345,7 @@ TEST(CApiTest, SealedSegment_search_float_With_Expr_Predicate_Range) {
     }
 
     CSearchResult c_search_result_on_bigIndex;
-    auto res_after_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_bigIndex, -1);
+    auto res_after_load_index = Search(segment, plan, placeholderGroup, time, &c_search_result_on_bigIndex);
     assert(res_after_load_index.error_code == Success);
 
     auto search_result_on_bigIndex = (SearchResult*)c_search_result_on_bigIndex;
@@ -3472,61 +3401,61 @@ TEST(CApiTest, RetriveScalarFieldFromSealedSegmentWithIndex) {
     // load index for int8 field
     auto age8_col = raw_data.get_col<int8_t>(i8_fid);
     GenScalarIndexing(N, age8_col.data());
-    auto age8_index = milvus::scalar::CreateScalarIndexSort<int8_t>();
+    auto age8_index = milvus::index::CreateScalarIndexSort<int8_t>();
     age8_index->Build(N, age8_col.data());
     load_index_info.field_id = i8_fid.get();
-    load_index_info.field_type = Int8;
-    load_index_info.index = std::shared_ptr<milvus::scalar::ScalarIndexSort<int8_t>>(age8_index.release());
+    load_index_info.field_type = DataType::INT8;
+    load_index_info.index = std::move(age8_index);
     segment->LoadIndex(load_index_info);
 
     // load index for 16 field
     auto age16_col = raw_data.get_col<int16_t>(i16_fid);
     GenScalarIndexing(N, age16_col.data());
-    auto age16_index = milvus::scalar::CreateScalarIndexSort<int16_t>();
+    auto age16_index = milvus::index::CreateScalarIndexSort<int16_t>();
     age16_index->Build(N, age16_col.data());
     load_index_info.field_id = i16_fid.get();
-    load_index_info.field_type = Int16;
-    load_index_info.index = std::shared_ptr<milvus::scalar::ScalarIndexSort<int16_t>>(age16_index.release());
+    load_index_info.field_type = DataType::INT16;
+    load_index_info.index = std::move(age16_index);
     segment->LoadIndex(load_index_info);
 
     // load index for int32 field
     auto age32_col = raw_data.get_col<int32_t>(i32_fid);
     GenScalarIndexing(N, age32_col.data());
-    auto age32_index = milvus::scalar::CreateScalarIndexSort<int32_t>();
+    auto age32_index = milvus::index::CreateScalarIndexSort<int32_t>();
     age32_index->Build(N, age32_col.data());
     load_index_info.field_id = i32_fid.get();
-    load_index_info.field_type = Int32;
-    load_index_info.index = std::shared_ptr<milvus::scalar::ScalarIndexSort<int32_t>>(age32_index.release());
+    load_index_info.field_type = DataType::INT32;
+    load_index_info.index = std::move(age32_index);
     segment->LoadIndex(load_index_info);
 
     // load index for int64 field
     auto age64_col = raw_data.get_col<int64_t>(i64_fid);
     GenScalarIndexing(N, age64_col.data());
-    auto age64_index = milvus::scalar::CreateScalarIndexSort<int64_t>();
+    auto age64_index = milvus::index::CreateScalarIndexSort<int64_t>();
     age64_index->Build(N, age64_col.data());
     load_index_info.field_id = i64_fid.get();
-    load_index_info.field_type = Int64;
-    load_index_info.index = std::shared_ptr<milvus::scalar::ScalarIndexSort<int64_t>>(age64_index.release());
+    load_index_info.field_type = DataType::INT64;
+    load_index_info.index = std::move(age64_index);
     segment->LoadIndex(load_index_info);
 
     // load index for float field
     auto age_float_col = raw_data.get_col<float>(float_fid);
     GenScalarIndexing(N, age_float_col.data());
-    auto age_float_index = milvus::scalar::CreateScalarIndexSort<float>();
+    auto age_float_index = milvus::index::CreateScalarIndexSort<float>();
     age_float_index->Build(N, age_float_col.data());
     load_index_info.field_id = float_fid.get();
-    load_index_info.field_type = Float;
-    load_index_info.index = std::shared_ptr<milvus::scalar::ScalarIndexSort<float>>(age_float_index.release());
+    load_index_info.field_type = DataType::FLOAT;
+    load_index_info.index = std::move(age_float_index);
     segment->LoadIndex(load_index_info);
 
     // load index for double field
     auto age_double_col = raw_data.get_col<double>(double_fid);
     GenScalarIndexing(N, age_double_col.data());
-    auto age_double_index = milvus::scalar::CreateScalarIndexSort<double>();
+    auto age_double_index = milvus::index::CreateScalarIndexSort<double>();
     age_double_index->Build(N, age_double_col.data());
     load_index_info.field_id = double_fid.get();
-    load_index_info.field_type = Float;
-    load_index_info.index = std::shared_ptr<milvus::scalar::ScalarIndexSort<double>>(age_double_index.release());
+    load_index_info.field_type = DataType::FLOAT;
+    load_index_info.index = std::move(age_double_index);
     segment->LoadIndex(load_index_info);
 
     // create retrieve plan

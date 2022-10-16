@@ -18,7 +18,6 @@ package flowgraph
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,7 +26,7 @@ import (
 )
 
 func TestInputNode(t *testing.T) {
-	os.Setenv("ROCKSMQ_PATH", "/tmp/MilvusTest/FlowGraph/TestInputNode")
+	t.Setenv("ROCKSMQ_PATH", "/tmp/MilvusTest/FlowGraph/TestInputNode")
 	factory := dependency.NewDefaultFactory(true)
 
 	msgStream, _ := factory.NewMsgStream(context.TODO())
@@ -41,10 +40,7 @@ func TestInputNode(t *testing.T) {
 	produceStream.Produce(&msgPack)
 
 	nodeName := "input_node"
-	inputNode := &InputNode{
-		inStream: msgStream,
-		name:     nodeName,
-	}
+	inputNode := NewInputNode(msgStream, nodeName, 100, 100)
 	defer inputNode.Close()
 
 	isInputNode := inputNode.IsInputNode()
@@ -56,8 +52,11 @@ func TestInputNode(t *testing.T) {
 	stream := inputNode.InStream()
 	assert.NotNil(t, stream)
 
-	output := inputNode.Operate([]Msg{})
-	assert.Greater(t, len(output), 0)
+	output := inputNode.Operate(nil)
+	assert.NotNil(t, output)
+	msg, ok := output[0].(*MsgStreamMsg)
+	assert.True(t, ok)
+	assert.False(t, msg.isCloseMsg)
 }
 
 func Test_NewInputNode(t *testing.T) {

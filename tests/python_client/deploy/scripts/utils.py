@@ -5,12 +5,10 @@ from pymilvus import (
     Collection, list_collections,
 )
 
-all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "HNSW", "ANNOY", "RHNSW_FLAT", "RHNSW_PQ", "RHNSW_SQ"]
+all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "HNSW", "ANNOY"]
 
 default_index_params = [{"nlist": 128}, {"nlist": 128}, {"nlist": 128}, {"nlist": 128, "m": 16, "nbits": 8},
-                        {"M": 48, "efConstruction": 500}, {"n_trees": 50}, {"M": 48, "efConstruction": 500},
-                        {"M": 48, "efConstruction": 500, "PQM": 8}, {"M": 48, "efConstruction": 500}, {"nlist": 128},
-                        {"nlist": 128}]
+                        {"M": 48, "efConstruction": 500}, {"n_trees": 50}]
 
 index_params_map = dict(zip(all_index_types, default_index_params))
 
@@ -28,7 +26,7 @@ def filter_collections_by_prefix(prefix):
 
 def gen_search_param(index_type, metric_type="L2"):
     search_params = []
-    if index_type in ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_SQ8H", "IVF_PQ"]:
+    if index_type in ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"]:
         for nprobe in [10]:
             ivf_search_params = {"metric_type": metric_type, "params": {"nprobe": nprobe}}
             search_params.append(ivf_search_params)
@@ -36,14 +34,10 @@ def gen_search_param(index_type, metric_type="L2"):
         for nprobe in [10]:
             bin_search_params = {"metric_type": "HAMMING", "params": {"nprobe": nprobe}}
             search_params.append(bin_search_params)
-    elif index_type in ["HNSW", "RHNSW_FLAT", "RHNSW_PQ", "RHNSW_SQ"]:
+    elif index_type in ["HNSW"]:
         for ef in [64]:
             hnsw_search_param = {"metric_type": metric_type, "params": {"ef": ef}}
             search_params.append(hnsw_search_param)
-    elif index_type in ["NSG", "RNSG"]:
-        for search_length in [100]:
-            nsg_search_param = {"metric_type": metric_type, "params": {"search_length": search_length}}
-            search_params.append(nsg_search_param)
     elif index_type == "ANNOY":
         for search_k in [1000]:
             annoy_search_param = {"metric_type": metric_type, "params": {"search_k": search_k}}
@@ -61,6 +55,7 @@ def get_collections(prefix, check=False):
     # list entities if collections
     for name in col_list:
         c = Collection(name=name)
+        c.flush()
         num_entities = c.num_entities
         print(f"{name}: {num_entities}")
         if check:
@@ -137,16 +132,20 @@ def load_and_search(prefix, replicas=1):
     for col_name in col_list:
         c = Collection(name=col_name)
         print(f"collection name: {col_name}")
-        print("release collection")
-        c.release()
         print("load collection")
-        t0 = time.time()
         if replicas == 1:
+            t0 = time.time()
             c.load()
+            print(f"load time: {time.time() - t0:.4f}")
         if replicas > 1:
+            print("release collection before load if replicas > 1")
+            t0 = time.time()
+            c.release()
+            print(f"release time: {time.time() - t0:.4f}")
+            t0 = time.time()
             c.load(replica_number=replicas)
+            print(f"load time: {time.time() - t0:.4f}")
             print(c.get_replicas())
-        print(f"load time: {time.time() - t0:.4f}")
         topK = 5
         vectors = [[1.0 for _ in range(128)] for _ in range(3000)]
         index_name = col_name.replace(prefix, "")
@@ -168,9 +167,9 @@ def load_and_search(prefix, replicas=1):
                 # Get value of the random value field for search result
                 print(hit, hit.entity.get("random_value"))
             ids = hits.ids
-            assert len(ids) == topK
+            assert len(ids) == topK, f"get {len(ids)} results, but topK is {topK}"
             print(ids)
-        assert len(res) == len(v_search)
+        assert len(res) == len(v_search), f"get {len(res)} results, but search num is {len(v_search)}"
         print("search latency: %.4fs" % (end_time - start_time))
         t0 = time.time()
         expr = "count in [2,4,6,8]"

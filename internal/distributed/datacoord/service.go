@@ -25,18 +25,20 @@ import (
 	"sync"
 	"time"
 
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
+	icc "github.com/milvus-io/milvus/internal/distributed/indexcoord/client"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/datacoord"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
@@ -58,7 +60,8 @@ type Server struct {
 	wg        sync.WaitGroup
 	dataCoord types.DataCoordComponent
 
-	etcdCli *clientv3.Client
+	etcdCli    *clientv3.Client
+	indexCoord types.IndexCoord
 
 	grpcErrChan chan error
 	grpcServer  *grpc.Server
@@ -96,6 +99,25 @@ func (s *Server) init() error {
 	}
 	s.etcdCli = etcdCli
 	s.dataCoord.SetEtcdClient(etcdCli)
+
+	if s.indexCoord == nil {
+		var err error
+		log.Debug("create IndexCoord client for DataCoord")
+		s.indexCoord, err = icc.NewClient(s.ctx, Params.EtcdCfg.MetaRootPath, etcdCli)
+		if err != nil {
+			log.Warn("failed to create IndexCoord client for DataCoord", zap.Error(err))
+			return err
+		}
+		log.Debug("create IndexCoord client for DataCoord done")
+	}
+
+	log.Debug("init IndexCoord client for DataCoord")
+	if err := s.indexCoord.Init(); err != nil {
+		log.Warn("failed to init IndexCoord client for DataCoord", zap.Error(err))
+		return err
+	}
+	log.Debug("init IndexCoord client for DataCoord done")
+	s.dataCoord.SetIndexCoord(s.indexCoord)
 
 	err = s.startGrpc()
 	if err != nil {
@@ -149,8 +171,12 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
-		grpc.UnaryInterceptor(ot.UnaryServerInterceptor(opts...)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			ot.UnaryServerInterceptor(opts...),
+			logutil.UnaryTraceLoggerInterceptor)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			ot.StreamServerInterceptor(opts...),
+			logutil.StreamTraceLoggerInterceptor)))
 	datapb.RegisterDataCoordServer(s.grpcServer, s)
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
 	if err := s.grpcServer.Serve(lis); err != nil {
@@ -217,7 +243,7 @@ func (s *Server) Run() error {
 }
 
 // GetComponentStates gets states of datacoord and datanodes
-func (s *Server) GetComponentStates(ctx context.Context, req *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return s.dataCoord.GetComponentStates(ctx)
 }
 
@@ -286,14 +312,19 @@ func (s *Server) GetFlushedSegments(ctx context.Context, req *datapb.GetFlushedS
 	return s.dataCoord.GetFlushedSegments(ctx, req)
 }
 
+// GetSegmentsByStates get all segments of a partition by given states
+func (s *Server) GetSegmentsByStates(ctx context.Context, req *datapb.GetSegmentsByStatesRequest) (*datapb.GetSegmentsByStatesResponse, error) {
+	return s.dataCoord.GetSegmentsByStates(ctx, req)
+}
+
+// ShowConfigurations gets specified configurations para of DataCoord
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return s.dataCoord.ShowConfigurations(ctx, req)
+}
+
 // GetMetrics gets metrics of data coordinator and datanodes
 func (s *Server) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	return s.dataCoord.GetMetrics(ctx, req)
-}
-
-// CompleteCompaction completes a compaction with the result
-func (s *Server) CompleteCompaction(ctx context.Context, req *datapb.CompactionResult) (*commonpb.Status, error) {
-	return s.dataCoord.CompleteCompaction(ctx, req)
 }
 
 // ManualCompaction triggers a compaction for a collection
@@ -351,6 +382,22 @@ func (s *Server) ReleaseSegmentLock(ctx context.Context, req *datapb.ReleaseSegm
 	return s.dataCoord.ReleaseSegmentLock(ctx, req)
 }
 
-func (s *Server) AddSegment(ctx context.Context, request *datapb.AddSegmentRequest) (*commonpb.Status, error) {
-	return s.dataCoord.AddSegment(ctx, request)
+// SaveImportSegment saves the import segment binlog paths data and then looks for the right DataNode to add the
+// segment to that DataNode.
+func (s *Server) SaveImportSegment(ctx context.Context, request *datapb.SaveImportSegmentRequest) (*commonpb.Status, error) {
+	return s.dataCoord.SaveImportSegment(ctx, request)
+}
+
+// UnsetIsImportingState is the distributed caller of UnsetIsImportingState.
+func (s *Server) UnsetIsImportingState(ctx context.Context, request *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error) {
+	return s.dataCoord.UnsetIsImportingState(ctx, request)
+}
+
+// MarkSegmentsDropped is the distributed caller of MarkSegmentsDropped.
+func (s *Server) MarkSegmentsDropped(ctx context.Context, req *datapb.MarkSegmentsDroppedRequest) (*commonpb.Status, error) {
+	return s.dataCoord.MarkSegmentsDropped(ctx, req)
+}
+
+func (s *Server) BroadcastAlteredCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return s.dataCoord.BroadcastAlteredCollection(ctx, request)
 }

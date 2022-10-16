@@ -20,13 +20,15 @@ import (
 	"context"
 	"io"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	rc "github.com/milvus-io/milvus/internal/distributed/rootcoord"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
 
 	"github.com/opentracing/opentracing-go"
-
-	rc "github.com/milvus-io/milvus/internal/distributed/rootcoord"
+	"go.uber.org/zap"
 )
 
 // RootCoord implements RoodCoord grpc server
@@ -53,6 +55,7 @@ func NewRootCoord(ctx context.Context, factory dependency.Factory) (*RootCoord, 
 // Run starts service
 func (rc *RootCoord) Run() error {
 	if err := rc.svr.Run(); err != nil {
+		log.Error("RootCoord starts error", zap.Error(err))
 		return err
 	}
 	log.Debug("RootCoord successfully started")
@@ -68,6 +71,14 @@ func (rc *RootCoord) Stop() error {
 }
 
 // GetComponentStates returns RootCoord's states
-func (rc *RootCoord) GetComponentStates(ctx context.Context, request *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
-	return rc.svr.GetComponentStates(ctx, request)
+func (rc *RootCoord) Health(ctx context.Context) commonpb.StateCode {
+	resp, err := rc.svr.GetComponentStates(ctx, &milvuspb.GetComponentStatesRequest{})
+	if err != nil {
+		return commonpb.StateCode_Abnormal
+	}
+	return resp.State.GetStateCode()
+}
+
+func (rc *RootCoord) GetName() string {
+	return typeutil.RootCoordRole
 }

@@ -19,18 +19,21 @@ package datanode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 )
 
@@ -39,8 +42,8 @@ var segmentReplicaNodeTestDir = "/tmp/milvus_test/segment_replica"
 func TestNewReplica(t *testing.T) {
 	rc := &RootCoordFactory{}
 	cm := storage.NewLocalChunkManager(storage.RootPath(segmentReplicaNodeTestDir))
-	defer cm.RemoveWithPrefix("")
-	replica, err := newReplica(context.Background(), rc, cm, 0)
+	defer cm.RemoveWithPrefix(context.Background(), "")
+	replica, err := newReplica(context.Background(), rc, cm, 0, nil)
 	assert.Nil(t, err)
 	assert.NotNil(t, replica)
 }
@@ -49,12 +52,12 @@ type mockDataCM struct {
 	storage.ChunkManager
 }
 
-func (kv *mockDataCM) MultiRead(keys []string) ([][]byte, error) {
+func (kv *mockDataCM) MultiRead(ctx context.Context, keys []string) ([][]byte, error) {
 	stats := &storage.PrimaryKeyStats{
 		FieldID: common.RowIDField,
 		Min:     0,
 		Max:     10,
-		BF:      bloom.NewWithEstimates(bloomFilterSize, maxBloomFalsePositive),
+		BF:      bloom.NewWithEstimates(100000, maxBloomFalsePositive),
 	}
 	buffer, _ := json.Marshal(stats)
 	return [][]byte{buffer}, nil
@@ -64,22 +67,24 @@ type mockPkfilterMergeError struct {
 	storage.ChunkManager
 }
 
-func (kv *mockPkfilterMergeError) MultiRead(keys []string) ([][]byte, error) {
-	stats := &storage.PrimaryKeyStats{
-		FieldID: common.RowIDField,
-		Min:     0,
-		Max:     10,
-		BF:      bloom.NewWithEstimates(1, 0.0001),
-	}
-	buffer, _ := json.Marshal(stats)
-	return [][]byte{buffer}, nil
+func (kv *mockPkfilterMergeError) MultiRead(ctx context.Context, keys []string) ([][]byte, error) {
+	/*
+		stats := &storage.PrimaryKeyStats{
+			FieldID: common.RowIDField,
+			Min:     0,
+			Max:     10,
+			BF:      bloom.NewWithEstimates(1, 0.0001),
+		}
+		buffer, _ := json.Marshal(stats)
+		return [][]byte{buffer}, nil*/
+	return nil, errors.New("mocked multi read error")
 }
 
 type mockDataCMError struct {
 	storage.ChunkManager
 }
 
-func (kv *mockDataCMError) MultiRead(keys []string) ([][]byte, error) {
+func (kv *mockDataCMError) MultiRead(ctx context.Context, keys []string) ([][]byte, error) {
 	return nil, fmt.Errorf("mock error")
 }
 
@@ -87,7 +92,7 @@ type mockDataCMStatsError struct {
 	storage.ChunkManager
 }
 
-func (kv *mockDataCMStatsError) MultiRead(keys []string) ([][]byte, error) {
+func (kv *mockDataCMStatsError) MultiRead(ctx context.Context, keys []string) ([][]byte, error) {
 	return [][]byte{[]byte("3123123,error,test")}, nil
 }
 
@@ -95,6 +100,57 @@ func getSimpleFieldBinlog() *datapb.FieldBinlog {
 	return &datapb.FieldBinlog{
 		FieldID: 106,
 		Binlogs: []*datapb.Binlog{{LogPath: "test"}},
+	}
+}
+
+func TestSegmentReplica_getChannelName(t *testing.T) {
+	var (
+		channelName = "TestSegmentReplica_getChannelName"
+		newSegments = map[UniqueID]*Segment{
+			100: {channelName: channelName},
+			101: {channelName: channelName},
+			102: {channelName: channelName},
+		}
+		normalSegments = map[UniqueID]*Segment{
+			200: {channelName: channelName},
+			201: {channelName: channelName},
+			202: {channelName: channelName},
+		}
+		flushedSegments = map[UniqueID]*Segment{
+			300: {channelName: channelName},
+			301: {channelName: channelName},
+			302: {channelName: channelName},
+		}
+	)
+
+	sr := &SegmentReplica{
+		newSegments:     newSegments,
+		normalSegments:  normalSegments,
+		flushedSegments: flushedSegments,
+	}
+
+	tests := []struct {
+		description string
+
+		seg     UniqueID
+		ifExist bool
+	}{
+		{"100 exists in new segments", 100, true},
+		{"201 exists in normal segments", 201, true},
+		{"302 exists in flushed segments", 302, true},
+		{"400 not exists in all segments", 400, false},
+	}
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			chanName, err := sr.getChannelName(test.seg)
+			if test.ifExist {
+				assert.NoError(t, err)
+				assert.Equal(t, channelName, chanName)
+			} else {
+				assert.Error(t, err)
+				assert.Empty(t, chanName)
+			}
+		})
 	}
 }
 
@@ -170,18 +226,28 @@ func TestSegmentReplica_getCollectionAndPartitionID(te *testing.T) {
 }
 
 func TestSegmentReplica(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	rc := &RootCoordFactory{
 		pkType: schemapb.DataType_Int64,
 	}
 	collID := UniqueID(1)
 	cm := storage.NewLocalChunkManager(storage.RootPath(segmentReplicaNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 
 	t.Run("Test coll mot match", func(t *testing.T) {
-		replica, err := newReplica(context.Background(), rc, cm, collID)
+		replica, err := newReplica(context.Background(), rc, cm, collID, nil)
 		assert.Nil(t, err)
-
-		err = replica.addNewSegment(1, collID+1, 0, "", nil, nil)
+		err = replica.addSegment(
+			addSegmentReq{
+				segType:     datapb.SegmentType_New,
+				segID:       1,
+				collID:      collID + 1,
+				partitionID: 0,
+				channelName: "",
+				startPos:    nil,
+				endPos:      nil,
+			})
 		assert.NotNil(t, err)
 	})
 
@@ -254,11 +320,13 @@ func TestSegmentReplica(t *testing.T) {
 }
 
 func TestSegmentReplica_InterfaceMethod(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	rc := &RootCoordFactory{
 		pkType: schemapb.DataType_Int64,
 	}
 	cm := storage.NewLocalChunkManager(storage.RootPath(segmentReplicaNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 
 	t.Run("Test addFlushedSegmentWithPKs", func(t *testing.T) {
 		tests := []struct {
@@ -277,7 +345,7 @@ func TestSegmentReplica_InterfaceMethod(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				replica, err := newReplica(context.TODO(), rc, cm, test.replicaCollID)
+				replica, err := newReplica(context.TODO(), rc, cm, test.replicaCollID, nil)
 				require.NoError(t, err)
 				if test.isvalid {
 					replica.addFlushedSegmentWithPKs(100, test.incollID, 10, "a", 1, primaryKeyData)
@@ -314,11 +382,19 @@ func TestSegmentReplica_InterfaceMethod(t *testing.T) {
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				sr, err := newReplica(context.Background(), rc, cm, test.replicaCollID)
+				sr, err := newReplica(context.Background(), rc, cm, test.replicaCollID, nil)
 				assert.Nil(t, err)
 				require.False(t, sr.hasSegment(test.inSegID, true))
-				err = sr.addNewSegment(test.inSegID,
-					test.inCollID, 1, "", test.instartPos, &internalpb.MsgPosition{})
+				err = sr.addSegment(
+					addSegmentReq{
+						segType:     datapb.SegmentType_New,
+						segID:       test.inSegID,
+						collID:      test.inCollID,
+						partitionID: 1,
+						channelName: "",
+						startPos:    test.instartPos,
+						endPos:      &internalpb.MsgPosition{},
+					})
 				if test.isValidCase {
 					assert.NoError(t, err)
 					assert.True(t, sr.hasSegment(test.inSegID, true))
@@ -350,10 +426,21 @@ func TestSegmentReplica_InterfaceMethod(t *testing.T) {
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				sr, err := newReplica(context.Background(), rc, &mockDataCM{}, test.replicaCollID)
+				sr, err := newReplica(context.Background(), rc, &mockDataCM{}, test.replicaCollID, nil)
 				assert.Nil(t, err)
 				require.False(t, sr.hasSegment(test.inSegID, true))
-				err = sr.addNormalSegment(test.inSegID, test.inCollID, 1, "", 0, []*datapb.FieldBinlog{getSimpleFieldBinlog()}, &segmentCheckPoint{}, 0)
+				err = sr.addSegment(
+					addSegmentReq{
+						segType:      datapb.SegmentType_Normal,
+						segID:        test.inSegID,
+						collID:       test.inCollID,
+						partitionID:  1,
+						channelName:  "",
+						numOfRows:    0,
+						statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+						cp:           &segmentCheckPoint{},
+						recoverTs:    0,
+					})
 				if test.isValidCase {
 					assert.NoError(t, err)
 					assert.True(t, sr.hasSegment(test.inSegID, true))
@@ -368,12 +455,23 @@ func TestSegmentReplica_InterfaceMethod(t *testing.T) {
 	})
 
 	t.Run("Test_addNormalSegmentWithNilDml", func(t *testing.T) {
-		sr, err := newReplica(context.Background(), rc, &mockDataCM{}, 1)
+		sr, err := newReplica(context.Background(), rc, &mockDataCM{}, 1, nil)
 		require.NoError(t, err)
 		segID := int64(101)
 		require.False(t, sr.hasSegment(segID, true))
 		assert.NotPanics(t, func() {
-			err = sr.addNormalSegment(segID, 1, 10, "empty_dml_chan", 0, []*datapb.FieldBinlog{}, nil, 0)
+			err = sr.addSegment(
+				addSegmentReq{
+					segType:      datapb.SegmentType_Normal,
+					segID:        segID,
+					collID:       1,
+					partitionID:  10,
+					channelName:  "empty_dml_chan",
+					numOfRows:    0,
+					statsBinLogs: []*datapb.FieldBinlog{},
+					cp:           nil,
+					recoverTs:    0,
+				})
 			assert.NoError(t, err)
 		})
 	})
@@ -560,10 +658,11 @@ func TestSegmentReplica_InterfaceMethod(t *testing.T) {
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				sr, err := newReplica(context.Background(), rc, cm, test.replicaCollID)
+				sr, err := newReplica(context.Background(), rc, cm, test.replicaCollID, nil)
 				assert.Nil(t, err)
 
 				if test.metaServiceErr {
+					sr.collSchema = nil
 					rc.setCollectionID(-1)
 				} else {
 					rc.setCollectionID(1)
@@ -605,78 +704,213 @@ func TestSegmentReplica_InterfaceMethod(t *testing.T) {
 	})
 
 	t.Run("Test_addSegmentMinIOLoadError", func(t *testing.T) {
-		sr, err := newReplica(context.Background(), rc, cm, 1)
+		sr, err := newReplica(context.Background(), rc, cm, 1, nil)
 		assert.Nil(t, err)
 		sr.chunkManager = &mockDataCMError{}
 
 		cpPos := &internalpb.MsgPosition{ChannelName: "insert-01", Timestamp: Timestamp(10)}
 		cp := &segmentCheckPoint{int64(10), *cpPos}
-		err = sr.addNormalSegment(1, 1, 2, "insert-01", int64(10), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, cp, 0)
+		err = sr.addSegment(
+			addSegmentReq{
+				segType:      datapb.SegmentType_Normal,
+				segID:        1,
+				collID:       1,
+				partitionID:  2,
+				channelName:  "insert-01",
+				numOfRows:    int64(10),
+				statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+				cp:           cp,
+				recoverTs:    0,
+			})
 		assert.NotNil(t, err)
-		err = sr.addFlushedSegment(1, 1, 2, "insert-01", int64(0), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, 0)
+		err = sr.addSegment(
+			addSegmentReq{
+				segType:      datapb.SegmentType_Flushed,
+				segID:        1,
+				collID:       1,
+				partitionID:  2,
+				channelName:  "insert-01",
+				numOfRows:    int64(0),
+				statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+				recoverTs:    0,
+			})
 		assert.NotNil(t, err)
 	})
 
 	t.Run("Test_addSegmentStatsError", func(t *testing.T) {
-		sr, err := newReplica(context.Background(), rc, cm, 1)
+		sr, err := newReplica(context.Background(), rc, cm, 1, nil)
 		assert.Nil(t, err)
 		sr.chunkManager = &mockDataCMStatsError{}
 
 		cpPos := &internalpb.MsgPosition{ChannelName: "insert-01", Timestamp: Timestamp(10)}
 		cp := &segmentCheckPoint{int64(10), *cpPos}
-		err = sr.addNormalSegment(1, 1, 2, "insert-01", int64(10), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, cp, 0)
+		err = sr.addSegment(
+			addSegmentReq{
+				segType:      datapb.SegmentType_Normal,
+				segID:        1,
+				collID:       1,
+				partitionID:  2,
+				channelName:  "insert-01",
+				numOfRows:    int64(10),
+				statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+				cp:           cp,
+				recoverTs:    0,
+			})
 		assert.NotNil(t, err)
-		err = sr.addFlushedSegment(1, 1, 2, "insert-01", int64(0), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, 0)
+		err = sr.addSegment(
+			addSegmentReq{
+				segType:      datapb.SegmentType_Flushed,
+				segID:        1,
+				collID:       1,
+				partitionID:  2,
+				channelName:  "insert-01",
+				numOfRows:    int64(0),
+				statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+				recoverTs:    0,
+			})
 		assert.NotNil(t, err)
 	})
 
 	t.Run("Test_addSegmentPkfilterError", func(t *testing.T) {
-		sr, err := newReplica(context.Background(), rc, cm, 1)
+		sr, err := newReplica(context.Background(), rc, cm, 1, nil)
 		assert.Nil(t, err)
 		sr.chunkManager = &mockPkfilterMergeError{}
 
 		cpPos := &internalpb.MsgPosition{ChannelName: "insert-01", Timestamp: Timestamp(10)}
 		cp := &segmentCheckPoint{int64(10), *cpPos}
-		err = sr.addNormalSegment(1, 1, 2, "insert-01", int64(10), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, cp, 0)
+		err = sr.addSegment(
+			addSegmentReq{
+				segType:      datapb.SegmentType_Normal,
+				segID:        1,
+				collID:       1,
+				partitionID:  2,
+				channelName:  "insert-01",
+				numOfRows:    int64(10),
+				statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+				cp:           cp,
+				recoverTs:    0,
+			})
 		assert.NotNil(t, err)
-		err = sr.addFlushedSegment(1, 1, 2, "insert-01", int64(0), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, 0)
+		err = sr.addSegment(
+			addSegmentReq{
+				segType:      datapb.SegmentType_Flushed,
+				segID:        1,
+				collID:       1,
+				partitionID:  2,
+				channelName:  "insert-01",
+				numOfRows:    int64(0),
+				statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+				recoverTs:    0,
+			})
 		assert.NotNil(t, err)
 	})
 
 	t.Run("Test_mergeFlushedSegments", func(t *testing.T) {
-		sr, err := newReplica(context.Background(), rc, cm, 1)
+		sr, err := newReplica(context.Background(), rc, cm, 1, nil)
 		assert.Nil(t, err)
 
 		primaryKeyData := &storage.Int64FieldData{
 			Data: []UniqueID{1},
 		}
-		sr.addFlushedSegmentWithPKs(1, 1, 0, "channel", 10, primaryKeyData)
-		sr.addFlushedSegmentWithPKs(2, 1, 0, "channel", 10, primaryKeyData)
-		require.True(t, sr.hasSegment(1, true))
-		require.True(t, sr.hasSegment(2, true))
+		tests := []struct {
+			description string
+			isValid     bool
+			stored      bool
 
-		sr.mergeFlushedSegments(3, 1, 0, 100, []UniqueID{1, 2}, "channel", 15)
-		assert.True(t, sr.hasSegment(3, true))
-		assert.False(t, sr.hasSegment(1, true))
-		assert.False(t, sr.hasSegment(2, true))
+			inCompactedFrom []UniqueID
+			inSeg           *Segment
+		}{
+			{"mismatch collection", false, false, []UniqueID{1, 2}, &Segment{
+				segmentID:    3,
+				collectionID: -1,
+			}},
+			{"no match flushed segment", false, false, []UniqueID{1, 6}, &Segment{
+				segmentID:    3,
+				collectionID: 1,
+			}},
+			{"numRows==0", true, false, []UniqueID{1, 2}, &Segment{
+				segmentID:    3,
+				collectionID: 1,
+				numRows:      0,
+			}},
+			{"numRows>0", true, true, []UniqueID{1, 2}, &Segment{
+				segmentID:    3,
+				collectionID: 1,
+				numRows:      15,
+			}},
+			{"segment exists but not flushed", false, false, []UniqueID{1, 4}, &Segment{
+				segmentID:    3,
+				collectionID: 1,
+				numRows:      15,
+			}},
+		}
 
-		to2from := sr.listCompactedSegmentIDs()
-		assert.NotEmpty(t, to2from)
+		for _, test := range tests {
+			t.Run(test.description, func(t *testing.T) {
+				// prepare segment replica
+				if !sr.hasSegment(1, true) {
+					sr.addFlushedSegmentWithPKs(1, 1, 0, "channel", 10, primaryKeyData)
+				}
 
-		from, ok := to2from[3]
-		assert.True(t, ok)
-		assert.ElementsMatch(t, []UniqueID{1, 2}, from)
+				if !sr.hasSegment(2, true) {
+					sr.addFlushedSegmentWithPKs(2, 1, 0, "channel", 10, primaryKeyData)
+				}
+
+				if !sr.hasSegment(4, false) {
+					sr.removeSegments(4)
+					sr.addSegment(addSegmentReq{
+						segType:     datapb.SegmentType_Normal,
+						segID:       4,
+						collID:      1,
+						partitionID: 0,
+					})
+				}
+
+				if sr.hasSegment(3, true) {
+					sr.removeSegments(3)
+				}
+
+				require.True(t, sr.hasSegment(1, true))
+				require.True(t, sr.hasSegment(2, true))
+				require.True(t, sr.hasSegment(4, false))
+				require.False(t, sr.hasSegment(3, true))
+
+				// tests start
+				err := sr.mergeFlushedSegments(test.inSeg, 100, test.inCompactedFrom)
+				if test.isValid {
+					assert.NoError(t, err)
+				} else {
+					assert.Error(t, err)
+				}
+
+				if test.stored {
+					assert.True(t, sr.hasSegment(3, true))
+
+					to2from := sr.listCompactedSegmentIDs()
+					assert.NotEmpty(t, to2from)
+
+					from, ok := to2from[3]
+					assert.True(t, ok)
+					assert.ElementsMatch(t, []UniqueID{1, 2}, from)
+				} else {
+					assert.False(t, sr.hasSegment(3, true))
+				}
+
+			})
+		}
 	})
 
 }
 func TestInnerFunctionSegment(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	rc := &RootCoordFactory{
 		pkType: schemapb.DataType_Int64,
 	}
 	collID := UniqueID(1)
 	cm := storage.NewLocalChunkManager(storage.RootPath(segmentReplicaNodeTestDir))
-	defer cm.RemoveWithPrefix("")
-	replica, err := newReplica(context.Background(), rc, cm, collID)
+	defer cm.RemoveWithPrefix(ctx, "")
+	replica, err := newReplica(context.Background(), rc, cm, collID, nil)
 	assert.Nil(t, err)
 	replica.chunkManager = &mockDataCM{}
 	assert.False(t, replica.hasSegment(0, true))
@@ -684,7 +918,16 @@ func TestInnerFunctionSegment(t *testing.T) {
 
 	startPos := &internalpb.MsgPosition{ChannelName: "insert-01", Timestamp: Timestamp(100)}
 	endPos := &internalpb.MsgPosition{ChannelName: "insert-01", Timestamp: Timestamp(200)}
-	err = replica.addNewSegment(0, 1, 2, "insert-01", startPos, endPos)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:     datapb.SegmentType_New,
+			segID:       0,
+			collID:      1,
+			partitionID: 2,
+			channelName: "insert-01",
+			startPos:    startPos,
+			endPos:      endPos,
+		})
 	assert.NoError(t, err)
 	assert.True(t, replica.hasSegment(0, true))
 	assert.Equal(t, 1, len(replica.newSegments))
@@ -709,7 +952,18 @@ func TestInnerFunctionSegment(t *testing.T) {
 
 	cpPos := &internalpb.MsgPosition{ChannelName: "insert-01", Timestamp: Timestamp(10)}
 	cp := &segmentCheckPoint{int64(10), *cpPos}
-	err = replica.addNormalSegment(1, 1, 2, "insert-01", int64(10), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, cp, 0)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:      datapb.SegmentType_Normal,
+			segID:        1,
+			collID:       1,
+			partitionID:  2,
+			channelName:  "insert-01",
+			numOfRows:    int64(10),
+			statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+			cp:           cp,
+			recoverTs:    0,
+		})
 	assert.NoError(t, err)
 	assert.True(t, replica.hasSegment(1, true))
 	assert.Equal(t, 1, len(replica.normalSegments))
@@ -726,7 +980,18 @@ func TestInnerFunctionSegment(t *testing.T) {
 	assert.False(t, seg.isNew.Load().(bool))
 	assert.False(t, seg.isFlushed.Load().(bool))
 
-	err = replica.addNormalSegment(1, 100000, 2, "invalid", int64(0), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, &segmentCheckPoint{}, 0)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:      datapb.SegmentType_Normal,
+			segID:        1,
+			collID:       100000,
+			partitionID:  2,
+			channelName:  "invalid",
+			numOfRows:    int64(0),
+			statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+			cp:           &segmentCheckPoint{},
+			recoverTs:    0,
+		})
 	assert.Error(t, err)
 
 	replica.updateStatistics(1, 10)
@@ -761,7 +1026,17 @@ func TestInnerFunctionSegment(t *testing.T) {
 	replica.updateSegmentCheckPoint(1)
 	assert.Equal(t, int64(20), replica.normalSegments[UniqueID(1)].checkPoint.numRows)
 
-	err = replica.addFlushedSegment(1, 1, 2, "insert-01", int64(0), []*datapb.FieldBinlog{getSimpleFieldBinlog()}, 0)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:      datapb.SegmentType_Flushed,
+			segID:        1,
+			collID:       1,
+			partitionID:  2,
+			channelName:  "insert-01",
+			numOfRows:    int64(0),
+			statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+			recoverTs:    0,
+		})
 	assert.Nil(t, err)
 
 	totalSegments := replica.filterSegments("insert-01", common.InvalidPartitionID)
@@ -793,7 +1068,55 @@ func TestSegmentReplica_UpdatePKRange(t *testing.T) {
 	}
 }
 
+func TestSegment_getSegmentStatslog(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	cases := make([][]int64, 0, 100)
+	for i := 0; i < 100; i++ {
+		tc := make([]int64, 0, 10)
+		for j := 0; j < 100; j++ {
+			tc = append(tc, rand.Int63())
+		}
+		cases = append(cases, tc)
+	}
+	buf := make([]byte, 8)
+	for _, tc := range cases {
+		seg := &Segment{
+			pkFilter: bloom.NewWithEstimates(100000, 0.005),
+		}
+
+		seg.updatePKRange(&storage.Int64FieldData{
+			Data: tc,
+		})
+
+		statBytes, err := seg.getSegmentStatslog(1, schemapb.DataType_Int64)
+		assert.NoError(t, err)
+
+		pks := storage.PrimaryKeyStats{}
+		err = json.Unmarshal(statBytes, &pks)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(1), pks.FieldID)
+		assert.Equal(t, int64(schemapb.DataType_Int64), pks.PkType)
+
+		for _, v := range tc {
+			pk := newInt64PrimaryKey(v)
+			assert.True(t, pks.MinPk.LE(pk))
+			assert.True(t, pks.MaxPk.GE(pk))
+
+			common.Endian.PutUint64(buf, uint64(v))
+			assert.True(t, seg.pkFilter.Test(buf))
+		}
+	}
+
+	pks := &storage.PrimaryKeyStats{}
+	_, err := json.Marshal(pks)
+	assert.NoError(t, err)
+}
+
 func TestReplica_UpdatePKRange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	rc := &RootCoordFactory{
 		pkType: schemapb.DataType_Int64,
 	}
@@ -806,14 +1129,34 @@ func TestReplica_UpdatePKRange(t *testing.T) {
 	cp := &segmentCheckPoint{int64(10), *cpPos}
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(segmentReplicaNodeTestDir))
-	defer cm.RemoveWithPrefix("")
-	replica, err := newReplica(context.Background(), rc, cm, collID)
+	defer cm.RemoveWithPrefix(ctx, "")
+	replica, err := newReplica(context.Background(), rc, cm, collID, nil)
 	assert.Nil(t, err)
 	replica.chunkManager = &mockDataCM{}
 
-	err = replica.addNewSegment(1, collID, partID, chanName, startPos, endPos)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:     datapb.SegmentType_New,
+			segID:       1,
+			collID:      collID,
+			partitionID: partID,
+			channelName: chanName,
+			startPos:    startPos,
+			endPos:      endPos,
+		})
 	assert.Nil(t, err)
-	err = replica.addNormalSegment(2, collID, partID, chanName, 100, []*datapb.FieldBinlog{getSimpleFieldBinlog()}, cp, 0)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:      datapb.SegmentType_Normal,
+			segID:        2,
+			collID:       collID,
+			partitionID:  partID,
+			channelName:  chanName,
+			numOfRows:    100,
+			statsBinLogs: []*datapb.FieldBinlog{getSimpleFieldBinlog()},
+			cp:           cp,
+			recoverTs:    0,
+		})
 	assert.Nil(t, err)
 
 	segNew := replica.newSegments[1]
@@ -843,4 +1186,129 @@ func TestReplica_UpdatePKRange(t *testing.T) {
 
 	}
 
+}
+
+// SegmentReplicaSuite setup test suite for SegmentReplica
+type SegmentReplicaSuite struct {
+	suite.Suite
+	sr *SegmentReplica
+
+	collID    UniqueID
+	partID    UniqueID
+	vchanName string
+	cm        *storage.LocalChunkManager
+}
+
+func (s *SegmentReplicaSuite) SetupSuite() {
+	rc := &RootCoordFactory{
+		pkType: schemapb.DataType_Int64,
+	}
+	s.collID = 1
+	s.cm = storage.NewLocalChunkManager(storage.RootPath(segmentReplicaNodeTestDir))
+	var err error
+	s.sr, err = newReplica(context.Background(), rc, s.cm, s.collID, nil)
+	s.Require().NoError(err)
+}
+
+func (s *SegmentReplicaSuite) TearDownSuite() {
+	s.cm.RemoveWithPrefix(context.Background(), "")
+}
+
+func (s *SegmentReplicaSuite) SetupTest() {
+	var err error
+	err = s.sr.addSegment(addSegmentReq{
+		segType:     datapb.SegmentType_New,
+		segID:       1,
+		collID:      s.collID,
+		partitionID: s.partID,
+		channelName: s.vchanName,
+		startPos:    &internalpb.MsgPosition{},
+		endPos:      nil,
+	})
+	s.Require().NoError(err)
+	err = s.sr.addSegment(addSegmentReq{
+		segType:      datapb.SegmentType_Normal,
+		segID:        2,
+		collID:       s.collID,
+		partitionID:  s.partID,
+		channelName:  s.vchanName,
+		numOfRows:    10,
+		statsBinLogs: nil,
+		cp:           nil,
+		recoverTs:    0,
+	})
+	s.Require().NoError(err)
+	err = s.sr.addSegment(addSegmentReq{
+		segType:      datapb.SegmentType_Flushed,
+		segID:        3,
+		collID:       s.collID,
+		partitionID:  s.partID,
+		channelName:  s.vchanName,
+		numOfRows:    10,
+		statsBinLogs: nil,
+		recoverTs:    0,
+	})
+	s.Require().NoError(err)
+}
+
+func (s *SegmentReplicaSuite) TearDownTest() {
+	s.sr.removeSegments(1, 2, 3)
+}
+
+func (s *SegmentReplicaSuite) TestGetSegmentStatslog() {
+	bs, err := s.sr.getSegmentStatslog(1)
+	s.NoError(err)
+
+	segment, ok := s.getSegmentByID(1)
+	s.Require().True(ok)
+	expected, err := segment.getSegmentStatslog(106, schemapb.DataType_Int64)
+	s.Require().NoError(err)
+	s.Equal(expected, bs)
+
+	bs, err = s.sr.getSegmentStatslog(2)
+	s.NoError(err)
+
+	segment, ok = s.getSegmentByID(2)
+	s.Require().True(ok)
+	expected, err = segment.getSegmentStatslog(106, schemapb.DataType_Int64)
+	s.Require().NoError(err)
+	s.Equal(expected, bs)
+
+	bs, err = s.sr.getSegmentStatslog(3)
+	s.NoError(err)
+
+	segment, ok = s.getSegmentByID(3)
+	s.Require().True(ok)
+	expected, err = segment.getSegmentStatslog(106, schemapb.DataType_Int64)
+	s.Require().NoError(err)
+	s.Equal(expected, bs)
+
+	_, err = s.sr.getSegmentStatslog(4)
+	s.Error(err)
+}
+
+func (s *SegmentReplicaSuite) getSegmentByID(id UniqueID) (*Segment, bool) {
+	s.sr.segMu.RLock()
+	defer s.sr.segMu.RUnlock()
+
+	seg, ok := s.sr.newSegments[id]
+	if ok {
+		return seg, true
+	}
+
+	seg, ok = s.sr.normalSegments[id]
+	if ok {
+		return seg, true
+	}
+
+	seg, ok = s.sr.flushedSegments[id]
+	if ok {
+		return seg, true
+	}
+
+	return nil, false
+}
+
+func TestSegmentReplicaSuite(t *testing.T) {
+	suite.Run(t, new(SegmentReplicaSuite))
 }

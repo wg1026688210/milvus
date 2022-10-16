@@ -20,10 +20,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/milvus-io/milvus/internal/util/grpcclient"
@@ -114,17 +114,17 @@ func (c *Client) Register() error {
 }
 
 // GetComponentStates gets the component states of QueryCoord.
-func (c *Client) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
+func (c *Client) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
 	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
 		if !funcutil.CheckCtxValid(ctx) {
 			return nil, ctx.Err()
 		}
-		return client.(querypb.QueryCoordClient).GetComponentStates(ctx, &internalpb.GetComponentStatesRequest{})
+		return client.(querypb.QueryCoordClient).GetComponentStates(ctx, &milvuspb.GetComponentStatesRequest{})
 	})
 	if err != nil || ret == nil {
 		return nil, err
 	}
-	return ret.(*internalpb.ComponentStates), err
+	return ret.(*milvuspb.ComponentStates), err
 }
 
 // GetTimeTickChannel gets the time tick channel of QueryCoord.
@@ -279,6 +279,21 @@ func (c *Client) LoadBalance(ctx context.Context, req *querypb.LoadBalanceReques
 		return nil, err
 	}
 	return ret.(*commonpb.Status), err
+}
+
+// ShowConfigurations gets specified configurations para of QueryCoord
+func (c *Client) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	ret, err := c.grpcClient.ReCall(ctx, func(client interface{}) (interface{}, error) {
+		if !funcutil.CheckCtxValid(ctx) {
+			return nil, ctx.Err()
+		}
+		return client.(querypb.QueryCoordClient).ShowConfigurations(ctx, req)
+	})
+	if err != nil || ret == nil {
+		return nil, err
+	}
+
+	return ret.(*internalpb.ShowConfigurationsResponse), err
 }
 
 // GetMetrics gets the metrics information of QueryCoord.

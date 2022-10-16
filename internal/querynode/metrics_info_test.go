@@ -22,9 +22,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/etcd"
+	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 )
 
@@ -41,9 +43,37 @@ func TestGetSystemInfoMetrics(t *testing.T) {
 	node.session = sessionutil.NewSession(node.queryNodeLoopCtx, Params.EtcdCfg.MetaRootPath, etcdCli)
 
 	req := &milvuspb.GetMetricsRequest{
-		Base: genCommonMsgBase(commonpb.MsgType_WatchQueryChannels),
+		Base: genCommonMsgBase(commonpb.MsgType_WatchQueryChannels, node.session.ServerID),
 	}
 	resp, err := getSystemInfoMetrics(ctx, req, node)
 	assert.NoError(t, err)
-	resp.Status.ErrorCode = commonpb.ErrorCode_Success
+	assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+
+	// test getQuotaMetricsError
+	rateCol.Deregister(metricsinfo.NQPerSecond)
+	resp, err = getSystemInfoMetrics(ctx, req, node)
+	assert.NoError(t, err)
+	assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	rateCol.Register(metricsinfo.NQPerSecond)
+}
+
+func TestGetComponentConfigurationsFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	node, err := genSimpleQueryNode(ctx)
+	assert.NoError(t, err)
+
+	etcdCli, err := etcd.GetEtcdClient(&Params.EtcdCfg)
+	assert.NoError(t, err)
+	defer etcdCli.Close()
+	node.session = sessionutil.NewSession(node.queryNodeLoopCtx, Params.EtcdCfg.MetaRootPath, etcdCli)
+
+	req := &internalpb.ShowConfigurationsRequest{
+		Base:    genCommonMsgBase(commonpb.MsgType_WatchQueryChannels, node.session.ServerID),
+		Pattern: "Cache",
+	}
+
+	resq := getComponentConfigurations(ctx, req)
+	assert.Equal(t, resq.Status.ErrorCode, commonpb.ErrorCode_Success)
 }

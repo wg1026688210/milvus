@@ -17,22 +17,26 @@
 package querynode
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
 
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-
+	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
+
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
+
+var _ typeutil.ResultWithID = &internalpb.RetrieveResults{}
+var _ typeutil.ResultWithID = &segcorepb.RetrieveResults{}
 
 func reduceStatisticResponse(results []*internalpb.GetStatisticsResponse) (*internalpb.GetStatisticsResponse, error) {
 	mergedResults := map[string]interface{}{
@@ -73,24 +77,24 @@ func reduceStatisticResponse(results []*internalpb.GetStatisticsResponse) (*inte
 	return ret, nil
 }
 
-func reduceSearchResults(results []*internalpb.SearchResults, nq int64, topk int64, metricType string) (*internalpb.SearchResults, error) {
+func reduceSearchResults(ctx context.Context, results []*internalpb.SearchResults, nq int64, topk int64, metricType string) (*internalpb.SearchResults, error) {
 	searchResultData, err := decodeSearchResults(results)
 	if err != nil {
-		log.Warn("shard leader decode search results errors", zap.Error(err))
+		log.Ctx(ctx).Warn("shard leader decode search results errors", zap.Error(err))
 		return nil, err
 	}
-	log.Debug("shard leader get valid search results", zap.Int("numbers", len(searchResultData)))
+	log.Ctx(ctx).Debug("shard leader get valid search results", zap.Int("numbers", len(searchResultData)))
 
 	for i, sData := range searchResultData {
-		log.Debug("reduceSearchResultData",
+		log.Ctx(ctx).Debug("reduceSearchResultData",
 			zap.Int("result No.", i),
 			zap.Int64("nq", sData.NumQueries),
 			zap.Int64("topk", sData.TopK))
 	}
 
-	reducedResultData, err := reduceSearchResultData(searchResultData, nq, topk)
+	reducedResultData, err := reduceSearchResultData(ctx, searchResultData, nq, topk)
 	if err != nil {
-		log.Warn("shard leader reduce errors", zap.Error(err))
+		log.Ctx(ctx).Warn("shard leader reduce errors", zap.Error(err))
 		return nil, err
 	}
 	searchResults, err := encodeSearchResultData(reducedResultData, nq, topk, metricType)
@@ -110,7 +114,7 @@ func reduceSearchResults(results []*internalpb.SearchResults, nq int64, topk int
 	return searchResults, nil
 }
 
-func reduceSearchResultData(searchResultData []*schemapb.SearchResultData, nq int64, topk int64) (*schemapb.SearchResultData, error) {
+func reduceSearchResultData(ctx context.Context, searchResultData []*schemapb.SearchResultData, nq int64, topk int64) (*schemapb.SearchResultData, error) {
 	if len(searchResultData) == 0 {
 		return &schemapb.SearchResultData{
 			NumQueries: nq,
@@ -174,22 +178,37 @@ func reduceSearchResultData(searchResultData []*schemapb.SearchResultData, nq in
 		// }
 		ret.Topks = append(ret.Topks, j)
 	}
-	log.Debug("skip duplicated search result", zap.Int64("count", skipDupCnt))
+	log.Ctx(ctx).Debug("skip duplicated search result", zap.Int64("count", skipDupCnt))
 	return ret, nil
 }
 
 func selectSearchResultData(dataArray []*schemapb.SearchResultData, resultOffsets [][]int64, offsets []int64, qi int64) int {
-	sel := -1
-	maxDistance := -1 * float32(math.MaxFloat32)
+	var (
+		sel                 = -1
+		maxDistance         = -1 * float32(math.MaxFloat32)
+		resultDataIdx int64 = -1
+	)
 	for i, offset := range offsets { // query num, the number of ways to merge
 		if offset >= dataArray[i].Topks[qi] {
 			continue
 		}
+
 		idx := resultOffsets[i][qi] + offset
 		distance := dataArray[i].Scores[idx]
+
 		if distance > maxDistance {
 			sel = i
 			maxDistance = distance
+			resultDataIdx = idx
+		} else if distance == maxDistance {
+			sID := typeutil.GetPK(dataArray[i].GetIds(), idx)
+			tmpID := typeutil.GetPK(dataArray[sel].GetIds(), resultDataIdx)
+
+			if typeutil.ComparePK(sID, tmpID) {
+				sel = i
+				maxDistance = distance
+				resultDataIdx = idx
+			}
 		}
 	}
 	return sel
@@ -233,100 +252,121 @@ func encodeSearchResultData(searchResultData *schemapb.SearchResultData, nq int6
 	return
 }
 
-// TODO: largely based on function mergeSegcoreRetrieveResults, need rewriting
-func mergeInternalRetrieveResults(retrieveResults []*internalpb.RetrieveResults) (*internalpb.RetrieveResults, error) {
-	var ret *internalpb.RetrieveResults
-	var skipDupCnt int64
-	var idSet = make(map[interface{}]struct{})
+func mergeInternalRetrieveResult(ctx context.Context, retrieveResults []*internalpb.RetrieveResults, limit int64) (*internalpb.RetrieveResults, error) {
+	log.Ctx(ctx).Debug("reduceInternelRetrieveResults",
+		zap.Int64("limit", limit),
+		zap.Int("len(retrieveResults)", len(retrieveResults)),
+	)
+	var (
+		ret = &internalpb.RetrieveResults{
+			Ids: &schemapb.IDs{},
+		}
 
-	// merge results and remove duplicates
-	for _, rr := range retrieveResults {
-		// skip if fields data is empty
-		if len(rr.FieldsData) == 0 {
+		skipDupCnt int64
+		loopEnd    int
+	)
+
+	validRetrieveResults := []*internalpb.RetrieveResults{}
+	for _, r := range retrieveResults {
+		size := typeutil.GetSizeOfIDs(r.GetIds())
+		if r == nil || len(r.GetFieldsData()) == 0 || size == 0 {
 			continue
 		}
-
-		if ret == nil {
-			ret = &internalpb.RetrieveResults{
-				Ids:        &schemapb.IDs{},
-				FieldsData: make([]*schemapb.FieldData, len(rr.FieldsData)),
-			}
-		}
-
-		if len(ret.FieldsData) != len(rr.FieldsData) {
-			log.Warn("mismatch FieldData in RetrieveResults")
-			return nil, fmt.Errorf("mismatch FieldData in RetrieveResults")
-		}
-
-		numPks := typeutil.GetSizeOfIDs(rr.GetIds())
-		for i := 0; i < numPks; i++ {
-			id := typeutil.GetPK(rr.GetIds(), int64(i))
-			if _, ok := idSet[id]; !ok {
-				typeutil.AppendPKs(ret.Ids, id)
-				typeutil.AppendFieldData(ret.FieldsData, rr.FieldsData, int64(i))
-				idSet[id] = struct{}{}
-			} else {
-				// primary keys duplicate
-				skipDupCnt++
-			}
-		}
+		validRetrieveResults = append(validRetrieveResults, r)
+		loopEnd += size
 	}
 
-	// not found, return default values indicating not result found
-	if ret == nil {
-		ret = &internalpb.RetrieveResults{
-			Ids:        &schemapb.IDs{},
-			FieldsData: []*schemapb.FieldData{},
+	if len(validRetrieveResults) == 0 {
+		return ret, nil
+	}
+
+	if limit != typeutil.Unlimited {
+		loopEnd = int(limit)
+	}
+
+	ret.FieldsData = make([]*schemapb.FieldData, len(validRetrieveResults[0].GetFieldsData()))
+	idSet := make(map[interface{}]struct{})
+	cursors := make([]int64, len(validRetrieveResults))
+	for j := 0; j < loopEnd; j++ {
+		sel := typeutil.SelectMinPK(validRetrieveResults, cursors)
+		if sel == -1 {
+			break
 		}
+
+		pk := typeutil.GetPK(validRetrieveResults[sel].GetIds(), cursors[sel])
+		if _, ok := idSet[pk]; !ok {
+			typeutil.AppendPKs(ret.Ids, pk)
+			typeutil.AppendFieldData(ret.FieldsData, validRetrieveResults[sel].GetFieldsData(), cursors[sel])
+			idSet[pk] = struct{}{}
+		} else {
+			// primary keys duplicate
+			skipDupCnt++
+		}
+		cursors[sel]++
+	}
+
+	if skipDupCnt > 0 {
+		log.Ctx(ctx).Debug("skip duplicated query result while reducing internal.RetrieveResults", zap.Int64("count", skipDupCnt))
 	}
 
 	return ret, nil
 }
 
-func mergeSegcoreRetrieveResults(retrieveResults []*segcorepb.RetrieveResults) (*segcorepb.RetrieveResults, error) {
-	var ret *segcorepb.RetrieveResults
-	var skipDupCnt int64
-	var idSet = make(map[interface{}]struct{})
+func mergeSegcoreRetrieveResults(ctx context.Context, retrieveResults []*segcorepb.RetrieveResults, limit int64) (*segcorepb.RetrieveResults, error) {
+	log.Ctx(ctx).Debug("reduceSegcoreRetrieveResults",
+		zap.Int64("limit", limit),
+		zap.Int("len(retrieveResults)", len(retrieveResults)),
+	)
+	var (
+		ret = &segcorepb.RetrieveResults{
+			Ids: &schemapb.IDs{},
+		}
 
-	// merge results and remove duplicates
-	for _, rr := range retrieveResults {
-		// skip empty result, it will break merge result
-		if rr == nil || len(rr.Offset) == 0 {
+		skipDupCnt int64
+		loopEnd    int
+	)
+
+	validRetrieveResults := []*segcorepb.RetrieveResults{}
+	for _, r := range retrieveResults {
+		size := typeutil.GetSizeOfIDs(r.GetIds())
+		if r == nil || len(r.GetOffset()) == 0 || size == 0 {
 			continue
 		}
-
-		if ret == nil {
-			ret = &segcorepb.RetrieveResults{
-				Ids:        &schemapb.IDs{},
-				FieldsData: make([]*schemapb.FieldData, len(rr.FieldsData)),
-			}
-		}
-
-		if len(ret.FieldsData) != len(rr.FieldsData) {
-			return nil, fmt.Errorf("mismatch FieldData in RetrieveResults")
-		}
-
-		pkHitNum := typeutil.GetSizeOfIDs(rr.GetIds())
-		for i := 0; i < pkHitNum; i++ {
-			id := typeutil.GetPK(rr.GetIds(), int64(i))
-			if _, ok := idSet[id]; !ok {
-				typeutil.AppendPKs(ret.Ids, id)
-				typeutil.AppendFieldData(ret.FieldsData, rr.FieldsData, int64(i))
-				idSet[id] = struct{}{}
-			} else {
-				// primary keys duplicate
-				skipDupCnt++
-			}
-		}
+		validRetrieveResults = append(validRetrieveResults, r)
+		loopEnd += size
 	}
-	log.Debug("skip duplicated query result", zap.Int64("count", skipDupCnt))
 
-	// not found, return default values indicating not result found
-	if ret == nil {
-		ret = &segcorepb.RetrieveResults{
-			Ids:        &schemapb.IDs{},
-			FieldsData: []*schemapb.FieldData{},
+	if len(validRetrieveResults) == 0 {
+		return ret, nil
+	}
+
+	if limit != typeutil.Unlimited {
+		loopEnd = int(limit)
+	}
+
+	ret.FieldsData = make([]*schemapb.FieldData, len(validRetrieveResults[0].GetFieldsData()))
+	idSet := make(map[interface{}]struct{})
+	cursors := make([]int64, len(validRetrieveResults))
+	for j := 0; j < loopEnd; j++ {
+		sel := typeutil.SelectMinPK(validRetrieveResults, cursors)
+		if sel == -1 {
+			break
 		}
+
+		pk := typeutil.GetPK(validRetrieveResults[sel].GetIds(), cursors[sel])
+		if _, ok := idSet[pk]; !ok {
+			typeutil.AppendPKs(ret.Ids, pk)
+			typeutil.AppendFieldData(ret.FieldsData, validRetrieveResults[sel].GetFieldsData(), cursors[sel])
+			idSet[pk] = struct{}{}
+		} else {
+			// primary keys duplicate
+			skipDupCnt++
+		}
+		cursors[sel]++
+	}
+
+	if skipDupCnt > 0 {
+		log.Ctx(ctx).Debug("skip duplicated query result while reducing segcore.RetrieveResults", zap.Int64("count", skipDupCnt))
 	}
 
 	return ret, nil

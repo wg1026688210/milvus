@@ -19,14 +19,12 @@ package mock
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 )
@@ -57,10 +55,6 @@ func (m *GrpcRootCoordClient) SelectUser(ctx context.Context, in *milvuspb.Selec
 	return &milvuspb.SelectUserResponse{}, m.Err
 }
 
-func (m *GrpcRootCoordClient) SelectResource(ctx context.Context, in *milvuspb.SelectResourceRequest, opts ...grpc.CallOption) (*milvuspb.SelectResourceResponse, error) {
-	return &milvuspb.SelectResourceResponse{}, m.Err
-}
-
 func (m *GrpcRootCoordClient) OperatePrivilege(ctx context.Context, in *milvuspb.OperatePrivilegeRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }
@@ -73,8 +67,8 @@ func (m *GrpcRootCoordClient) ListPolicy(ctx context.Context, in *internalpb.Lis
 	return &internalpb.ListPolicyResponse{}, m.Err
 }
 
-func (m *GrpcRootCoordClient) GetComponentStates(ctx context.Context, in *internalpb.GetComponentStatesRequest, opts ...grpc.CallOption) (*internalpb.ComponentStates, error) {
-	return &internalpb.ComponentStates{}, m.Err
+func (m *GrpcRootCoordClient) GetComponentStates(ctx context.Context, in *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error) {
+	return &milvuspb.ComponentStates{}, m.Err
 }
 func (m *GrpcRootCoordClient) GetTimeTickChannel(ctx context.Context, in *internalpb.GetTimeTickChannelRequest, opts ...grpc.CallOption) (*milvuspb.StringResponse, error) {
 	return &milvuspb.StringResponse{}, m.Err
@@ -143,21 +137,21 @@ func (m *GrpcRootCoordClient) DescribeSegments(ctx context.Context, in *rootcoor
 	return &rootcoordpb.DescribeSegmentsResponse{}, m.Err
 }
 
-func (m *GrpcRootCoordClient) CreateIndex(ctx context.Context, in *milvuspb.CreateIndexRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
-	return &commonpb.Status{}, m.Err
-}
-
-func (m *GrpcRootCoordClient) DescribeIndex(ctx context.Context, in *milvuspb.DescribeIndexRequest, opts ...grpc.CallOption) (*milvuspb.DescribeIndexResponse, error) {
-	return &milvuspb.DescribeIndexResponse{}, m.Err
-}
-
-func (m *GrpcRootCoordClient) GetIndexState(ctx context.Context, in *milvuspb.GetIndexStateRequest, opt ...grpc.CallOption) (*indexpb.GetIndexStatesResponse, error) {
-	return &indexpb.GetIndexStatesResponse{}, m.Err
-}
-
-func (m *GrpcRootCoordClient) DropIndex(ctx context.Context, in *milvuspb.DropIndexRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
-	return &commonpb.Status{}, m.Err
-}
+//func (m *GrpcRootCoordClient) CreateIndex(ctx context.Context, in *milvuspb.CreateIndexRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+//	return &commonpb.Status{}, m.Err
+//}
+//
+//func (m *GrpcRootCoordClient) DescribeIndex(ctx context.Context, in *milvuspb.DescribeIndexRequest, opts ...grpc.CallOption) (*milvuspb.DescribeIndexResponse, error) {
+//	return &milvuspb.DescribeIndexResponse{}, m.Err
+//}
+//
+//func (m *GrpcRootCoordClient) GetIndexState(ctx context.Context, in *milvuspb.GetIndexStateRequest, opt ...grpc.CallOption) (*indexpb.GetIndexStatesResponse, error) {
+//	return &indexpb.GetIndexStatesResponse{}, m.Err
+//}
+//
+//func (m *GrpcRootCoordClient) DropIndex(ctx context.Context, in *milvuspb.DropIndexRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+//	return &commonpb.Status{}, m.Err
+//}
 
 func (m *GrpcRootCoordClient) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestampRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocTimestampResponse, error) {
 	return &rootcoordpb.AllocTimestampResponse{}, m.Err
@@ -171,16 +165,16 @@ func (m *GrpcRootCoordClient) UpdateChannelTimeTick(ctx context.Context, in *int
 	return &commonpb.Status{}, m.Err
 }
 
-func (m *GrpcRootCoordClient) ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
-	return &commonpb.Status{}, m.Err
-}
-
 func (m *GrpcRootCoordClient) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.InvalidateCollMetaCacheRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }
 
 func (m *GrpcRootCoordClient) SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcRootCoordClient) ShowConfigurations(ctx context.Context, in *internalpb.ShowConfigurationsRequest, opts ...grpc.CallOption) (*internalpb.ShowConfigurationsResponse, error) {
+	return &internalpb.ShowConfigurationsResponse{}, m.Err
 }
 
 func (m *GrpcRootCoordClient) GetMetrics(ctx context.Context, in *milvuspb.GetMetricsRequest, opts ...grpc.CallOption) (*milvuspb.GetMetricsResponse, error) {
@@ -221,4 +215,8 @@ func (m *GrpcRootCoordClient) ListCredUsers(ctx context.Context, in *milvuspb.Li
 
 func (m *GrpcRootCoordClient) GetCredential(ctx context.Context, in *rootcoordpb.GetCredentialRequest, opts ...grpc.CallOption) (*rootcoordpb.GetCredentialResponse, error) {
 	return &rootcoordpb.GetCredentialResponse{}, m.Err
+}
+
+func (m *GrpcRootCoordClient) AlterCollection(ctx context.Context, in *milvuspb.AlterCollectionRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
 }

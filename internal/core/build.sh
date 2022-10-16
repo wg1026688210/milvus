@@ -36,6 +36,7 @@ GPU_VERSION="OFF" #defaults to CPU version
 WITH_PROMETHEUS="ON"
 CUDA_ARCH="DEFAULT"
 CUSTOM_THIRDPARTY_PATH=""
+BUILD_DISK_ANN="OFF"
 
 while getopts "p:t:s:f:o:ulrcghzme" arg; do
   case $arg in
@@ -78,9 +79,11 @@ while getopts "p:t:s:f:o:ulrcghzme" arg; do
   s)
     CUDA_ARCH=$OPTARG
     ;;
+  n)
+    BUILD_DISK_ANN="OFF"
+    ;;
   h) # help
     echo "
-
 parameter:
 -f: custom paths of thirdparty downloaded files(default: NULL)
 -p: install prefix(default: $(pwd)/milvus)
@@ -95,7 +98,6 @@ parameter:
 -e: build without prometheus(default: OFF)
 -s: build with CUDA arch(default:DEFAULT), for example '-gencode=compute_61,code=sm_61;-gencode=compute_75,code=sm_75'
 -h: help
-
 usage:
 ./build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} -f\${CUSTOM_THIRDPARTY_PATH} [-u] [-l] [-r] [-c] [-z] [-g] [-m] [-e] [-h]
                 "
@@ -151,6 +153,7 @@ CMAKE_CMD="cmake \
 -DMILVUS_CUDA_ARCH=${CUDA_ARCH} \
 -DCUSTOM_THIRDPARTY_DOWNLOAD_PATH=${CUSTOM_THIRDPARTY_PATH} \
 -DKNOWHERE_GPU_VERSION=${SUPPORT_GPU} \
+-DBUILD_DISK_ANN=${BUILD_DISK_ANN} \
 ${SCRIPTS_DIR}"
 echo ${CMAKE_CMD}
 ${CMAKE_CMD}

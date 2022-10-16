@@ -24,9 +24,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	grpcindexnode "github.com/milvus-io/milvus/internal/distributed/indexnode"
 	"github.com/milvus-io/milvus/internal/indexnode"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/dependency"
@@ -42,11 +42,11 @@ var ParamsGlobal paramtable.ComponentParam
 func Test_NewClient(t *testing.T) {
 	ClientParams.InitOnce(typeutil.IndexNodeRole)
 	ctx := context.Background()
-	client, err := NewClient(ctx, "")
+	client, err := NewClient(ctx, "", false)
 	assert.Nil(t, client)
 	assert.NotNil(t, err)
 
-	client, err = NewClient(ctx, "test")
+	client, err = NewClient(ctx, "test", false)
 	assert.Nil(t, err)
 	assert.NotNil(t, client)
 
@@ -73,17 +73,20 @@ func Test_NewClient(t *testing.T) {
 		r1, err := client.GetComponentStates(ctx)
 		retCheck(retNotNil, r1, err)
 
-		r2, err := client.GetTimeTickChannel(ctx)
-		retCheck(retNotNil, r2, err)
-
 		r3, err := client.GetStatisticsChannel(ctx)
 		retCheck(retNotNil, r3, err)
 
-		r4, err := client.CreateIndex(ctx, nil)
+		r4, err := client.CreateJob(ctx, nil)
 		retCheck(retNotNil, r4, err)
 
 		r5, err := client.GetMetrics(ctx, nil)
 		retCheck(retNotNil, r5, err)
+
+		r6, err := client.QueryJobs(ctx, nil)
+		retCheck(retNotNil, r6, err)
+
+		r7, err := client.DropJobs(ctx, nil)
+		retCheck(retNotNil, r7, err)
 	}
 
 	client.grpcClient = &mock.GRPCClientBase{
@@ -129,7 +132,7 @@ func TestIndexNodeClient(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, ins)
 
-	inm := &indexnode.Mock{}
+	inm := indexnode.NewIndexNodeMock()
 	ParamsGlobal.InitOnce()
 	etcdCli, err := etcd.GetEtcdClient(&ParamsGlobal.EtcdCfg)
 	assert.NoError(t, err)
@@ -140,7 +143,7 @@ func TestIndexNodeClient(t *testing.T) {
 	err = ins.Run()
 	assert.Nil(t, err)
 
-	inc, err := NewClient(ctx, "localhost:21121")
+	inc, err := NewClient(ctx, "localhost:21121", false)
 	assert.Nil(t, err)
 	assert.NotNil(t, inc)
 
@@ -153,14 +156,8 @@ func TestIndexNodeClient(t *testing.T) {
 	t.Run("GetComponentStates", func(t *testing.T) {
 		states, err := inc.GetComponentStates(ctx)
 		assert.Nil(t, err)
-		assert.Equal(t, internalpb.StateCode_Healthy, states.State.StateCode)
+		assert.Equal(t, commonpb.StateCode_Healthy, states.State.StateCode)
 		assert.Equal(t, commonpb.ErrorCode_Success, states.Status.ErrorCode)
-	})
-
-	t.Run("GetTimeTickChannel", func(t *testing.T) {
-		resp, err := inc.GetTimeTickChannel(ctx)
-		assert.Nil(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})
 
 	t.Run("GetStatisticsChannel", func(t *testing.T) {
@@ -169,14 +166,37 @@ func TestIndexNodeClient(t *testing.T) {
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})
 
-	t.Run("CreateIndex", func(t *testing.T) {
-		req := &indexpb.CreateIndexRequest{
-			IndexBuildID: 0,
-			IndexID:      0,
+	t.Run("CreatJob", func(t *testing.T) {
+		req := &indexpb.CreateJobRequest{
+			ClusterID: "0",
+			BuildID:   0,
 		}
-		resp, err := inc.CreateIndex(ctx, req)
+		resp, err := inc.CreateJob(ctx, req)
 		assert.Nil(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+	})
+
+	t.Run("QueryJob", func(t *testing.T) {
+		req := &indexpb.QueryJobsRequest{}
+		resp, err := inc.QueryJobs(ctx, req)
+		assert.Nil(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+	})
+
+	t.Run("DropJob", func(t *testing.T) {
+		req := &indexpb.DropJobsRequest{}
+		resp, err := inc.DropJobs(ctx, req)
+		assert.Nil(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.ErrorCode)
+	})
+
+	t.Run("ShowConfigurations", func(t *testing.T) {
+		req := &internalpb.ShowConfigurationsRequest{
+			Pattern: "",
+		}
+		resp, err := inc.ShowConfigurations(ctx, req)
+		assert.Nil(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})
 
 	t.Run("GetMetrics", func(t *testing.T) {
@@ -187,9 +207,9 @@ func TestIndexNodeClient(t *testing.T) {
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})
 
-	t.Run("GetTaskSlots", func(t *testing.T) {
-		req := &indexpb.GetTaskSlotsRequest{}
-		resp, err := inc.GetTaskSlots(ctx, req)
+	t.Run("GetJobStats", func(t *testing.T) {
+		req := &indexpb.GetJobStatsRequest{}
+		resp, err := inc.GetJobStats(ctx, req)
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
 	})

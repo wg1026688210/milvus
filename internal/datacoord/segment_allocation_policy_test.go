@@ -21,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -176,4 +176,17 @@ func TestSealSegmentPolicy(t *testing.T) {
 		shouldSeal = p(segment, tsoutil.ComposeTS(sealTs, 0))
 		assert.True(t, shouldSeal)
 	})
+}
+
+func Test_sealLongTimeIdlePolicy(t *testing.T) {
+	idleTimeTolerance := 2 * time.Second
+	minSizeToSealIdleSegment := 16.0
+	maxSizeOfSegment := 512.0
+	policy := sealLongTimeIdlePolicy(idleTimeTolerance, minSizeToSealIdleSegment, maxSizeOfSegment)
+	seg1 := &SegmentInfo{lastWrittenTime: time.Now().Add(idleTimeTolerance * 5)}
+	assert.False(t, policy(seg1, 100))
+	seg2 := &SegmentInfo{lastWrittenTime: getZeroTime(), currRows: 1, SegmentInfo: &datapb.SegmentInfo{MaxRowNum: 10000}}
+	assert.False(t, policy(seg2, 100))
+	seg3 := &SegmentInfo{lastWrittenTime: getZeroTime(), currRows: 1000, SegmentInfo: &datapb.SegmentInfo{MaxRowNum: 10000}}
+	assert.True(t, policy(seg3, 100))
 }

@@ -19,6 +19,7 @@
 #include "query/generated/ExprVisitor.h"
 #include "query/generated/ShowPlanNodeVisitor.h"
 #include "segcore/SegmentSealed.h"
+#include "test_utils/AssertUtils.h"
 #include "test_utils/DataGen.h"
 
 using namespace milvus;
@@ -504,7 +505,7 @@ TEST(Query, ExecWithoutPredicate) {
             {
                 "vector": {
                     "fakevec": {
-                        "metric_type": "L2",
+                        "metric_type": "l2",
                         "params": {
                             "nprobe": 10
                         },
@@ -530,6 +531,7 @@ TEST(Query, ExecWithoutPredicate) {
     Timestamp time = 1000000;
 
     auto sr = segment->Search(plan.get(), ph_group.get(), time);
+    assert_order(*sr, "l2");
     std::vector<std::vector<std::string>> results;
     int topk = 5;
     auto json = SearchResultToJson(*sr);
@@ -560,7 +562,7 @@ TEST(Query, ExecWithoutPredicate) {
     ASSERT_EQ(json.dump(2), ref.dump(2));
 }
 
-TEST(Indexing, InnerProduct) {
+TEST(Query, InnerProduct) {
     int64_t N = 100000;
     constexpr auto dim = 16;
     constexpr auto topk = 10;
@@ -572,7 +574,7 @@ TEST(Indexing, InnerProduct) {
             {
                 "vector": {
                     "normalized": {
-                        "metric_type": "IP",
+                        "metric_type": "ip",
                         "params": {
                             "nprobe": 10
                         },
@@ -599,6 +601,7 @@ TEST(Indexing, InnerProduct) {
     auto ph_group = ParsePlaceholderGroup(plan.get(), ph_group_raw.SerializeAsString());
     Timestamp ts = N * 2;
     auto sr = segment->Search(plan.get(), ph_group.get(), ts);
+    assert_order(*sr, "ip");
     std::cout << SearchResultToJson(*sr).dump(2);
 }
 

@@ -1,3 +1,19 @@
+// Licensed to the LF AI & Data foundation under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package importutil
 
 import (
@@ -8,7 +24,7 @@ import (
 	"github.com/sbinet/npyio/npy"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/timerecord"
 )
@@ -42,7 +58,7 @@ func Test_ConvertNumpyType(t *testing.T) {
 	assert.Equal(t, schemapb.DataType_None, dt)
 }
 
-func Test_Validate(t *testing.T) {
+func Test_NumpyParserValidate(t *testing.T) {
 	ctx := context.Background()
 	err := os.MkdirAll(TempFilesPath, os.ModePerm)
 	assert.Nil(t, err)
@@ -83,7 +99,8 @@ func Test_Validate(t *testing.T) {
 	func() {
 		filePath := TempFilesPath + "scalar_1.npy"
 		data1 := []float64{0, 1, 2, 3, 4, 5}
-		CreateNumpyFile(filePath, data1)
+		err := CreateNumpyFile(filePath, data1)
+		assert.Nil(t, err)
 
 		file1, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -102,7 +119,8 @@ func Test_Validate(t *testing.T) {
 		// data type mismatch
 		filePath = TempFilesPath + "scalar_2.npy"
 		data2 := []int64{0, 1, 2, 3, 4, 5}
-		CreateNumpyFile(filePath, data2)
+		err = CreateNumpyFile(filePath, data2)
+		assert.Nil(t, err)
 
 		file2, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -117,7 +135,8 @@ func Test_Validate(t *testing.T) {
 		// shape mismatch
 		filePath = TempFilesPath + "scalar_2.npy"
 		data3 := [][2]float64{{1, 1}}
-		CreateNumpyFile(filePath, data3)
+		err = CreateNumpyFile(filePath, data3)
+		assert.Nil(t, err)
 
 		file3, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -134,7 +153,8 @@ func Test_Validate(t *testing.T) {
 	func() {
 		filePath := TempFilesPath + "binary_vector_1.npy"
 		data1 := [][2]uint8{{0, 1}, {2, 3}, {4, 5}}
-		CreateNumpyFile(filePath, data1)
+		err := CreateNumpyFile(filePath, data1)
+		assert.Nil(t, err)
 
 		file1, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -150,7 +170,8 @@ func Test_Validate(t *testing.T) {
 		// data type mismatch
 		filePath = TempFilesPath + "binary_vector_2.npy"
 		data2 := [][2]uint16{{0, 1}, {2, 3}, {4, 5}}
-		CreateNumpyFile(filePath, data2)
+		err = CreateNumpyFile(filePath, data2)
+		assert.Nil(t, err)
 
 		file2, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -165,7 +186,8 @@ func Test_Validate(t *testing.T) {
 		// shape mismatch
 		filePath = TempFilesPath + "binary_vector_3.npy"
 		data3 := []uint8{1, 2, 3}
-		CreateNumpyFile(filePath, data3)
+		err = CreateNumpyFile(filePath, data3)
+		assert.Nil(t, err)
 
 		file3, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -180,7 +202,8 @@ func Test_Validate(t *testing.T) {
 		// shape[1] mismatch
 		filePath = TempFilesPath + "binary_vector_4.npy"
 		data4 := [][3]uint8{{0, 1, 2}, {2, 3, 4}, {4, 5, 6}}
-		CreateNumpyFile(filePath, data4)
+		err = CreateNumpyFile(filePath, data4)
+		assert.Nil(t, err)
 
 		file4, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -211,7 +234,8 @@ func Test_Validate(t *testing.T) {
 	func() {
 		filePath := TempFilesPath + "float_vector.npy"
 		data1 := [][4]float32{{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}}
-		CreateNumpyFile(filePath, data1)
+		err := CreateNumpyFile(filePath, data1)
+		assert.Nil(t, err)
 
 		file1, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -227,7 +251,8 @@ func Test_Validate(t *testing.T) {
 		// data type mismatch
 		filePath = TempFilesPath + "float_vector_2.npy"
 		data2 := [][4]int32{{0, 1, 2, 3}}
-		CreateNumpyFile(filePath, data2)
+		err = CreateNumpyFile(filePath, data2)
+		assert.Nil(t, err)
 
 		file2, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -242,7 +267,8 @@ func Test_Validate(t *testing.T) {
 		// shape mismatch
 		filePath = TempFilesPath + "float_vector_3.npy"
 		data3 := []float32{1, 2, 3}
-		CreateNumpyFile(filePath, data3)
+		err = CreateNumpyFile(filePath, data3)
+		assert.Nil(t, err)
 
 		file3, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -257,7 +283,8 @@ func Test_Validate(t *testing.T) {
 		// shape[1] mismatch
 		filePath = TempFilesPath + "float_vector_4.npy"
 		data4 := [][3]float32{{0, 0, 0}, {1, 1, 1}}
-		CreateNumpyFile(filePath, data4)
+		err = CreateNumpyFile(filePath, data4)
+		assert.Nil(t, err)
 
 		file4, err := os.Open(filePath)
 		assert.Nil(t, err)
@@ -285,7 +312,7 @@ func Test_Validate(t *testing.T) {
 	}()
 }
 
-func Test_Parse(t *testing.T) {
+func Test_NumpyParserParse(t *testing.T) {
 	ctx := context.Background()
 	err := os.MkdirAll(TempFilesPath, os.ModePerm)
 	assert.Nil(t, err)
@@ -296,7 +323,8 @@ func Test_Parse(t *testing.T) {
 	checkFunc := func(data interface{}, fieldName string, callback func(field storage.FieldData) error) {
 
 		filePath := TempFilesPath + fieldName + ".npy"
-		CreateNumpyFile(filePath, data)
+		err := CreateNumpyFile(filePath, data)
+		assert.Nil(t, err)
 
 		func() {
 			file, err := os.Open(filePath)
@@ -476,7 +504,7 @@ func Test_Parse(t *testing.T) {
 	checkFunc(data10, "field_float_vector", flushFunc)
 }
 
-func Test_Parse_perf(t *testing.T) {
+func Test_NumpyParserParse_perf(t *testing.T) {
 	ctx := context.Background()
 	err := os.MkdirAll(TempFilesPath, os.ModePerm)
 	assert.Nil(t, err)
@@ -510,7 +538,8 @@ func Test_Parse_perf(t *testing.T) {
 	}
 
 	filePath := TempFilesPath + "perf.npy"
-	CreateNumpyFile(filePath, data)
+	err = CreateNumpyFile(filePath, data)
+	assert.Nil(t, err)
 
 	tr.Record("generate large numpy file " + filePath)
 

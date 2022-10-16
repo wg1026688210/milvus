@@ -17,18 +17,32 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
+
+	"github.com/milvus-io/milvus/internal/util"
+	"github.com/milvus-io/milvus/internal/util/crypto"
+	"github.com/milvus-io/milvus/internal/util/tsoutil"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
+
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestValidateCollectionName(t *testing.T) {
 	assert.Nil(t, validateCollectionName("abc"))
 	assert.Nil(t, validateCollectionName("_123abc"))
-	assert.Nil(t, validateCollectionName("abc123_$"))
+	assert.Nil(t, validateCollectionName("abc123_"))
 
 	longName := make([]byte, 256)
 	for i := 0; i < len(longName); i++ {
@@ -37,6 +51,7 @@ func TestValidateCollectionName(t *testing.T) {
 	invalidNames := []string{
 		"123abc",
 		"$abc",
+		"abc$",
 		"_12 ac",
 		" ",
 		"",
@@ -55,7 +70,7 @@ func TestValidatePartitionTag(t *testing.T) {
 	assert.Nil(t, validatePartitionTag("abc", true))
 	assert.Nil(t, validatePartitionTag("123abc", true))
 	assert.Nil(t, validatePartitionTag("_123abc", true))
-	assert.Nil(t, validatePartitionTag("abc123_$", true))
+	assert.Nil(t, validatePartitionTag("abc123_", true))
 
 	longName := make([]byte, 256)
 	for i := 0; i < len(longName); i++ {
@@ -63,6 +78,7 @@ func TestValidatePartitionTag(t *testing.T) {
 	}
 	invalidNames := []string{
 		"$abc",
+		"abc$",
 		"_12 ac",
 		" ",
 		"",
@@ -81,6 +97,7 @@ func TestValidatePartitionTag(t *testing.T) {
 func TestValidateFieldName(t *testing.T) {
 	assert.Nil(t, validateFieldName("abc"))
 	assert.Nil(t, validateFieldName("_123abc"))
+	assert.Nil(t, validateFieldName("abc123_"))
 
 	longName := make([]byte, 256)
 	for i := 0; i < len(longName); i++ {
@@ -89,6 +106,7 @@ func TestValidateFieldName(t *testing.T) {
 	invalidNames := []string{
 		"123abc",
 		"$abc",
+		"abc$",
 		"_12 ac",
 		" ",
 		"",
@@ -615,4 +633,179 @@ func TestReplaceID2Name(t *testing.T) {
 	srcStr := "collection 432682805904801793 has not been loaded to memory or load failed"
 	dstStr := "collection default_collection has not been loaded to memory or load failed"
 	assert.Equal(t, dstStr, ReplaceID2Name(srcStr, int64(432682805904801793), "default_collection"))
+}
+
+func TestValidateName(t *testing.T) {
+	Params.InitOnce()
+	nameType := "Test"
+	validNames := []string{
+		"abc",
+		"_123abc",
+	}
+	for _, name := range validNames {
+		assert.Nil(t, validateName(name, nameType))
+		assert.Nil(t, ValidateRoleName(name))
+		assert.Nil(t, ValidateObjectName(name))
+		assert.Nil(t, ValidateObjectType(name))
+		assert.Nil(t, ValidatePrincipalName(name))
+		assert.Nil(t, ValidatePrincipalType(name))
+		assert.Nil(t, ValidatePrivilege(name))
+	}
+
+	longName := make([]byte, 256)
+	for i := 0; i < len(longName); i++ {
+		longName[i] = 'a'
+	}
+	invalidNames := []string{
+		" ",
+		"123abc",
+		"$abc",
+		"_12 ac",
+		" ",
+		"",
+		string(longName),
+		"中文",
+	}
+
+	for _, name := range invalidNames {
+		assert.NotNil(t, validateName(name, nameType))
+		assert.NotNil(t, ValidateRoleName(name))
+		assert.NotNil(t, ValidateObjectType(name))
+		assert.NotNil(t, ValidatePrincipalName(name))
+		assert.NotNil(t, ValidatePrincipalType(name))
+		assert.NotNil(t, ValidatePrivilege(name))
+	}
+	assert.NotNil(t, ValidateObjectName(" "))
+	assert.NotNil(t, ValidateObjectName(string(longName)))
+	assert.Nil(t, ValidateObjectName("*"))
+}
+
+func TestIsDefaultRole(t *testing.T) {
+	assert.Equal(t, true, IsDefaultRole(util.RoleAdmin))
+	assert.Equal(t, true, IsDefaultRole(util.RolePublic))
+	assert.Equal(t, false, IsDefaultRole("manager"))
+}
+
+func GetContext(ctx context.Context, originValue string) context.Context {
+	authKey := strings.ToLower(util.HeaderAuthorize)
+	authValue := crypto.Base64Encode(originValue)
+	contextMap := map[string]string{
+		authKey: authValue,
+	}
+	md := metadata.New(contextMap)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+func TestGetCurUserFromContext(t *testing.T) {
+	_, err := GetCurUserFromContext(context.Background())
+	assert.NotNil(t, err)
+
+	_, err = GetCurUserFromContext(metadata.NewIncomingContext(context.Background(), metadata.New(map[string]string{})))
+	assert.NotNil(t, err)
+
+	_, err = GetCurUserFromContext(GetContext(context.Background(), "123456"))
+	assert.NotNil(t, err)
+
+	root := "root"
+	password := "123456"
+	username, err := GetCurUserFromContext(GetContext(context.Background(), fmt.Sprintf("%s%s%s", root, util.CredentialSeperator, password)))
+	assert.Nil(t, err)
+	assert.Equal(t, "root", username)
+}
+
+func TestGetRole(t *testing.T) {
+	globalMetaCache = nil
+	_, err := GetRole("foo")
+	assert.NotNil(t, err)
+	globalMetaCache = &mockCache{
+		getUserRoleFunc: func(username string) []string {
+			if username == "root" {
+				return []string{"role1", "admin", "role2"}
+			}
+			return []string{"role1"}
+		},
+	}
+	roles, err := GetRole("root")
+	assert.Nil(t, err)
+	assert.Equal(t, 3, len(roles))
+
+	roles, err = GetRole("foo")
+	assert.Nil(t, err)
+	assert.Equal(t, 1, len(roles))
+}
+
+func TestPasswordVerify(t *testing.T) {
+	username := "user-test00"
+	password := "PasswordVerify"
+
+	// credential does not exist within cache
+	credCache := make(map[string]*internalpb.CredentialInfo, 0)
+	invokedCount := 0
+
+	mockedRootCoord := newMockRootCoord()
+	mockedRootCoord.GetGetCredentialFunc = func(ctx context.Context, req *rootcoordpb.GetCredentialRequest) (*rootcoordpb.GetCredentialResponse, error) {
+		invokedCount++
+		return nil, fmt.Errorf("get cred not found credential")
+	}
+
+	metaCache := &MetaCache{
+		credMap:   credCache,
+		rootCoord: mockedRootCoord,
+	}
+	ret, ok := credCache[username]
+	assert.False(t, ok)
+	assert.Nil(t, ret)
+	assert.False(t, passwordVerify(context.TODO(), username, password, metaCache))
+	assert.Equal(t, 1, invokedCount)
+
+	// Sha256Password has not been filled into cache during establish connection firstly
+	encryptedPwd, err := crypto.PasswordEncrypt(password)
+	assert.Nil(t, err)
+	credCache[username] = &internalpb.CredentialInfo{
+		Username:          username,
+		EncryptedPassword: encryptedPwd,
+	}
+	assert.True(t, passwordVerify(context.TODO(), username, password, metaCache))
+	ret, ok = credCache[username]
+	assert.True(t, ok)
+	assert.NotNil(t, ret)
+	assert.Equal(t, username, ret.Username)
+	assert.NotNil(t, ret.Sha256Password)
+	assert.Equal(t, 1, invokedCount)
+
+	// Sha256Password already exists within cache
+	assert.True(t, passwordVerify(context.TODO(), username, password, metaCache))
+	assert.Equal(t, 1, invokedCount)
+}
+
+func TestValidateTravelTimestamp(t *testing.T) {
+	Params.Init()
+	originalRetentionDuration := Params.CommonCfg.RetentionDuration
+	defer func() {
+		Params.CommonCfg.RetentionDuration = originalRetentionDuration
+	}()
+
+	travelTs := tsoutil.GetCurrentTime()
+	tests := []struct {
+		description string
+		defaultRD   int64
+		nowTs       typeutil.Timestamp
+		isValid     bool
+	}{
+		{"one second", 100, tsoutil.AddPhysicalDurationOnTs(travelTs, time.Second), true},
+		{"retention duration", 100, tsoutil.AddPhysicalDurationOnTs(travelTs, 100*time.Second), true},
+		{"retention duration+1", 100, tsoutil.AddPhysicalDurationOnTs(travelTs, 101*time.Second), false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			Params.CommonCfg.RetentionDuration = test.defaultRD
+			err := validateTravelTimestamp(travelTs, test.nowTs)
+			if test.isValid {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
+	}
 }

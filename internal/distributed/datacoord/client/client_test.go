@@ -103,9 +103,6 @@ func Test_NewClient(t *testing.T) {
 		r15, err := client.GetMetrics(ctx, nil)
 		retCheck(retNotNil, r15, err)
 
-		r16, err := client.CompleteCompaction(ctx, nil)
-		retCheck(retNotNil, r16, err)
-
 		r17, err := client.GetCompactionState(ctx, nil)
 		retCheck(retNotNil, r17, err)
 
@@ -136,8 +133,22 @@ func Test_NewClient(t *testing.T) {
 		r26, err := client.ReleaseSegmentLock(ctx, nil)
 		retCheck(retNotNil, r26, err)
 
-		r27, err := client.AddSegment(ctx, nil)
+		r27, err := client.SaveImportSegment(ctx, nil)
 		retCheck(retNotNil, r27, err)
+
+		r29, err := client.UnsetIsImportingState(ctx, nil)
+		retCheck(retNotNil, r29, err)
+
+		r30, err := client.MarkSegmentsDropped(ctx, nil)
+		retCheck(retNotNil, r30, err)
+
+		r31, err := client.ShowConfigurations(ctx, nil)
+		retCheck(retNotNil, r31, err)
+
+		{
+			ret, err := client.BroadcastAlteredCollection(ctx, nil)
+			retCheck(retNotNil, ret, err)
+		}
 	}
 
 	client.grpcClient = &mock.GRPCClientBase{

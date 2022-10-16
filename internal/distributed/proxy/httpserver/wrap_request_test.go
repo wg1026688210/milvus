@@ -4,15 +4,15 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestFieldData_AsSchemapb(t *testing.T) {
-	t.Run("string_ok", func(t *testing.T) {
+	t.Run("varchar_ok", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_String,
+			Type:  schemapb.DataType_VarChar,
 			Field: []interface{}{"a", "b", "c"},
 		}
 		raw, _ := json.Marshal(fieldData)
@@ -20,9 +20,9 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 		_, err := fieldData.AsSchemapb()
 		assert.NoError(t, err)
 	})
-	t.Run("string_error", func(t *testing.T) {
+	t.Run("varchar_error", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_String,
+			Type:  schemapb.DataType_VarChar,
 			Field: []interface{}{1, 2, 3},
 		}
 		raw, _ := json.Marshal(fieldData)
@@ -30,7 +30,6 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 		_, err := fieldData.AsSchemapb()
 		assert.Error(t, err)
 	})
-
 	t.Run("bool_ok", func(t *testing.T) {
 		fieldData := FieldData{
 			Type:  schemapb.DataType_Bool,
@@ -152,9 +151,9 @@ func TestFieldData_AsSchemapb(t *testing.T) {
 		_, err := fieldData.AsSchemapb()
 		assert.Error(t, err)
 	})
-	t.Run("varchar_not_support", func(t *testing.T) {
+	t.Run("string_not_support", func(t *testing.T) {
 		fieldData := FieldData{
-			Type:  schemapb.DataType_VarChar,
+			Type:  schemapb.DataType_String,
 			Field: []interface{}{"a", "b", "c"},
 		}
 		raw, _ := json.Marshal(fieldData)

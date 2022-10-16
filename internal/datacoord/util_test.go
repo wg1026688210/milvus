@@ -22,13 +22,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
 )
 
-func TestVerifyResponse(t *testing.T) {
+type UtilSuite struct {
+	suite.Suite
+}
+
+func (suite *UtilSuite) TestVerifyResponse() {
 	type testCase struct {
 		resp       interface{}
 		err        error
@@ -104,14 +109,14 @@ func TestVerifyResponse(t *testing.T) {
 	for _, c := range cases {
 		r := VerifyResponse(c.resp, c.err)
 		if c.equalValue {
-			assert.EqualValues(t, c.expected, r)
+			suite.EqualValues(c.expected, r)
 		} else {
-			assert.Equal(t, c.expected, r)
+			suite.Equal(c.expected, r)
 		}
 	}
 }
 
-func Test_getCompactTime(t *testing.T) {
+func (suite *UtilSuite) TestGetCompactTime() {
 	Params.Init()
 	Params.CommonCfg.RetentionDuration = 43200 // 5 days
 
@@ -130,17 +135,21 @@ func Test_getCompactTime(t *testing.T) {
 		{
 			"test get timetravel",
 			args{&fixedTSOAllocator{fixedTime: tFixed}},
-			&compactTime{tsoutil.ComposeTS(tBefore.UnixNano()/int64(time.Millisecond), 0), 0},
+			&compactTime{tsoutil.ComposeTS(tBefore.UnixNano()/int64(time.Millisecond), 0), 0, 0},
 			false,
 		},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := getCompactTime(context.TODO(), tt.args.allocator)
-			assert.Equal(t, tt.wantErr, err != nil)
-			assert.EqualValues(t, tt.want, got)
+		suite.Run(tt.name, func() {
+			got, err := GetCompactTime(context.TODO(), tt.args.allocator)
+			suite.Equal(tt.wantErr, err != nil)
+			suite.EqualValues(tt.want, got)
 		})
 	}
+}
+
+func TestUtil(t *testing.T) {
+	suite.Run(t, new(UtilSuite))
 }
 
 type fixedTSOAllocator struct {
@@ -153,4 +162,35 @@ func (f *fixedTSOAllocator) allocTimestamp(_ context.Context) (Timestamp, error)
 
 func (f *fixedTSOAllocator) allocID(_ context.Context) (UniqueID, error) {
 	panic("not implemented") // TODO: Implement
+}
+
+func (suite *UtilSuite) TestGetZeroTime() {
+	n := 10
+	for i := 0; i < n; i++ {
+		timeGot := getZeroTime()
+		suite.True(timeGot.IsZero())
+	}
+}
+
+func (suite *UtilSuite) TestGetCollectionTTL() {
+	properties1 := map[string]string{
+		common.CollectionTTLConfigKey: "3600",
+	}
+
+	// get ttl from configuration file
+	ttl, err := getCollectionTTL(properties1)
+	suite.NoError(err)
+	suite.Equal(ttl, time.Duration(3600)*time.Second)
+
+	properties2 := map[string]string{
+		common.CollectionTTLConfigKey: "error value",
+	}
+	// test for parsing configuration failed
+	ttl, err = getCollectionTTL(properties2)
+	suite.Error(err)
+	suite.Equal(int(ttl), -1)
+
+	ttl, err = getCollectionTTL(map[string]string{})
+	suite.NoError(err)
+	suite.Equal(ttl, Params.CommonCfg.EntityExpirationTTL)
 }

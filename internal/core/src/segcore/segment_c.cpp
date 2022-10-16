@@ -18,8 +18,8 @@
 #include "segcore/Collection.h"
 #include "segcore/SegmentGrowingImpl.h"
 #include "segcore/SegmentSealedImpl.h"
-#include "segcore/SimilarityCorelation.h"
 #include "segcore/segment_c.h"
+#include "index/IndexInfo.h"
 #include "google/protobuf/text_format.h"
 
 //////////////////////////////    common interfaces    //////////////////////////////
@@ -65,14 +65,13 @@ Search(CSegmentInterface c_segment,
        CSearchPlan c_plan,
        CPlaceholderGroup c_placeholder_group,
        uint64_t timestamp,
-       CSearchResult* result,
-       int64_t segment_id) {
+       CSearchResult* result) {
     try {
         auto segment = (milvus::segcore::SegmentInterface*)c_segment;
         auto plan = (milvus::query::Plan*)c_plan;
         auto phg_ptr = reinterpret_cast<const milvus::query::PlaceholderGroup*>(c_placeholder_group);
         auto search_result = segment->Search(plan, phg_ptr, timestamp);
-        if (!milvus::segcore::PositivelyRelated(plan->plan_node_->search_info_.metric_type_)) {
+        if (!milvus::PositivelyRelated(plan->plan_node_->search_info_.metric_type_)) {
             for (auto& dis : search_result->distances_) {
                 dis *= -1;
             }
@@ -239,7 +238,7 @@ UpdateSealedSegmentIndex(CSegmentInterface c_segment, CLoadIndexInfo c_load_inde
         auto segment_interface = reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
         auto segment = dynamic_cast<milvus::segcore::SegmentSealed*>(segment_interface);
         AssertInfo(segment != nullptr, "segment conversion failed");
-        auto load_index_info = (LoadIndexInfo*)c_load_index_info;
+        auto load_index_info = (milvus::segcore::LoadIndexInfo*)c_load_index_info;
         segment->LoadIndex(*load_index_info);
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {

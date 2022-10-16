@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 option( EMBEDDED_MILVUS "Enable embedded Milvus" OFF )
 
 if ( EMBEDDED_MILVUS )
@@ -23,10 +22,36 @@ endif()
 
 milvus_add_pkg_config("milvus_storage")
 
-set(STORAGE_FILES parquet_c.cpp PayloadStream.cpp)
+set(STORAGE_FILES
+        parquet_c.cpp
+        PayloadStream.cpp
+        DataCodec.cpp
+        Util.cpp
+        PayloadReader.cpp
+        PayloadWriter.cpp
+        FieldData.cpp
+        IndexData.cpp
+        InsertData.cpp
+        Event.cpp
+        storage_c.cpp)
+
+if ( BUILD_DISK_ANN STREQUAL "ON" )
+    set(STORAGE_FILES
+            ${STORAGE_FILES}
+            LocalChunkManager.cpp
+            MinioChunkManager.cpp
+            DiskFileManagerImpl.cpp)
+endif ()
+
 add_library(milvus_storage SHARED ${STORAGE_FILES})
 
-target_link_libraries( milvus_storage PUBLIC arrow parquet pthread)
+find_package(Boost REQUIRED COMPONENTS filesystem)
+
+if ( BUILD_DISK_ANN STREQUAL "ON" )
+    target_link_libraries( milvus_storage PUBLIC milvus_common Boost::filesystem aws-cpp-sdk-s3 pthread)
+else()
+    target_link_libraries( milvus_storage PUBLIC milvus_common Boost::filesystem pthread)
+endif()
 
 if(NOT CMAKE_INSTALL_PREFIX)
     set(CMAKE_INSTALL_PREFIX ${CMAKE_CURRENT_BINARY_DIR})

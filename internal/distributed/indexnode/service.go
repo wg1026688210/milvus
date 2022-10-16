@@ -25,23 +25,24 @@ import (
 	"sync"
 	"time"
 
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
-	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
-
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/indexnode"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/trace"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
@@ -108,8 +109,12 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
-		grpc.UnaryInterceptor(ot.UnaryServerInterceptor(opts...)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			ot.UnaryServerInterceptor(opts...),
+			logutil.UnaryTraceLoggerInterceptor)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			ot.StreamServerInterceptor(opts...),
+			logutil.StreamTraceLoggerInterceptor)))
 	indexpb.RegisterIndexNodeServer(s.grpcServer, s)
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
 	if err := s.grpcServer.Serve(lis); err != nil {
@@ -218,13 +223,8 @@ func (s *Server) SetEtcdClient(etcdCli *clientv3.Client) {
 }
 
 // GetComponentStates gets the component states of IndexNode.
-func (s *Server) GetComponentStates(ctx context.Context, req *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return s.indexnode.GetComponentStates(ctx)
-}
-
-// GetTimeTickChannel gets the time tick channel of IndexNode.
-func (s *Server) GetTimeTickChannel(ctx context.Context, req *internalpb.GetTimeTickChannelRequest) (*milvuspb.StringResponse, error) {
-	return s.indexnode.GetTimeTickChannel(ctx)
 }
 
 // GetStatisticsChannel gets the statistics channel of IndexNode.
@@ -232,13 +232,29 @@ func (s *Server) GetStatisticsChannel(ctx context.Context, req *internalpb.GetSt
 	return s.indexnode.GetStatisticsChannel(ctx)
 }
 
-// CreateIndex sends the create index request to IndexNode.
-func (s *Server) CreateIndex(ctx context.Context, req *indexpb.CreateIndexRequest) (*commonpb.Status, error) {
-	return s.indexnode.CreateIndex(ctx, req)
+// CreateJob sends the create index request to IndexNode.
+func (s *Server) CreateJob(ctx context.Context, req *indexpb.CreateJobRequest) (*commonpb.Status, error) {
+	return s.indexnode.CreateJob(ctx, req)
 }
 
-func (s *Server) GetTaskSlots(ctx context.Context, req *indexpb.GetTaskSlotsRequest) (*indexpb.GetTaskSlotsResponse, error) {
-	return s.indexnode.GetTaskSlots(ctx, req)
+// QueryJobs querys index jobs statues
+func (s *Server) QueryJobs(ctx context.Context, req *indexpb.QueryJobsRequest) (*indexpb.QueryJobsResponse, error) {
+	return s.indexnode.QueryJobs(ctx, req)
+}
+
+// DropJobs drops index build jobs
+func (s *Server) DropJobs(ctx context.Context, req *indexpb.DropJobsRequest) (*commonpb.Status, error) {
+	return s.indexnode.DropJobs(ctx, req)
+}
+
+// GetJobNum gets indexnode's job statisctics
+func (s *Server) GetJobStats(ctx context.Context, req *indexpb.GetJobStatsRequest) (*indexpb.GetJobStatsResponse, error) {
+	return s.indexnode.GetJobStats(ctx, req)
+}
+
+// ShowConfigurations gets specified configurations para of IndexNode
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return s.indexnode.ShowConfigurations(ctx, req)
 }
 
 // GetMetrics gets the metrics info of IndexNode.

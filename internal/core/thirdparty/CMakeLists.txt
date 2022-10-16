@@ -64,18 +64,23 @@ add_subdirectory( boost_ext )
 add_subdirectory( arrow )
 add_subdirectory( rocksdb )
 
-# ******************************* Thridparty marisa ********************************
+# ******************************* Thirdparty aws sdk ********************************
+if ( LINUX )
+    add_subdirectory( aws_sdk )
+endif()
+
+# ******************************* Thirdparty marisa ********************************
 # TODO: support win.
 if ( LINUX OR APPLE)
     add_subdirectory( marisa )
 endif()
 
-# ******************************* Thridparty jemalloc ********************************
+# ******************************* Thirdparty jemalloc ********************************
 if ( LINUX )
     add_subdirectory( jemalloc )
 endif()
 
-# ******************************* Thridparty rapidxml ********************************
+# ******************************* Thirdparty rapidxml ********************************
 #if ( LINUX )
 #    add_subdirectory( rapidxml )
 #endif()

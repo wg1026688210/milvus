@@ -20,8 +20,19 @@ LIBRARY_PATH := $(PWD)/lib
 OS := $(shell uname -s)
 ARCH := $(shell arch)
 mode = Release
+disk_index = OFF
 
-all: build-cpp build-go
+
+milvus: build-cpp print-build-info
+ifeq ($(RELEASE), TRUE)
+	@echo "Update milvus/api version ..."
+	@(env bash $(PWD)/scripts/update_api_version.sh)
+endif
+	@echo "Building Milvus ..."
+	@source $(PWD)/scripts/setenv.sh && \
+		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && \
+		GO111MODULE=on $(GO) build -ldflags="-r $${RPATH} -X '$(OBJPREFIX).BuildTags=$(BUILD_TAGS)' -X '$(OBJPREFIX).BuildTime=$(BUILD_TIME)' -X '$(OBJPREFIX).GitCommit=$(GIT_COMMIT)' -X '$(OBJPREFIX).GoVersion=$(GO_VERSION)'" \
+		${APPLE_SILICON_FLAG} -o $(INSTALL_PATH)/milvus $(PWD)/cmd/main.go 1>/dev/null
 
 get-build-deps:
 	@(env bash $(PWD)/scripts/install_deps.sh)
@@ -29,7 +40,7 @@ get-build-deps:
 # attention: upgrade golangci-lint should also change Dockerfiles in build/docker/builder/cpu/<os>
 getdeps:
 	@mkdir -p ${GOPATH}/bin
-	@which golangci-lint 1>/dev/null || (echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.43.0)
+	@which golangci-lint 1>/dev/null || (echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.46.2)
 
 tools/bin/revive: tools/check/go.mod
 	cd tools/check; \
@@ -76,7 +87,14 @@ verifiers: build-cpp getdeps cppcheck fmt static-check
 binlog:
 	@echo "Building binlog ..."
 	@source $(PWD)/scripts/setenv.sh && \
-		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && GO111MODULE=on $(GO) build -o $(INSTALL_PATH)/binlog $(PWD)/cmd/tools/binlog/main.go 1>/dev/null
+		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && \
+		GO111MODULE=on $(GO) build -ldflags="-r $${RPATH}" -o $(INSTALL_PATH)/binlog $(PWD)/cmd/tools/binlog/main.go 1>/dev/null
+
+MIGRATION_PATH = $(PWD)/cmd/tools/migration
+migration:
+	@echo "Building migration tool ..."
+	@source $(PWD)/scripts/setenv.sh && \
+		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && GO111MODULE=on $(GO) build -o $(INSTALL_PATH)/migration $(MIGRATION_PATH)/main.go 1>/dev/null
 
 BUILD_TAGS = $(shell git describe --tags --always --dirty="-dev")
 BUILD_TIME = $(shell date -u)
@@ -89,99 +107,126 @@ endif
 endif
 
 print-build-info:
+	$(shell git config --global --add safe.directory '*')
 	@echo "Build Tag: $(BUILD_TAGS)"
 	@echo "Build Time: $(BUILD_TIME)"
 	@echo "Git Commit: $(GIT_COMMIT)"
 	@echo "Go Version: $(GO_VERSION)"
 
-milvus: build-cpp print-build-info
-	@echo "Building Milvus ..."
-	@echo "if build fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
-	@source $(PWD)/scripts/setenv.sh && \
-		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && \
-		GO111MODULE=on $(GO) build -ldflags="-r $${RPATH} -X '$(OBJPREFIX).BuildTags=$(BUILD_TAGS)' -X '$(OBJPREFIX).BuildTime=$(BUILD_TIME)' -X '$(OBJPREFIX).GitCommit=$(GIT_COMMIT)' -X '$(OBJPREFIX).GoVersion=$(GO_VERSION)'" \
-		${APPLE_SILICON_FLAG} -o $(INSTALL_PATH)/milvus $(PWD)/cmd/main.go 1>/dev/null
+
 
 embd-milvus: build-cpp-embd print-build-info
 	@echo "Building **Embedded** Milvus ..."
-	@echo "if build fails on Mac M1 machines, rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
 	@source $(PWD)/scripts/setenv.sh && \
 		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && \
 		GO111MODULE=on $(GO) build -ldflags="-r /tmp/milvus/lib/ -X '$(OBJPREFIX).BuildTags=$(BUILD_TAGS)' -X '$(OBJPREFIX).BuildTime=$(BUILD_TIME)' -X '$(OBJPREFIX).GitCommit=$(GIT_COMMIT)' -X '$(OBJPREFIX).GoVersion=$(GO_VERSION)'" \
 		${APPLE_SILICON_FLAG} -buildmode=c-shared -o $(INSTALL_PATH)/embd-milvus.so $(PWD)/pkg/embedded/embedded.go 1>/dev/null
 
-build-go: milvus
+
 
 build-cpp: 
 	@echo "Building Milvus cpp library ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -f "$(CUSTOM_THIRDPARTY_PATH)")
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -f "$(CUSTOM_THIRDPARTY_PATH)" -n ${disk_index})
 
 build-cpp-embd: 
 	@echo "Building **Embedded** Milvus cpp library ..."
-	@(env bash $(PWD)/scripts/core_build.sh -b -t ${mode} -f "$(CUSTOM_THIRDPARTY_PATH)")
+	@(env bash $(PWD)/scripts/core_build.sh -b -t ${mode} -f "$(CUSTOM_THIRDPARTY_PATH)" -n ${disk_index})
 
 build-cpp-with-unittest: 
 	@echo "Building Milvus cpp library with unittest ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -u -f "$(CUSTOM_THIRDPARTY_PATH)")
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -u -f "$(CUSTOM_THIRDPARTY_PATH)" -n ${disk_index})
 
 build-cpp-with-coverage: 
 	@echo "Building Milvus cpp library with coverage and unittest ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -u -c -f "$(CUSTOM_THIRDPARTY_PATH)")
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -u -c -f "$(CUSTOM_THIRDPARTY_PATH)" -n ${disk_index})
 
 
 # Run the tests.
 unittest: test-cpp test-go
-	@echo "if test fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
+
+test-util:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t util)
+
+test-storage:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t storage)
+
+test-allocator:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t allocator)
+
+test-config:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t config)
+
+test-tso:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t tso)
+
+test-kv:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t kv)
+
+test-mq:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t mq)
+
+test-rootcoord:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t rootcoord)
 
 test-indexnode:
 	@echo "Running go unittests..."
-	go test -race -coverpkg=./... -coverprofile=profile.out -covermode=atomic -timeout 5m github.com/milvus-io/milvus/internal/indexnode -v -failfast
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t indexnode)
+
+test-indexcoord:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t indexcoord)
 
 test-proxy:
 	@echo "Running go unittests..."
-	go test -race -coverpkg=./... -coverprofile=profile.out -covermode=atomic -timeout 5m github.com/milvus-io/milvus/internal/proxy -v -failfast
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t proxy)
 
 test-datacoord:
 	@echo "Running go unittests..."
-	go test -race -coverpkg=./... -coverprofile=profile.out -covermode=atomic -timeout 5m github.com/milvus-io/milvus/internal/datacoord -v -failfast
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t datacoord)
 
 test-datanode:
 	@echo "Running go unittests..."
-	go test -race -coverpkg=./... -coverprofile=profile.out -covermode=atomic -timeout 5m github.com/milvus-io/milvus/internal/datanode -v -failfast
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t datanode)
 
 test-querynode:
 	@echo "Running go unittests..."
-	go test -race -coverpkg=./... -coverprofile=profile.out -covermode=atomic -timeout 5m github.com/milvus-io/milvus/internal/querynode -v -failfast
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t querynode)
 
 test-querycoord:
 	@echo "Running go unittests..."
-	go test -race -coverpkg=./... -coverprofile=profile.out -covermode=atomic -timeout 5m github.com/milvus-io/milvus/internal/querycoord	-v -failfast
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t querycoord)
 
+test-metastore:
+	@echo "Running go unittests..."
+	@(env bash $(PWD)/scripts/run_go_unittest.sh -t metastore)
 
 test-go: build-cpp-with-unittest
 	@echo "Running go unittests..."
-	@echo "if test fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
 	@(env bash $(PWD)/scripts/run_go_unittest.sh)
 
 test-cpp: build-cpp-with-unittest
 	@echo "Running cpp unittests..."
-	@echo "if test fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
 	@(env bash $(PWD)/scripts/run_cpp_unittest.sh)
 
 # Run code coverage.
 codecov: codecov-go codecov-cpp
-	@echo "if test fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
 
 # Run codecov-go
 codecov-go: build-cpp-with-coverage
 	@echo "Running go coverage..."
-	@echo "if test fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
 	@(env bash $(PWD)/scripts/run_go_codecov.sh)
 
 # Run codecov-cpp
 codecov-cpp: build-cpp-with-coverage
 	@echo "Running cpp coverage..."
-	@echo "if test fails on Mac M1 machines, you probably need to rerun scripts/install_deps.sh and then run: \`export PKG_CONFIG_PATH=\"/opt/homebrew/opt/openssl@3/lib/pkgconfig\"\`"
 	@(env bash $(PWD)/scripts/run_cpp_codecov.sh)
 
 # Package docker image locally.
@@ -190,7 +235,7 @@ docker: install
 	./build/build_image.sh
 
 # Build each component and install binary to $GOPATH/bin.
-install: all
+install: milvus
 	@echo "Installing binary to './bin'"
 	@mkdir -p $(GOPATH)/bin && cp -f $(PWD)/bin/milvus $(GOPATH)/bin/milvus
 	@mkdir -p $(LIBRARY_PATH) && cp -r -P $(PWD)/internal/core/output/lib/*.so* $(LIBRARY_PATH)
@@ -231,3 +276,9 @@ rpm: install
 	@cp -r configs ~/rpmbuild/BUILD/
 	@cp -r build/rpm/services ~/rpmbuild/BUILD/
 	@QA_RPATHS="$$[ 0x001|0x0002|0x0020 ]" rpmbuild -ba ./build/rpm/milvus.spec
+
+mock-datanode:
+	mockery --name=DataNode --dir=$(PWD)/internal/types --output=$(PWD)/internal/mocks --filename=mock_datanode.go --with-expecter
+
+mock-tnx-kv:
+	mockery --name=TxnKV --dir=$(PWD)/internal/kv --output=$(PWD)/internal/kv/mocks --filename=TxnKV.go --with-expecter

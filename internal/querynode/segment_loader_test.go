@@ -22,17 +22,24 @@ import (
 	"math/rand"
 	"runtime"
 	"testing"
+	"time"
 
-	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
-	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
+	"github.com/milvus-io/milvus/internal/common"
+	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/internal/mocks"
+	"github.com/milvus-io/milvus/internal/mq/msgstream"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/concurrency"
+	"github.com/milvus-io/milvus/internal/util/funcutil"
 )
 
 func TestSegmentLoader_loadSegment(t *testing.T) {
@@ -69,7 +76,7 @@ func TestSegmentLoader_loadSegment(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 		assert.NoError(t, err)
 	})
 
@@ -100,7 +107,7 @@ func TestSegmentLoader_loadSegment(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 		assert.Error(t, err)
 	})
 
@@ -113,7 +120,7 @@ func TestSegmentLoader_loadSegment(t *testing.T) {
 
 		req := &querypb.LoadSegmentsRequest{}
 
-		err = loader.LoadSegment(req, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 		assert.Error(t, err)
 	})
 }
@@ -127,6 +134,9 @@ func TestSegmentLoader_loadSegmentFieldsData(t *testing.T) {
 		assert.NoError(t, err)
 		loader := node.loader
 		assert.NotNil(t, loader)
+
+		pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+		require.NoError(t, err)
 
 		var fieldPk *schemapb.FieldSchema
 		switch pkType {
@@ -175,13 +185,15 @@ func TestSegmentLoader_loadSegmentFieldsData(t *testing.T) {
 			defaultPartitionID,
 			defaultCollectionID,
 			defaultDMLChannel,
-			segmentTypeSealed)
+			segmentTypeSealed,
+			defaultSegmentVersion,
+			pool)
 		assert.Nil(t, err)
 
 		binlog, _, err := saveBinLog(ctx, defaultCollectionID, defaultPartitionID, defaultSegmentID, defaultMsgLength, schema)
 		assert.NoError(t, err)
 
-		err = loader.loadSealedSegmentFields(segment, binlog, &querypb.SegmentLoadInfo{})
+		err = loader.loadSealedSegmentFields(ctx, segment, binlog, &querypb.SegmentLoadInfo{})
 		assert.NoError(t, err)
 	}
 
@@ -234,7 +246,7 @@ func TestSegmentLoader_invalid(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 		assert.Error(t, err)
 	})
 
@@ -272,7 +284,7 @@ func TestSegmentLoader_invalid(t *testing.T) {
 				},
 			},
 		}
-		err = loader.LoadSegment(req, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 		assert.Error(t, err)
 	})
 
@@ -297,7 +309,95 @@ func TestSegmentLoader_invalid(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req, commonpb.SegmentState_Dropped)
+		err = loader.LoadSegment(ctx, req, commonpb.SegmentState_Dropped)
+		assert.Error(t, err)
+	})
+
+	t.Run("Test load file failed", func(t *testing.T) {
+		node, err := genSimpleQueryNode(ctx)
+		assert.NoError(t, err)
+		loader := node.loader
+		assert.NotNil(t, loader)
+
+		pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+		require.NoError(t, err)
+
+		cm := &mocks.ChunkManager{}
+		cm.EXPECT().Read(mock.Anything, mock.AnythingOfType("string")).Return(nil, errors.New("mocked"))
+
+		loader.cm = cm
+		fieldPk := genPKFieldSchema(simpleInt64Field)
+		fieldVector := genVectorFieldSchema(simpleFloatVecField)
+		schema := &schemapb.CollectionSchema{
+			Name:   defaultCollectionName,
+			AutoID: true,
+			Fields: []*schemapb.FieldSchema{fieldPk, fieldVector},
+		}
+
+		loader.metaReplica.removeSegment(defaultSegmentID, segmentTypeSealed)
+
+		col := newCollection(defaultCollectionID, schema)
+		assert.NotNil(t, col)
+		segment, err := newSegment(col,
+			defaultSegmentID,
+			defaultPartitionID,
+			defaultCollectionID,
+			defaultDMLChannel,
+			segmentTypeSealed,
+			defaultSegmentVersion,
+			pool)
+		assert.Nil(t, err)
+
+		binlog, _, err := saveBinLog(ctx, defaultCollectionID, defaultPartitionID, defaultSegmentID, defaultMsgLength, schema)
+		assert.NoError(t, err)
+
+		err = loader.loadSealedSegmentFields(ctx, segment, binlog, &querypb.SegmentLoadInfo{})
+		assert.Error(t, err)
+	})
+
+	t.Run("Test load index failed", func(t *testing.T) {
+
+		node, err := genSimpleQueryNode(ctx)
+		assert.NoError(t, err)
+		loader := node.loader
+		assert.NotNil(t, loader)
+
+		pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+		require.NoError(t, err)
+
+		cm := &mocks.ChunkManager{}
+		cm.EXPECT().Read(mock.Anything, mock.AnythingOfType("string")).Return(nil, errors.New("mocked"))
+
+		loader.cm = cm
+		fieldPk := genPKFieldSchema(simpleInt64Field)
+		fieldVector := genVectorFieldSchema(simpleFloatVecField)
+		schema := &schemapb.CollectionSchema{
+			Name:   defaultCollectionName,
+			AutoID: true,
+			Fields: []*schemapb.FieldSchema{fieldPk, fieldVector},
+		}
+
+		loader.metaReplica.removeSegment(defaultSegmentID, segmentTypeSealed)
+
+		col := newCollection(defaultCollectionID, schema)
+		assert.NotNil(t, col)
+		segment, err := newSegment(col,
+			defaultSegmentID,
+			defaultPartitionID,
+			defaultCollectionID,
+			defaultDMLChannel,
+			segmentTypeSealed,
+			defaultSegmentVersion,
+			pool)
+		assert.Nil(t, err)
+
+		err = loader.loadFieldIndexData(ctx, segment, &querypb.FieldIndexInfo{
+			FieldID:     fieldVector.FieldID,
+			EnableIndex: true,
+
+			IndexFilePaths: []string{"simpleindex"},
+		})
+
 		assert.Error(t, err)
 	})
 }
@@ -328,7 +428,7 @@ func TestSegmentLoader_testLoadGrowing(t *testing.T) {
 		collection, err := node.metaReplica.getCollectionByID(defaultCollectionID)
 		assert.NoError(t, err)
 
-		segment, err := newSegment(collection, defaultSegmentID+1, defaultPartitionID, defaultCollectionID, defaultDMLChannel, segmentTypeGrowing)
+		segment, err := newSegment(collection, defaultSegmentID+1, defaultPartitionID, defaultCollectionID, defaultDMLChannel, segmentTypeGrowing, defaultSegmentVersion, loader.cgoPool)
 		assert.Nil(t, err)
 
 		insertData, err := genInsertData(defaultMsgLength, collection.schema)
@@ -357,7 +457,7 @@ func TestSegmentLoader_testLoadGrowing(t *testing.T) {
 		collection, err := node.metaReplica.getCollectionByID(defaultCollectionID)
 		assert.NoError(t, err)
 
-		segment, err := newSegment(collection, defaultSegmentID+1, defaultPartitionID, defaultCollectionID, defaultDMLChannel, segmentTypeGrowing)
+		segment, err := newSegment(collection, defaultSegmentID+1, defaultPartitionID, defaultCollectionID, defaultDMLChannel, segmentTypeGrowing, defaultSegmentVersion, node.loader.cgoPool)
 		assert.Nil(t, err)
 
 		insertData, err := genInsertData(defaultMsgLength, collection.schema)
@@ -415,7 +515,7 @@ func TestSegmentLoader_testLoadGrowingAndSealed(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req1, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req1, segmentTypeSealed)
 		assert.NoError(t, err)
 
 		segment1, err := loader.metaReplica.getSegmentByID(segmentID1, segmentTypeSealed)
@@ -441,7 +541,7 @@ func TestSegmentLoader_testLoadGrowingAndSealed(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req2, segmentTypeSealed)
+		err = loader.LoadSegment(ctx, req2, segmentTypeSealed)
 		assert.NoError(t, err)
 
 		segment2, err := loader.metaReplica.getSegmentByID(segmentID2, segmentTypeSealed)
@@ -475,7 +575,7 @@ func TestSegmentLoader_testLoadGrowingAndSealed(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req1, segmentTypeGrowing)
+		err = loader.LoadSegment(ctx, req1, segmentTypeGrowing)
 		assert.NoError(t, err)
 
 		segment1, err := loader.metaReplica.getSegmentByID(segmentID1, segmentTypeGrowing)
@@ -501,7 +601,7 @@ func TestSegmentLoader_testLoadGrowingAndSealed(t *testing.T) {
 			},
 		}
 
-		err = loader.LoadSegment(req2, segmentTypeGrowing)
+		err = loader.LoadSegment(ctx, req2, segmentTypeGrowing)
 		assert.NoError(t, err)
 
 		segment2, err := loader.metaReplica.getSegmentByID(segmentID2, segmentTypeGrowing)
@@ -561,7 +661,7 @@ func TestSegmentLoader_testLoadSealedSegmentWithIndex(t *testing.T) {
 		},
 	}
 
-	err = loader.LoadSegment(req, segmentTypeSealed)
+	err = loader.LoadSegment(ctx, req, segmentTypeSealed)
 	assert.NoError(t, err)
 
 	segment, err := node.metaReplica.getSegmentByID(segmentID, segmentTypeSealed)
@@ -582,6 +682,7 @@ func TestSegmentLoader_testFromDmlCPLoadDelete(t *testing.T) {
 	{
 		mockMsg := &mockMsgID{}
 		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
 		testSeekFailWhenConsumingDeltaMsg(ctx, t, position, mockMsg)
 	}
 
@@ -589,31 +690,62 @@ func TestSegmentLoader_testFromDmlCPLoadDelete(t *testing.T) {
 	{
 		mockMsg := &mockMsgID{}
 		mockMsg.On("AtEarliestPosition").Return(true, nil)
-		assert.Nil(t, testConsumingDeltaMsg(ctx, t, position, true, mockMsg))
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
+		assert.Nil(t, testConsumingDeltaMsg(ctx, t, position, true, true, false, mockMsg))
+	}
+
+	// test already reach latest position
+	{
+		mockMsg := &mockMsgID{}
+		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(true, nil)
+		assert.Nil(t, testConsumingDeltaMsg(ctx, t, position, true, true, false, mockMsg))
 	}
 
 	//test consume after seeking when get last msg successfully
 	{
 		mockMsg := &mockMsgID{}
 		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
 		mockMsg.On("LessOrEqualThan", mock.AnythingOfType("string")).Return(true, nil)
-		assert.Nil(t, testConsumingDeltaMsg(ctx, t, position, true, mockMsg))
+		assert.Nil(t, testConsumingDeltaMsg(ctx, t, position, true, true, false, mockMsg))
 	}
 
 	//test compare msgID failed when get last msg successfully
 	{
 		mockMsg := &mockMsgID{}
 		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
 		mockMsg.On("LessOrEqualThan", mock.AnythingOfType("string")).Return(true, errors.New(""))
-		assert.NotNil(t, testConsumingDeltaMsg(ctx, t, position, true, mockMsg))
+		assert.NotNil(t, testConsumingDeltaMsg(ctx, t, position, true, true, false, mockMsg))
 	}
 
 	//test consume after seeking when get last msg failed
 	{
 		mockMsg := &mockMsgID{}
 		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
 		mockMsg.On("LessOrEqualThan", mock.AnythingOfType("string")).Return(true, errors.New(""))
-		assert.NotNil(t, testConsumingDeltaMsg(ctx, t, position, false, mockMsg))
+		assert.NotNil(t, testConsumingDeltaMsg(ctx, t, position, false, true, false, mockMsg))
+	}
+
+	//test consume after seeking when read stream failed
+	{
+		mockMsg := &mockMsgID{}
+		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
+		assert.NotNil(t, testConsumingDeltaMsg(ctx, t, position, true, false, true, mockMsg))
+	}
+
+	//test context timeout when reading stream
+	{
+		log.Debug("test context timeout when reading stream")
+		mockMsg := &mockMsgID{}
+		mockMsg.On("AtEarliestPosition").Return(false, nil)
+		mockMsg.On("Equal", mock.AnythingOfType("string")).Return(false, nil)
+		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+		defer cancel()
+		assert.ErrorIs(t, testConsumingDeltaMsg(ctx, t, position, true, false, false, mockMsg), context.DeadlineExceeded)
 	}
 }
 
@@ -635,7 +767,7 @@ func testSeekFailWhenConsumingDeltaMsg(ctx context.Context, t *testing.T, positi
 	assert.EqualError(t, ret, errMsg)
 }
 
-func testConsumingDeltaMsg(ctx context.Context, t *testing.T, position *msgstream.MsgPosition, getLastSucc bool, mockMsg *mockMsgID) error {
+func testConsumingDeltaMsg(ctx context.Context, t *testing.T, position *msgstream.MsgPosition, getLastSucc, hasData, closedStream bool, mockMsg *mockMsgID) error {
 	msgStream := &LoadDeleteMsgStream{}
 	msgStream.On("AsConsumer", mock.AnythingOfTypeArgument("string"), mock.AnythingOfTypeArgument("string"))
 	msgStream.On("Seek", mock.AnythingOfType("string")).Return(nil)
@@ -646,13 +778,16 @@ func testConsumingDeltaMsg(ctx context.Context, t *testing.T, position *msgstrea
 		msgStream.On("GetLatestMsgID", mock.AnythingOfType("string")).Return(mockMsg, errors.New(""))
 	}
 
-	msgChan := make(chan *msgstream.MsgPack)
-	go func() {
+	msgChan := make(chan *msgstream.MsgPack, 10)
+	if hasData {
 		msgChan <- nil
 		deleteMsg1 := genDeleteMsg(defaultCollectionID+1, schemapb.DataType_Int64, defaultDelLength)
 		deleteMsg2 := genDeleteMsg(defaultCollectionID, schemapb.DataType_Int64, defaultDelLength)
 		msgChan <- &msgstream.MsgPack{Msgs: []msgstream.TsMsg{deleteMsg1, deleteMsg2}}
-	}()
+	}
+	if closedStream {
+		close(msgChan)
+	}
 
 	msgStream.On("Chan").Return(msgChan)
 	factory := &mockMsgStreamFactory{mockMqStream: msgStream}
@@ -676,6 +811,15 @@ func (m2 *mockMsgID) AtEarliestPosition() bool {
 }
 
 func (m2 *mockMsgID) LessOrEqualThan(msgID []byte) (bool, error) {
+	args := m2.Called()
+	ret := args.Get(0)
+	if args.Get(1) != nil {
+		return false, args.Get(1).(error)
+	}
+	return ret.(bool), nil
+}
+
+func (m2 *mockMsgID) Equal(msgID []byte) (bool, error) {
 	args := m2.Called()
 	ret := args.Get(0)
 	if args.Get(1) != nil {
@@ -761,11 +905,12 @@ func TestSegmentLoader_getFieldType(t *testing.T) {
 	loader := &segmentLoader{metaReplica: replica}
 
 	// failed to get collection.
-	segment := &Segment{segmentType: segmentTypeSealed}
+	segment := &Segment{segmentType: atomic.NewInt32(0)}
+	segment.setType(segmentTypeSealed)
 	_, err := loader.getFieldType(segment, 100)
 	assert.Error(t, err)
 
-	segment.segmentType = segmentTypeGrowing
+	segment.setType(segmentTypeGrowing)
 	_, err = loader.getFieldType(segment, 100)
 	assert.Error(t, err)
 
@@ -784,12 +929,12 @@ func TestSegmentLoader_getFieldType(t *testing.T) {
 		}, nil
 	}
 
-	segment.segmentType = segmentTypeGrowing
+	segment.setType(segmentTypeGrowing)
 	fieldType, err := loader.getFieldType(segment, 100)
 	assert.NoError(t, err)
 	assert.Equal(t, schemapb.DataType_Int64, fieldType)
 
-	segment.segmentType = segmentTypeSealed
+	segment.setType(segmentTypeSealed)
 	fieldType, err = loader.getFieldType(segment, 100)
 	assert.NoError(t, err)
 	assert.Equal(t, schemapb.DataType_Int64, fieldType)

@@ -101,7 +101,7 @@ class TestCollectionParams(TestcaseBase):
                                              check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize("name", [[], 1, [1, "2", 3], (1,), {1: 1}, None])
+    @pytest.mark.parametrize("name", [[], 1, [1, "2", 3], (1,), {1: 1}, "qw$_o90", "1ns_", None])
     def test_collection_illegal_name(self, name):
         """
         target: test collection with illegal name
@@ -109,9 +109,26 @@ class TestCollectionParams(TestcaseBase):
         expected: raise exception
         """
         self._connect()
-        error = {ct.err_code: -1, ct.err_msg: "`collection_name` value {} is illegal".format(name)}
+        error = {ct.err_code: 1, ct.err_msg: "`collection_name` value {} is illegal".format(name)}
         self.collection_wrap.init_collection(name, schema=default_schema, check_task=CheckTasks.err_res,
                                              check_items=error)
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("name", ["_co11ection", "co11_ection"])
+    def test_collection_naming_rules(self, name):
+        """
+        target: test collection with valid name
+        method: 1. connect milvus
+                2. Create a field with a name which uses all the supported elements in the naming rules
+                3. Create a collection with a name which uses all the supported elements in the naming rules
+        expected: Collection created successfully
+        """
+        self._connect()
+        fields = [cf.gen_int64_field(), cf.gen_int64_field("_1nt"), cf.gen_float_vec_field("f10at_")]
+        schema = cf.gen_collection_schema(fields=fields, primary_field=ct.default_int64_field_name)
+        self.collection_wrap.init_collection(name, schema=schema,
+                                             check_task=CheckTasks.check_collection_property,
+                                             check_items={exp_name: name, exp_schema: schema})
 
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("name", ["12-s", "12 s", "(mn)", "中文", "%$#", "a".join("a" for i in range(256))])
@@ -370,6 +387,7 @@ class TestCollectionParams(TestcaseBase):
                                                  check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.xfail(reason="issue #19334")
     def test_collection_field_dtype_float_value(self):
         """
         target: test collection with float type
@@ -788,7 +806,6 @@ class TestCollectionParams(TestcaseBase):
         self.collection_wrap.init_collection(c_name, schema=schema, check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.xfail(reason="exception not Milvus Exception")
     def test_collection_vector_invalid_dim(self, get_invalid_dim):
         """
         target: test collection with invalid dimension
@@ -903,8 +920,8 @@ class TestCollectionParams(TestcaseBase):
                                              check_items={exp_name: c_name, exp_shards_num: default_shards_num})
         assert c_name in self.utility_wrap.list_collections()[0]
 
-    @pytest.mark.tags(CaseLabel.L0)
-    @pytest.mark.parametrize("shards_num", [-256, 0, 10, 256])
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("shards_num", [-256, 0, 1, 10, 214, 256])
     def test_collection_shards_num_with_not_default_value(self, shards_num):
         """
         target:test collection with shards_num
@@ -917,6 +934,20 @@ class TestCollectionParams(TestcaseBase):
                                              check_task=CheckTasks.check_collection_property,
                                              check_items={exp_name: c_name, exp_shards_num: shards_num})
         assert c_name in self.utility_wrap.list_collections()[0]
+
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("shards_num", [257])
+    def test_collection_shards_num_invalid(self, shards_num):
+        """
+        target:test collection with invalid shards_num
+        method:create collection with shards_num out of [1,256]
+        expected: raise exception
+        """
+        self._connect()
+        c_name = cf.gen_unique_str(prefix)
+        error = {ct.err_code: 1, ct.err_msg: "maximum shards's number should be limited to 256"}
+        self.collection_wrap.init_collection(c_name, schema=default_schema, shards_num=shards_num,
+                                             check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_collection_shards_num_with_error_type(self):
@@ -1381,6 +1412,7 @@ class TestCollectionDataframe(TestcaseBase):
         res, _ = self.collection_wrap.construct_from_dataframe(cf.gen_unique_str(prefix), df,
                                                                primary_field=ct.default_int64_field_name, auto_id=False)
         collection_w = res[0]
+        collection_w.flush()
         assert collection_w.num_entities == nb
         mutation_res = res[1]
         assert mutation_res.primary_keys == df[ct.default_int64_field_name].values.tolist()
@@ -1501,6 +1533,22 @@ class TestCollectionCountBinary(TestcaseBase):
         mutation_res, _ = collection_w.insert(data=df)
         collection_w.create_index(ct.default_binary_vec_field_name, default_binary_index_params)
         assert collection_w.num_entities == insert_count
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("auto_id", [True, False])
+    def test_binary_collection_with_min_dim(self, auto_id):
+        """
+        target: test binary collection when dim=1
+        method: creat collection and set dim=1
+        expected: check error message successfully
+        """
+        self._connect()
+        dim = 1
+        c_schema = cf.gen_default_binary_collection_schema(auto_id=auto_id, dim=dim)
+        collection_w = self.init_collection_wrap(schema=c_schema,
+                                                 check_task=CheckTasks.err_res,
+                                                 check_items={"err_code": 1,
+                                                              "err_msg": f"invalid dimension: {dim}. should be multiple of 8."})
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_collection_count_no_entities(self):
@@ -1711,8 +1759,10 @@ class TestDropCollection(TestcaseBase):
         c_name = cf.gen_unique_str()
         self.init_collection_wrap(name=c_name)
         c_name_2 = cf.gen_unique_str()
-        error = {ct.err_code: 0, ct.err_msg: 'DescribeCollection failed: can\'t find collection: %s' % c_name_2}
-        self.utility_wrap.drop_collection(c_name_2, check_task=CheckTasks.err_res, check_items=error)
+        # error = {ct.err_code: 0, ct.err_msg: 'DescribeCollection failed: can\'t find collection: %s' % c_name_2}
+        # self.utility_wrap.drop_collection(c_name_2, check_task=CheckTasks.err_res, check_items=error)
+        # @longjiquan: dropping collection should be idempotent.
+        self.utility_wrap.drop_collection(c_name_2)
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_create_drop_collection_multithread(self):
@@ -2032,7 +2082,7 @@ class TestLoadCollection(TestcaseBase):
         c_name = cf.gen_unique_str()
         collection_wr = self.init_collection_wrap(name=c_name)
         collection_wr.drop()
-        error = {ct.err_code: 0,
+        error = {ct.err_code: 1,
                  ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
         collection_wr.load(check_task=CheckTasks.err_res, check_items=error)
 
@@ -2047,7 +2097,7 @@ class TestLoadCollection(TestcaseBase):
         c_name = cf.gen_unique_str()
         collection_wr = self.init_collection_wrap(name=c_name)
         collection_wr.drop()
-        error = {ct.err_code: 0,
+        error = {ct.err_code: 1,
                  ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
         collection_wr.release(check_task=CheckTasks.err_res, check_items=error)
 
@@ -2109,7 +2159,7 @@ class TestLoadCollection(TestcaseBase):
         collection_wr.load()
         collection_wr.release()
         collection_wr.drop()
-        error = {ct.err_code: 0,
+        error = {ct.err_code: 1,
                  ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
         collection_wr.load(check_task=CheckTasks.err_res, check_items=error)
         collection_wr.release(check_task=CheckTasks.err_res, check_items=error)
@@ -2127,7 +2177,7 @@ class TestLoadCollection(TestcaseBase):
         collection_wr.load()
         collection_wr.drop()
         error = {ct.err_code: 0,
-                 ct.err_msg: "DescribeCollection failed: can't find collection: %s" % c_name}
+                 ct.err_msg: "can't find collection"}
         collection_wr.release(check_task=CheckTasks.err_res, check_items=error)
 
     @pytest.mark.tags(CaseLabel.L0)
@@ -2215,6 +2265,8 @@ class TestLoadCollection(TestcaseBase):
                 2.load with a new replica number
                 3.release collection
                 4.load with a new replica
+                5.create index is a must because get_query_segment_info could
+                  only return indexed and loaded segment
         expected: The second time successfully loaded with a new replica number
         """
         # create, insert
@@ -2222,14 +2274,14 @@ class TestLoadCollection(TestcaseBase):
         df = cf.gen_default_dataframe_data()
         insert_res, _ = collection_w.insert(df)
         assert collection_w.num_entities == ct.default_nb
-
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
         collection_w.load(replica_number=1)
         for seg in self.utility_wrap.get_query_segment_info(collection_w.name)[0]:
             assert len(seg.nodeIds) == 1
 
         collection_w.query(expr=f"{ct.default_int64_field_name} in [0]")
         loading_progress, _ = self.utility_wrap.loading_progress(collection_w.name)
-        assert loading_progress == {'loading_progress': '100%', 'num_loaded_partitions': 1, 'not_loaded_partitions': []}
+        assert loading_progress == {'loading_progress': '100%'}
 
         # verify load different replicas thrown an exception
         error = {ct.err_code: 5, ct.err_msg: f"Should release first then reload with the new number of replicas"}
@@ -2241,7 +2293,7 @@ class TestLoadCollection(TestcaseBase):
         collection_w.load(replica_number=2)
         # replicas is not yet reflected in loading progress
         loading_progress, _ = self.utility_wrap.loading_progress(collection_w.name)
-        assert loading_progress == {'loading_progress': '100%', 'num_loaded_partitions': 1, 'not_loaded_partitions': []}
+        assert loading_progress == {'loading_progress': '100%'}
         two_replicas, _ = collection_w.get_replicas()
         assert len(two_replicas.groups) == 2
         collection_w.query(expr=f"{ct.default_int64_field_name} in [0]", check_task=CheckTasks.check_query_results,
@@ -2554,9 +2606,6 @@ class TestLoadPartition(TestcaseBase):
         params=gen_simple_index()
     )
     def get_simple_index(self, request, connect):
-        # if str(connect._cmd("mode")) == "CPU":
-        #     if request.param["index_type"] in index_cpu_not_support():
-        #         pytest.skip("sq8h not support in cpu mode")
         return request.param
 
     @pytest.fixture(
@@ -2587,8 +2636,8 @@ class TestLoadPartition(TestcaseBase):
         # for metric_type in ct.binary_metrics:
         binary_index["metric_type"] = metric_type
         if binary_index["index_type"] == "BIN_IVF_FLAT" and metric_type in ct.structure_metrics:
-            error = {ct.err_code: -1, ct.err_msg: 'Invalid metric_type: SUBSTRUCTURE, '
-                                                  'which does not match the index type: %s' % metric_type}
+            error = {ct.err_code: 1, ct.err_msg: 'Invalid metric_type: SUBSTRUCTURE, '
+                                                 'which does not match the index type: BIN_IVF_FLAT'}
             collection_w.create_index(ct.default_binary_vec_field_name, binary_index,
                                       check_task=CheckTasks.err_res, check_items=error)
         else:
@@ -2746,7 +2795,7 @@ class TestLoadPartition(TestcaseBase):
                                                             "is_empty": True, "num_entities": 0}
                                                )
         collection_w.drop()
-        error = {ct.err_code: 0, ct.err_msg: "HasPartition failed: can\'t find collection: %s" % name}
+        error = {ct.err_code: 0, ct.err_msg: "can\'t find collection"}
         partition_w.load(check_task=CheckTasks.err_res, check_items=error)
         partition_w.release(check_task=CheckTasks.err_res, check_items=error)
 
@@ -2821,7 +2870,7 @@ class TestCollectionString(TestcaseBase):
         max_length = 100000
         string_field = cf.gen_string_field(max_length=max_length)
         schema = cf.gen_collection_schema([int_field, string_field, vec_field])
-        error = {ct.err_code: 0, ct.err_msg: "invalid max_length: %s" % max_length}
+        error = {ct.err_code: 1, ct.err_msg: "invalid max_length: %s" % max_length}
         self.collection_wrap.init_collection(name=c_name, schema=schema,
                                              check_task=CheckTasks.err_res, check_items=error)
 

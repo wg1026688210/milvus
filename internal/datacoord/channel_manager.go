@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/kv"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
@@ -60,8 +62,16 @@ type ChannelManager struct {
 }
 
 type channel struct {
-	Name         string
-	CollectionID UniqueID
+	Name           string
+	CollectionID   UniqueID
+	StartPositions []*commonpb.KeyDataPair
+	Schema         *schemapb.CollectionSchema
+}
+
+// String implement Stringer.
+func (ch *channel) String() string {
+	// schema maybe too large to print
+	return fmt.Sprintf("Name: %s, CollectionID: %d, StartPositions: %v", ch.Name, ch.CollectionID, ch.StartPositions)
 }
 
 // ChannelManagerOpt is to set optional parameters in channel manager.
@@ -403,7 +413,8 @@ func (c *ChannelManager) unsubAttempt(ncInfo *NodeChannelInfo) {
 
 	nodeID := ncInfo.NodeID
 	for _, ch := range ncInfo.Channels {
-		subName := fmt.Sprintf("%s-%d-%d", Params.CommonCfg.DataNodeSubName, nodeID, ch.CollectionID)
+		// align to datanode subname, using vchannel name
+		subName := fmt.Sprintf("%s-%d-%s", Params.CommonCfg.DataNodeSubName, nodeID, ch.Name)
 		pchannelName := funcutil.ToPhysicalChannel(ch.Name)
 		msgstream.UnsubscribeChannels(c.ctx, c.msgstreamFactory, subName, []string{pchannelName})
 	}
@@ -419,7 +430,7 @@ func (c *ChannelManager) Watch(ch *channel) error {
 		return nil
 	}
 	log.Info("try to update channel watch info with ToWatch state",
-		zap.Any("channel", ch),
+		zap.String("channel", ch.String()),
 		zap.Array("updates", updates))
 
 	err := c.updateWithTimer(updates, datapb.ChannelWatchState_ToWatch)
@@ -433,12 +444,13 @@ func (c *ChannelManager) Watch(ch *channel) error {
 // fillChannelWatchInfo updates the channel op by filling in channel watch info.
 func (c *ChannelManager) fillChannelWatchInfo(op *ChannelOp) {
 	for _, ch := range op.Channels {
-		vcInfo := c.h.GetVChanPositions(ch.Name, ch.CollectionID, allPartitionID)
+		vcInfo := c.h.GetDataVChanPositions(ch, allPartitionID)
 		info := &datapb.ChannelWatchInfo{
 			Vchan:     vcInfo,
 			StartTs:   time.Now().Unix(),
 			State:     datapb.ChannelWatchState_Uncomplete,
 			TimeoutTs: time.Now().Add(maxWatchDuration).UnixNano(),
+			Schema:    ch.Schema,
 		}
 		op.ChannelWatchInfos = append(op.ChannelWatchInfos, info)
 	}
@@ -450,12 +462,13 @@ func (c *ChannelManager) fillChannelWatchInfoWithState(op *ChannelOp, state data
 	startTs := time.Now().Unix()
 	timeoutTs := time.Now().Add(maxWatchDuration).UnixNano()
 	for _, ch := range op.Channels {
-		vcInfo := c.h.GetVChanPositions(ch.Name, ch.CollectionID, allPartitionID)
+		vcInfo := c.h.GetDataVChanPositions(ch, allPartitionID)
 		info := &datapb.ChannelWatchInfo{
 			Vchan:     vcInfo,
 			StartTs:   startTs,
 			State:     state,
 			TimeoutTs: timeoutTs,
+			Schema:    ch.Schema,
 		}
 
 		// Only set timer for watchInfo not from bufferID
@@ -739,11 +752,8 @@ func (c *ChannelManager) Reassign(nodeID UniqueID, channelName string) error {
 		if err := c.remove(nodeID, ch); err != nil {
 			return fmt.Errorf("failed to remove watch info: %v,%s", ch, err.Error())
 		}
-
-		log.Debug("try to cleanup removal flag ", zap.String("channel name", channelName))
 		c.h.FinishDropChannel(channelName)
-
-		log.Info("removed channel assignment", zap.Any("channel", ch))
+		log.Info("removed channel assignment", zap.String("channel name", channelName))
 		return nil
 	}
 

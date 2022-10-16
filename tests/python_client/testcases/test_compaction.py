@@ -46,6 +46,7 @@ class TestCompactionParams(TestcaseBase):
         expected: Merge into one segment
         """
         # init collection with one shard, insert into two segments
+        pytest.skip("DataCoord: for A, B -> C, will not compact segment C before A, B GCed, no method to check whether a segment is GCed")
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, nb_of_segment=tmp_nb)
 
         # first compact two segments
@@ -78,6 +79,8 @@ class TestCompactionParams(TestcaseBase):
         # create collection with shard_num=1, and create partition
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix), shards_num=1)
         partition_w = self.init_partition_wrap(collection_wrap=collection_w)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
 
         # insert flush twice
         for i in range(2):
@@ -95,8 +98,14 @@ class TestCompactionParams(TestcaseBase):
         target = c_plans.plans[0].target
 
         # verify queryNode load the compacted segments
-        collection_w.load()
-        segment_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
+        cost = 30
+        start = time()
+        while time() - start < cost:
+            collection_w.load()
+            segment_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
+            if len(segment_info) == 1:
+                break
+            sleep(1.0)
         assert target == segment_info[0].segmentID
 
     @pytest.mark.tags(CaseLabel.L2)
@@ -303,6 +312,7 @@ class TestCompactionParams(TestcaseBase):
         """
         # create collection shard_num=1, insert 2 segments, each with tmp_nb entities
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix), shards_num=1)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
         collection_w.compact()
 
         # Notice:The merge segments compaction triggered by max_compaction_interval also needs to meet
@@ -381,7 +391,8 @@ class TestCompactionOperation(TestcaseBase):
                                             check_items={"nq": ct.default_nq,
                                                          "ids": ids,
                                                          "limit": ct.default_limit})
-        collection_w.query(f"{ct.default_int64_field_name} in {delete_ids}", check_task=CheckTasks.check_query_empty)
+        collection_w.query(f"{ct.default_int64_field_name} in {delete_ids}",
+                           check_task=CheckTasks.check_query_empty)
 
     @pytest.mark.tags(CaseLabel.L3)
     def test_compact_delete_multi_segments(self):
@@ -415,7 +426,8 @@ class TestCompactionOperation(TestcaseBase):
         for plan in c_plans.plans:
             assert len(plan.sources) == 1
 
-        collection_w.query(f"{ct.default_int64_field_name} in {delete_ids}", check_task=CheckTasks.check_query_empty)
+        collection_w.query(f"{ct.default_int64_field_name} in {delete_ids}",
+                           check_task=CheckTasks.check_query_empty)
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_compact_merge_multi_shards(self):
@@ -432,6 +444,7 @@ class TestCompactionOperation(TestcaseBase):
             insert_res, _ = collection_w.insert(df)
             log.debug(collection_w.num_entities)
 
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
         collection_w.load()
         log.debug(self.utility_wrap.get_query_segment_info(collection_w.name))
 
@@ -516,7 +529,7 @@ class TestCompactionOperation(TestcaseBase):
         c_plans = collection_w.get_compaction_plans(check_task=CheckTasks.check_merge_compact)[0]
 
         # waiting for handoff completed and search
-        cost = 30
+        cost = 60
         start = time()
         while True:
             sleep(5)
@@ -544,6 +557,7 @@ class TestCompactionOperation(TestcaseBase):
                 4.load and search
         expected: Verify search result and index info
         """
+        pytest.skip("Compaction requires segment indexed")
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, nb_of_segment=ct.default_nb,
                                                                        is_dup=False)
 
@@ -609,6 +623,7 @@ class TestCompactionOperation(TestcaseBase):
                 3.load and search
         expected: Verify search result
         """
+        pytest.skip("Compaction requires segment indexed")
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, nb_of_segment=ct.default_nb,
                                                                        is_dup=False)
 
@@ -642,7 +657,7 @@ class TestCompactionOperation(TestcaseBase):
         df = cf.gen_default_dataframe_data()
         insert_res, _ = collection_w.insert(df)
         assert collection_w.num_entities == ct.default_nb
-
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
         collection_w.load()
 
         expr = f'{ct.default_int64_field_name} in {insert_res.primary_keys[:ct.default_nb // 2]}'
@@ -779,6 +794,8 @@ class TestCompactionOperation(TestcaseBase):
         num_of_segment = 2
         # create collection shard_num=1, insert 2 segments, each with tmp_nb entities
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, num_of_segment, tmp_nb)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
 
         collection_w.compact()
         collection_w.wait_for_compaction_completed()
@@ -789,8 +806,20 @@ class TestCompactionOperation(TestcaseBase):
 
         # verify queryNode load the compacted segments
         collection_w.load()
-        segment_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
-        assert c_plans.plans[0].target == segment_info[0].segmentID
+
+        start = time()
+        cost = 60
+        while True:
+            sleep(5)
+            segments_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
+
+            # verify segments reaches threshold, auto-merge ten segments into one
+            if len(segments_info) == 1:
+                break
+            end = time()
+            if end - start > cost:
+                raise MilvusException(1, "Compact merge two segments more than 60s")
+        assert c_plans.plans[0].target == segments_info[0].segmentID
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_compact_no_merge(self):
@@ -807,6 +836,7 @@ class TestCompactionOperation(TestcaseBase):
         collection_w.insert(df)
         assert collection_w.num_entities == tmp_nb
 
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
         collection_w.load()
 
         seg_before, _ = self.utility_wrap.get_query_segment_info(collection_w.name)
@@ -833,18 +863,34 @@ class TestCompactionOperation(TestcaseBase):
         expected: Verify segments info
         """
         # greater than auto-merge threshold 10
+        pytest.skip("DataCoord: for A, B -> C, will not compact segment C before A, B GCed, no method to check whether a segment is GCed")
         num_of_segment = ct.compact_segment_num_threshold + 1
 
         # create collection shard_num=1, insert 11 segments, each with one entity
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, num_of_segment=num_of_segment)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
+
+        # waiting for auto compaction finished
+        sleep(60)
 
         collection_w.compact()
         collection_w.wait_for_compaction_completed()
         c_plans, _ = collection_w.get_compaction_plans(check_task=CheckTasks.check_merge_compact, check_items={"segment_num": 2})
 
         collection_w.load()
-        segments_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
-        assert len(segments_info) == 1
+        start = time()
+        cost = 60
+        while True:
+            sleep(5)
+            segments_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
+
+            # verify segments reaches threshold, auto-merge ten segments into one
+            if len(segments_info) == 1:
+                break
+            end = time()
+            if end - start > cost:
+                raise MilvusException(1, "Compact auto and manual more than 60s")
         assert segments_info[0].segmentID == c_plans.plans[0].target
 
     @pytest.mark.tags(CaseLabel.L1)
@@ -862,6 +908,8 @@ class TestCompactionOperation(TestcaseBase):
 
         # create collection shard_num=1, insert 11 segments, each with one entity
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, num_of_segment=num_of_segment)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
 
         collection_w.compact()
         collection_w.wait_for_compaction_completed()
@@ -871,9 +919,20 @@ class TestCompactionOperation(TestcaseBase):
         target = c_plans.plans[0].target
 
         collection_w.load()
+        cost = 60
+        start = time()
+        while True:
+            sleep(5)
+            segments_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
+
+            # verify segments reaches threshold, auto-merge ten segments into one
+            if len(segments_info) == 1:
+                break
+            end = time()
+            if end - start > cost:
+                raise MilvusException(1, "Compact merge multiple segments more than 60s")
         replicas = collection_w.get_replicas()[0]
         replica_num = len(replicas.groups)
-        segments_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
         assert len(segments_info) == 1*replica_num
         assert segments_info[0].segmentID == target
 
@@ -887,6 +946,8 @@ class TestCompactionOperation(TestcaseBase):
         from pymilvus import utility
         # create collection shard_num=1, insert 2 segments, each with tmp_nb entities
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix), shards_num=1)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
 
         # insert twice
         df1 = cf.gen_default_dataframe_data(tmp_nb)
@@ -907,7 +968,7 @@ class TestCompactionOperation(TestcaseBase):
         search_res, _ = collection_w.search(df2[ct.default_float_vec_field_name][:1].to_list(),
                                             ct.default_float_vec_field_name,
                                             ct.default_search_params, ct.default_limit,
-                                            travel_timestamp=tt)
+                                            travel_timestamp=0)
         assert tmp_nb in search_res[0].ids
         assert len(search_res[0]) == ct.default_limit
 
@@ -924,6 +985,8 @@ class TestCompactionOperation(TestcaseBase):
 
         # create collection shard_num=1, insert 10 segments, each with one entity
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, num_of_segment=threshold)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
 
         # Estimated auto-merging takes 30s
         cost = 120
@@ -956,6 +1019,8 @@ class TestCompactionOperation(TestcaseBase):
         # create collection shard_num=1, insert 9 segments, each with one entity
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, num_of_segment=less_threshold)
 
+        # create index
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
 
         # load and verify no auto-merge
         collection_w.load()
@@ -1008,6 +1073,8 @@ class TestCompactionOperation(TestcaseBase):
         """
         # init collection with one shard, insert into two segments
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, is_dup=False)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
         # compact and complete
         collection_w.compact()
         collection_w.wait_for_compaction_completed()
@@ -1020,7 +1087,8 @@ class TestCompactionOperation(TestcaseBase):
         collection_w.query(expr, check_task=CheckTasks.check_query_empty)
 
         expr_1 = f'{ct.default_int64_field_name} in {[1]}'
-        collection_w.query(expr_1, check_task=CheckTasks.check_query_results, check_items={'exp_res': [{'int64': 1}]})
+        collection_w.query(expr_1, check_task=CheckTasks.check_query_results, check_items={
+                           'exp_res': [{'int64': 1}]})
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_compact_cross_shards(self):
@@ -1033,6 +1101,8 @@ class TestCompactionOperation(TestcaseBase):
         """
         # insert into two segments with two shard
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix), shards_num=2)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
         df = cf.gen_default_dataframe_data(tmp_nb)
         collection_w.insert(df)
         assert collection_w.num_entities == tmp_nb
@@ -1060,6 +1130,8 @@ class TestCompactionOperation(TestcaseBase):
         shards_num = 2
         # insert into two segments with two shard
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix), shards_num=shards_num)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
         df = cf.gen_default_dataframe_data(tmp_nb)
         collection_w.insert(df)
         expr = f"{ct.default_int64_field_name} in [0, 99]"
@@ -1086,6 +1158,8 @@ class TestCompactionOperation(TestcaseBase):
         # create collection and partition
         collection_w = self.init_collection_wrap(name=cf.gen_unique_str(prefix), shards_num=1)
         partition_w = self.init_partition_wrap(collection_wrap=collection_w)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
 
         # insert
         df = cf.gen_default_dataframe_data(tmp_nb)
@@ -1115,6 +1189,8 @@ class TestCompactionOperation(TestcaseBase):
         """
         collection_w = self.collection_insert_multi_segments_one_shard(prefix, nb_of_segment=ct.default_nb,
                                                                        is_dup=False)
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
+        log.debug(collection_w.index())
         df = cf.gen_default_dataframe_data()
 
         def do_flush():
@@ -1161,7 +1237,7 @@ class TestCompactionOperation(TestcaseBase):
         replicas = collection_w.get_replicas()[0]
         replica_num = len(replicas.groups)
         seg_info = self.utility_wrap.get_query_segment_info(collection_w.name)[0]
-        assert len(seg_info) == 1*replica_num
+        assert len(seg_info) != 1*replica_num
 
     @pytest.mark.tags(CaseLabel.L2)
     def test_compact_during_search(self):
@@ -1186,6 +1262,7 @@ class TestCompactionOperation(TestcaseBase):
                 assert len(search_res[0]) == ct.default_limit
 
         # compact during search
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
         collection_w.load()
         t = threading.Thread(target=do_search, args=())
         t.start()

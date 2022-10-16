@@ -22,9 +22,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
-
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
 
 	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
@@ -35,56 +32,49 @@ import (
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
 	"github.com/milvus-io/milvus/internal/types"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/planpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 
-	"github.com/milvus-io/milvus/internal/util/funcutil"
-	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/internal/util/timerecord"
 	"github.com/milvus-io/milvus/internal/util/trace"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
 
 const (
-	InsertTaskName                  = "InsertTask"
-	CreateCollectionTaskName        = "CreateCollectionTask"
-	DropCollectionTaskName          = "DropCollectionTask"
-	SearchTaskName                  = "SearchTask"
-	RetrieveTaskName                = "RetrieveTask"
-	QueryTaskName                   = "QueryTask"
-	AnnsFieldKey                    = "anns_field"
-	TopKKey                         = "topk"
-	MetricTypeKey                   = "metric_type"
-	SearchParamsKey                 = "params"
-	RoundDecimalKey                 = "round_decimal"
-	HasCollectionTaskName           = "HasCollectionTask"
-	DescribeCollectionTaskName      = "DescribeCollectionTask"
-	GetCollectionStatisticsTaskName = "GetCollectionStatisticsTask"
-	GetPartitionStatisticsTaskName  = "GetPartitionStatisticsTask"
-	ShowCollectionTaskName          = "ShowCollectionTask"
-	CreatePartitionTaskName         = "CreatePartitionTask"
-	DropPartitionTaskName           = "DropPartitionTask"
-	HasPartitionTaskName            = "HasPartitionTask"
-	ShowPartitionTaskName           = "ShowPartitionTask"
-	CreateIndexTaskName             = "CreateIndexTask"
-	DescribeIndexTaskName           = "DescribeIndexTask"
-	DropIndexTaskName               = "DropIndexTask"
-	GetIndexStateTaskName           = "GetIndexStateTask"
-	GetIndexBuildProgressTaskName   = "GetIndexBuildProgressTask"
-	FlushTaskName                   = "FlushTask"
-	LoadCollectionTaskName          = "LoadCollectionTask"
-	ReleaseCollectionTaskName       = "ReleaseCollectionTask"
-	LoadPartitionTaskName           = "LoadPartitionsTask"
-	ReleasePartitionTaskName        = "ReleasePartitionsTask"
-	deleteTaskName                  = "DeleteTask"
-	CreateAliasTaskName             = "CreateAliasTask"
-	DropAliasTaskName               = "DropAliasTask"
-	AlterAliasTaskName              = "AlterAliasTask"
+	AnnsFieldKey    = "anns_field"
+	TopKKey         = "topk"
+	NQKey           = "nq"
+	MetricTypeKey   = "metric_type"
+	SearchParamsKey = "params"
+	RoundDecimalKey = "round_decimal"
+	OffsetKey       = "offset"
+	LimitKey        = "limit"
+
+	InsertTaskName             = "InsertTask"
+	CreateCollectionTaskName   = "CreateCollectionTask"
+	DropCollectionTaskName     = "DropCollectionTask"
+	HasCollectionTaskName      = "HasCollectionTask"
+	DescribeCollectionTaskName = "DescribeCollectionTask"
+	ShowCollectionTaskName     = "ShowCollectionTask"
+	CreatePartitionTaskName    = "CreatePartitionTask"
+	DropPartitionTaskName      = "DropPartitionTask"
+	HasPartitionTaskName       = "HasPartitionTask"
+	ShowPartitionTaskName      = "ShowPartitionTask"
+	FlushTaskName              = "FlushTask"
+	LoadCollectionTaskName     = "LoadCollectionTask"
+	ReleaseCollectionTaskName  = "ReleaseCollectionTask"
+	LoadPartitionTaskName      = "LoadPartitionsTask"
+	ReleasePartitionTaskName   = "ReleasePartitionsTask"
+	deleteTaskName             = "DeleteTask"
+	CreateAliasTaskName        = "CreateAliasTask"
+	DropAliasTaskName          = "DropAliasTask"
+	AlterAliasTaskName         = "AlterAliasTask"
+	AlterCollectionTaskName    = "AlterCollectionTask"
 
 	// minFloat32 minimum float.
 	minFloat32 = -1 * float32(math.MaxFloat32)
@@ -309,76 +299,18 @@ func (dct *dropCollectionTask) PreExecute(ctx context.Context) error {
 }
 
 func (dct *dropCollectionTask) Execute(ctx context.Context) error {
-	collID, err := globalMetaCache.GetCollectionID(ctx, dct.CollectionName)
-	if err != nil {
-		return err
-	}
-
+	var err error
 	dct.result, err = dct.rootCoord.DropCollection(ctx, dct.DropCollectionRequest)
-	if err != nil {
-		return err
+	if common.IsCollectionNotExistError(err) {
+		// make dropping collection idempotent.
+		dct.result = &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}
+		return nil
 	}
-
-	_ = dct.chMgr.removeDMLStream(collID)
-	globalMetaCache.RemoveCollection(ctx, dct.CollectionName)
-	return nil
+	return err
 }
 
 func (dct *dropCollectionTask) PostExecute(ctx context.Context) error {
-	globalMetaCache.RemoveCollection(ctx, dct.CollectionName)
 	return nil
-}
-
-// Support wildcard in output fields:
-//   "*" - all scalar fields
-//   "%" - all vector fields
-// For example, A and B are scalar fields, C and D are vector fields, duplicated fields will automatically be removed.
-//   output_fields=["*"] 	 ==> [A,B]
-//   output_fields=["%"] 	 ==> [C,D]
-//   output_fields=["*","%"] ==> [A,B,C,D]
-//   output_fields=["*",A] 	 ==> [A,B]
-//   output_fields=["*",C]   ==> [A,B,C]
-func translateOutputFields(outputFields []string, schema *schemapb.CollectionSchema, addPrimary bool) ([]string, error) {
-	var primaryFieldName string
-	scalarFieldNameMap := make(map[string]bool)
-	vectorFieldNameMap := make(map[string]bool)
-	resultFieldNameMap := make(map[string]bool)
-	resultFieldNames := make([]string, 0)
-
-	for _, field := range schema.Fields {
-		if field.IsPrimaryKey {
-			primaryFieldName = field.Name
-		}
-		if field.DataType == schemapb.DataType_BinaryVector || field.DataType == schemapb.DataType_FloatVector {
-			vectorFieldNameMap[field.Name] = true
-		} else {
-			scalarFieldNameMap[field.Name] = true
-		}
-	}
-
-	for _, outputFieldName := range outputFields {
-		outputFieldName = strings.TrimSpace(outputFieldName)
-		if outputFieldName == "*" {
-			for fieldName := range scalarFieldNameMap {
-				resultFieldNameMap[fieldName] = true
-			}
-		} else if outputFieldName == "%" {
-			for fieldName := range vectorFieldNameMap {
-				resultFieldNameMap[fieldName] = true
-			}
-		} else {
-			resultFieldNameMap[outputFieldName] = true
-		}
-	}
-
-	if addPrimary {
-		resultFieldNameMap[primaryFieldName] = true
-	}
-
-	for fieldName := range resultFieldNameMap {
-		resultFieldNames = append(resultFieldNames, fieldName)
-	}
-	return resultFieldNames, nil
 }
 
 type hasCollectionTask struct {
@@ -526,6 +458,7 @@ func (dct *describeCollectionTask) Execute(ctx context.Context) error {
 		CollectionID:         0,
 		VirtualChannelNames:  nil,
 		PhysicalChannelNames: nil,
+		CollectionName:       dct.GetCollectionName(),
 	}
 
 	result, err := dct.rootCoord.DescribeCollection(ctx, dct.DescribeCollectionRequest)
@@ -548,6 +481,7 @@ func (dct *describeCollectionTask) Execute(ctx context.Context) error {
 		dct.result.ShardsNum = result.ShardsNum
 		dct.result.ConsistencyLevel = result.ConsistencyLevel
 		dct.result.Aliases = result.Aliases
+		dct.result.Properties = result.Properties
 		for _, field := range result.Schema.Fields {
 			if field.FieldID >= common.StartOfUserFieldID {
 				dct.result.Schema.Fields = append(dct.result.Schema.Fields, &schemapb.FieldSchema{
@@ -732,6 +666,68 @@ func (sct *showCollectionsTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
+type alterCollectionTask struct {
+	Condition
+	*milvuspb.AlterCollectionRequest
+	ctx       context.Context
+	rootCoord types.RootCoord
+	result    *commonpb.Status
+}
+
+func (act *alterCollectionTask) TraceCtx() context.Context {
+	return act.ctx
+}
+
+func (act *alterCollectionTask) ID() UniqueID {
+	return act.Base.MsgID
+}
+
+func (act *alterCollectionTask) SetID(uid UniqueID) {
+	act.Base.MsgID = uid
+}
+
+func (act *alterCollectionTask) Name() string {
+	return AlterCollectionTaskName
+}
+
+func (act *alterCollectionTask) Type() commonpb.MsgType {
+	return act.Base.MsgType
+}
+
+func (act *alterCollectionTask) BeginTs() Timestamp {
+	return act.Base.Timestamp
+}
+
+func (act *alterCollectionTask) EndTs() Timestamp {
+	return act.Base.Timestamp
+}
+
+func (act *alterCollectionTask) SetTs(ts Timestamp) {
+	act.Base.Timestamp = ts
+}
+
+func (act *alterCollectionTask) OnEnqueue() error {
+	act.Base = &commonpb.MsgBase{}
+	return nil
+}
+
+func (act *alterCollectionTask) PreExecute(ctx context.Context) error {
+	act.Base.MsgType = commonpb.MsgType_AlterCollection
+	act.Base.SourceID = Params.ProxyCfg.GetNodeID()
+
+	return nil
+}
+
+func (act *alterCollectionTask) Execute(ctx context.Context) error {
+	var err error
+	act.result, err = act.rootCoord.AlterCollection(ctx, act.AlterCollectionRequest)
+	return err
+}
+
+func (act *alterCollectionTask) PostExecute(ctx context.Context) error {
+	return nil
+}
+
 type createPartitionTask struct {
 	Condition
 	*milvuspb.CreatePartitionRequest
@@ -796,8 +792,8 @@ func (cpt *createPartitionTask) PreExecute(ctx context.Context) error {
 
 func (cpt *createPartitionTask) Execute(ctx context.Context) (err error) {
 	cpt.result, err = cpt.rootCoord.CreatePartition(ctx, cpt.CreatePartitionRequest)
-	if cpt.result == nil {
-		return errors.New("get collection statistics resp is nil")
+	if err != nil {
+		return err
 	}
 	if cpt.result.ErrorCode != commonpb.ErrorCode_Success {
 		return errors.New(cpt.result.Reason)
@@ -873,8 +869,8 @@ func (dpt *dropPartitionTask) PreExecute(ctx context.Context) error {
 
 func (dpt *dropPartitionTask) Execute(ctx context.Context) (err error) {
 	dpt.result, err = dpt.rootCoord.DropPartition(ctx, dpt.DropPartitionRequest)
-	if dpt.result == nil {
-		return errors.New("get collection statistics resp is nil")
+	if err != nil {
+		return err
 	}
 	if dpt.result.ErrorCode != commonpb.ErrorCode_Success {
 		return errors.New(dpt.result.Reason)
@@ -949,8 +945,8 @@ func (hpt *hasPartitionTask) PreExecute(ctx context.Context) error {
 
 func (hpt *hasPartitionTask) Execute(ctx context.Context) (err error) {
 	hpt.result, err = hpt.rootCoord.HasPartition(ctx, hpt.HasPartitionRequest)
-	if hpt.result == nil {
-		return errors.New("get collection statistics resp is nil")
+	if err != nil {
+		return err
 	}
 	if hpt.result.Status.ErrorCode != commonpb.ErrorCode_Success {
 		return errors.New(hpt.result.Status.Reason)
@@ -1127,689 +1123,6 @@ func (spt *showPartitionsTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
-type createIndexTask struct {
-	Condition
-	*milvuspb.CreateIndexRequest
-	ctx       context.Context
-	rootCoord types.RootCoord
-	result    *commonpb.Status
-
-	collectionID UniqueID
-}
-
-func (cit *createIndexTask) TraceCtx() context.Context {
-	return cit.ctx
-}
-
-func (cit *createIndexTask) ID() UniqueID {
-	return cit.Base.MsgID
-}
-
-func (cit *createIndexTask) SetID(uid UniqueID) {
-	cit.Base.MsgID = uid
-}
-
-func (cit *createIndexTask) Name() string {
-	return CreateIndexTaskName
-}
-
-func (cit *createIndexTask) Type() commonpb.MsgType {
-	return cit.Base.MsgType
-}
-
-func (cit *createIndexTask) BeginTs() Timestamp {
-	return cit.Base.Timestamp
-}
-
-func (cit *createIndexTask) EndTs() Timestamp {
-	return cit.Base.Timestamp
-}
-
-func (cit *createIndexTask) SetTs(ts Timestamp) {
-	cit.Base.Timestamp = ts
-}
-
-func (cit *createIndexTask) OnEnqueue() error {
-	cit.Base = &commonpb.MsgBase{}
-	return nil
-}
-
-func parseIndexParams(m []*commonpb.KeyValuePair) (map[string]string, error) {
-	indexParams := make(map[string]string)
-	for _, kv := range m {
-		if kv.Key == "params" { // TODO(dragondriver): change `params` to const variable
-			params, err := funcutil.ParseIndexParamsMap(kv.Value)
-			if err != nil {
-				return nil, err
-			}
-			for k, v := range params {
-				indexParams[k] = v
-			}
-		} else {
-			indexParams[kv.Key] = kv.Value
-		}
-	}
-	_, exist := indexParams["index_type"] // TODO(dragondriver): change `index_type` to const variable
-	if !exist {
-		indexParams["index_type"] = indexparamcheck.IndexFaissIvfPQ // IVF_PQ is the default index type
-	}
-	return indexParams, nil
-}
-
-func (cit *createIndexTask) getIndexedField(ctx context.Context) (*schemapb.FieldSchema, error) {
-	schema, err := globalMetaCache.GetCollectionSchema(ctx, cit.GetCollectionName())
-	if err != nil {
-		log.Error("failed to get collection schema", zap.Error(err))
-		return nil, fmt.Errorf("failed to get collection schema: %s", err)
-	}
-	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
-	if err != nil {
-		log.Error("failed to parse collection schema", zap.Error(err))
-		return nil, fmt.Errorf("failed to parse collection schema: %s", err)
-	}
-	field, err := schemaHelper.GetFieldFromName(cit.GetFieldName())
-	if err != nil {
-		log.Error("create index on non-exist field", zap.Error(err))
-		return nil, fmt.Errorf("cannot create index on non-exist field: %s", cit.GetFieldName())
-	}
-	return field, nil
-}
-
-func fillDimension(field *schemapb.FieldSchema, indexParams map[string]string) error {
-	vecDataTypes := []schemapb.DataType{
-		schemapb.DataType_FloatVector,
-		schemapb.DataType_BinaryVector,
-	}
-	if !funcutil.SliceContain(vecDataTypes, field.GetDataType()) {
-		return nil
-	}
-	params := make([]*commonpb.KeyValuePair, 0, len(field.GetTypeParams())+len(field.GetIndexParams()))
-	params = append(params, field.GetTypeParams()...)
-	params = append(params, field.GetIndexParams()...)
-	dimensionInSchema, err := funcutil.GetAttrByKeyFromRepeatedKV("dim", params)
-	if err != nil {
-		return fmt.Errorf("dimension not found in schema")
-	}
-	dimension, exist := indexParams["dim"]
-	if exist {
-		if dimensionInSchema != dimension {
-			return fmt.Errorf("dimension mismatch, dimension in schema: %s, dimension: %s", dimensionInSchema, dimension)
-		}
-	} else {
-		indexParams["dim"] = dimensionInSchema
-	}
-	return nil
-}
-
-func checkTrain(field *schemapb.FieldSchema, indexParams map[string]string) error {
-	indexType := indexParams["index_type"]
-
-	// skip params check of non-vector field.
-	vecDataTypes := []schemapb.DataType{
-		schemapb.DataType_FloatVector,
-		schemapb.DataType_BinaryVector,
-	}
-	if !funcutil.SliceContain(vecDataTypes, field.GetDataType()) {
-		return indexparamcheck.CheckIndexValid(field.GetDataType(), indexType, indexParams)
-	}
-
-	adapter, err := indexparamcheck.GetConfAdapterMgrInstance().GetAdapter(indexType)
-	if err != nil {
-		log.Warn("Failed to get conf adapter", zap.String("index_type", indexType))
-		return fmt.Errorf("invalid index type: %s", indexType)
-	}
-
-	if err := fillDimension(field, indexParams); err != nil {
-		return err
-	}
-
-	ok := adapter.CheckTrain(indexParams)
-	if !ok {
-		log.Warn("Create index with invalid params", zap.Any("index_params", indexParams))
-		return fmt.Errorf("invalid index params: %v", indexParams)
-	}
-
-	return nil
-}
-
-func (cit *createIndexTask) PreExecute(ctx context.Context) error {
-	cit.Base.MsgType = commonpb.MsgType_CreateIndex
-	cit.Base.SourceID = Params.ProxyCfg.GetNodeID()
-
-	collName := cit.CollectionName
-
-	collID, err := globalMetaCache.GetCollectionID(ctx, collName)
-	if err != nil {
-		return err
-	}
-	cit.collectionID = collID
-
-	field, err := cit.getIndexedField(ctx)
-	if err != nil {
-		return err
-	}
-
-	// check index param, not accurate, only some static rules
-	indexParams, err := parseIndexParams(cit.GetExtraParams())
-	if err != nil {
-		log.Error("failed to parse index params", zap.Error(err))
-		return fmt.Errorf("failed to parse index params: %s", err)
-	}
-
-	return checkTrain(field, indexParams)
-}
-
-func (cit *createIndexTask) Execute(ctx context.Context) error {
-	var err error
-	cit.result, err = cit.rootCoord.CreateIndex(ctx, cit.CreateIndexRequest)
-	if cit.result == nil {
-		return errors.New("get collection statistics resp is nil")
-	}
-	if cit.result.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(cit.result.Reason)
-	}
-	return err
-}
-
-func (cit *createIndexTask) PostExecute(ctx context.Context) error {
-	return nil
-}
-
-type describeIndexTask struct {
-	Condition
-	*milvuspb.DescribeIndexRequest
-	ctx       context.Context
-	rootCoord types.RootCoord
-	result    *milvuspb.DescribeIndexResponse
-
-	collectionID UniqueID
-}
-
-func (dit *describeIndexTask) TraceCtx() context.Context {
-	return dit.ctx
-}
-
-func (dit *describeIndexTask) ID() UniqueID {
-	return dit.Base.MsgID
-}
-
-func (dit *describeIndexTask) SetID(uid UniqueID) {
-	dit.Base.MsgID = uid
-}
-
-func (dit *describeIndexTask) Name() string {
-	return DescribeIndexTaskName
-}
-
-func (dit *describeIndexTask) Type() commonpb.MsgType {
-	return dit.Base.MsgType
-}
-
-func (dit *describeIndexTask) BeginTs() Timestamp {
-	return dit.Base.Timestamp
-}
-
-func (dit *describeIndexTask) EndTs() Timestamp {
-	return dit.Base.Timestamp
-}
-
-func (dit *describeIndexTask) SetTs(ts Timestamp) {
-	dit.Base.Timestamp = ts
-}
-
-func (dit *describeIndexTask) OnEnqueue() error {
-	dit.Base = &commonpb.MsgBase{}
-	return nil
-}
-
-func (dit *describeIndexTask) PreExecute(ctx context.Context) error {
-	dit.Base.MsgType = commonpb.MsgType_DescribeIndex
-	dit.Base.SourceID = Params.ProxyCfg.GetNodeID()
-
-	if err := validateCollectionName(dit.CollectionName); err != nil {
-		return err
-	}
-
-	collID, _ := globalMetaCache.GetCollectionID(ctx, dit.CollectionName)
-	dit.collectionID = collID
-	return nil
-}
-
-func (dit *describeIndexTask) Execute(ctx context.Context) error {
-	var err error
-	dit.result, err = dit.rootCoord.DescribeIndex(ctx, dit.DescribeIndexRequest)
-	if dit.result == nil {
-		return errors.New("get collection statistics resp is nil")
-	}
-	if dit.result.Status.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(dit.result.Status.Reason)
-	}
-	return err
-}
-
-func (dit *describeIndexTask) PostExecute(ctx context.Context) error {
-	return nil
-}
-
-type dropIndexTask struct {
-	Condition
-	ctx context.Context
-	*milvuspb.DropIndexRequest
-	rootCoord types.RootCoord
-	result    *commonpb.Status
-
-	collectionID UniqueID
-}
-
-func (dit *dropIndexTask) TraceCtx() context.Context {
-	return dit.ctx
-}
-
-func (dit *dropIndexTask) ID() UniqueID {
-	return dit.Base.MsgID
-}
-
-func (dit *dropIndexTask) SetID(uid UniqueID) {
-	dit.Base.MsgID = uid
-}
-
-func (dit *dropIndexTask) Name() string {
-	return DropIndexTaskName
-}
-
-func (dit *dropIndexTask) Type() commonpb.MsgType {
-	return dit.Base.MsgType
-}
-
-func (dit *dropIndexTask) BeginTs() Timestamp {
-	return dit.Base.Timestamp
-}
-
-func (dit *dropIndexTask) EndTs() Timestamp {
-	return dit.Base.Timestamp
-}
-
-func (dit *dropIndexTask) SetTs(ts Timestamp) {
-	dit.Base.Timestamp = ts
-}
-
-func (dit *dropIndexTask) OnEnqueue() error {
-	dit.Base = &commonpb.MsgBase{}
-	return nil
-}
-
-func (dit *dropIndexTask) PreExecute(ctx context.Context) error {
-	dit.Base.MsgType = commonpb.MsgType_DropIndex
-	dit.Base.SourceID = Params.ProxyCfg.GetNodeID()
-
-	collName, fieldName := dit.CollectionName, dit.FieldName
-
-	if err := validateCollectionName(collName); err != nil {
-		return err
-	}
-
-	if err := validateFieldName(fieldName); err != nil {
-		return err
-	}
-
-	if dit.IndexName == "" {
-		dit.IndexName = Params.CommonCfg.DefaultIndexName
-	}
-
-	collID, _ := globalMetaCache.GetCollectionID(ctx, dit.CollectionName)
-	dit.collectionID = collID
-
-	return nil
-}
-
-func (dit *dropIndexTask) Execute(ctx context.Context) error {
-	var err error
-	dit.result, err = dit.rootCoord.DropIndex(ctx, dit.DropIndexRequest)
-	if dit.result == nil {
-		return errors.New("drop index resp is nil")
-	}
-	if dit.result.ErrorCode != commonpb.ErrorCode_Success {
-		return errors.New(dit.result.Reason)
-	}
-	return err
-}
-
-func (dit *dropIndexTask) PostExecute(ctx context.Context) error {
-	return nil
-}
-
-type getIndexBuildProgressTask struct {
-	Condition
-	*milvuspb.GetIndexBuildProgressRequest
-	ctx        context.Context
-	indexCoord types.IndexCoord
-	rootCoord  types.RootCoord
-	dataCoord  types.DataCoord
-	result     *milvuspb.GetIndexBuildProgressResponse
-
-	collectionID UniqueID
-}
-
-func (gibpt *getIndexBuildProgressTask) TraceCtx() context.Context {
-	return gibpt.ctx
-}
-
-func (gibpt *getIndexBuildProgressTask) ID() UniqueID {
-	return gibpt.Base.MsgID
-}
-
-func (gibpt *getIndexBuildProgressTask) SetID(uid UniqueID) {
-	gibpt.Base.MsgID = uid
-}
-
-func (gibpt *getIndexBuildProgressTask) Name() string {
-	return GetIndexBuildProgressTaskName
-}
-
-func (gibpt *getIndexBuildProgressTask) Type() commonpb.MsgType {
-	return gibpt.Base.MsgType
-}
-
-func (gibpt *getIndexBuildProgressTask) BeginTs() Timestamp {
-	return gibpt.Base.Timestamp
-}
-
-func (gibpt *getIndexBuildProgressTask) EndTs() Timestamp {
-	return gibpt.Base.Timestamp
-}
-
-func (gibpt *getIndexBuildProgressTask) SetTs(ts Timestamp) {
-	gibpt.Base.Timestamp = ts
-}
-
-func (gibpt *getIndexBuildProgressTask) OnEnqueue() error {
-	gibpt.Base = &commonpb.MsgBase{}
-	return nil
-}
-
-func (gibpt *getIndexBuildProgressTask) PreExecute(ctx context.Context) error {
-	gibpt.Base.MsgType = commonpb.MsgType_GetIndexBuildProgress
-	gibpt.Base.SourceID = Params.ProxyCfg.GetNodeID()
-
-	if err := validateCollectionName(gibpt.CollectionName); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (gibpt *getIndexBuildProgressTask) Execute(ctx context.Context) error {
-	collectionName := gibpt.CollectionName
-	collectionID, err := globalMetaCache.GetCollectionID(ctx, collectionName)
-	if err != nil { // err is not nil if collection not exists
-		return err
-	}
-	gibpt.collectionID = collectionID
-
-	showPartitionRequest := &milvuspb.ShowPartitionsRequest{
-		Base: &commonpb.MsgBase{
-			MsgType:   commonpb.MsgType_ShowPartitions,
-			MsgID:     gibpt.Base.MsgID,
-			Timestamp: gibpt.Base.Timestamp,
-			SourceID:  Params.ProxyCfg.GetNodeID(),
-		},
-		DbName:         gibpt.DbName,
-		CollectionName: collectionName,
-		CollectionID:   collectionID,
-	}
-	partitions, err := gibpt.rootCoord.ShowPartitions(ctx, showPartitionRequest)
-	if err != nil {
-		return err
-	}
-
-	if gibpt.IndexName == "" {
-		gibpt.IndexName = Params.CommonCfg.DefaultIndexName
-	}
-
-	describeIndexReq := &milvuspb.DescribeIndexRequest{
-		Base: &commonpb.MsgBase{
-			MsgType:   commonpb.MsgType_DescribeIndex,
-			MsgID:     gibpt.Base.MsgID,
-			Timestamp: gibpt.Base.Timestamp,
-			SourceID:  Params.ProxyCfg.GetNodeID(),
-		},
-		DbName:         gibpt.DbName,
-		CollectionName: gibpt.CollectionName,
-		//		IndexName:      gibpt.IndexName,
-	}
-
-	indexDescriptionResp, err2 := gibpt.rootCoord.DescribeIndex(ctx, describeIndexReq)
-	if err2 != nil {
-		return err2
-	}
-
-	matchIndexID := int64(-1)
-	foundIndexID := false
-	for _, desc := range indexDescriptionResp.IndexDescriptions {
-		if desc.IndexName == gibpt.IndexName {
-			matchIndexID = desc.IndexID
-			foundIndexID = true
-			break
-		}
-	}
-	if !foundIndexID {
-		return fmt.Errorf("no index is created")
-	}
-
-	var allSegmentIDs []UniqueID
-	for _, partitionID := range partitions.PartitionIDs {
-		showSegmentsRequest := &milvuspb.ShowSegmentsRequest{
-			Base: &commonpb.MsgBase{
-				MsgType:   commonpb.MsgType_ShowSegments,
-				MsgID:     gibpt.Base.MsgID,
-				Timestamp: gibpt.Base.Timestamp,
-				SourceID:  Params.ProxyCfg.GetNodeID(),
-			},
-			CollectionID: collectionID,
-			PartitionID:  partitionID,
-		}
-		segments, err := gibpt.rootCoord.ShowSegments(ctx, showSegmentsRequest)
-		if err != nil {
-			return err
-		}
-		if segments.Status.ErrorCode != commonpb.ErrorCode_Success {
-			return errors.New(segments.Status.Reason)
-		}
-		allSegmentIDs = append(allSegmentIDs, segments.SegmentIDs...)
-	}
-
-	getIndexStatesRequest := &indexpb.GetIndexStatesRequest{
-		IndexBuildIDs: make([]UniqueID, 0),
-	}
-
-	buildIndexMap := make(map[int64]int64)
-	for _, segmentID := range allSegmentIDs {
-		describeSegmentRequest := &milvuspb.DescribeSegmentRequest{
-			Base: &commonpb.MsgBase{
-				MsgType:   commonpb.MsgType_DescribeSegment,
-				MsgID:     gibpt.Base.MsgID,
-				Timestamp: gibpt.Base.Timestamp,
-				SourceID:  Params.ProxyCfg.GetNodeID(),
-			},
-			CollectionID: collectionID,
-			SegmentID:    segmentID,
-		}
-		segmentDesc, err := gibpt.rootCoord.DescribeSegment(ctx, describeSegmentRequest)
-		if err != nil {
-			return err
-		}
-		if segmentDesc.IndexID == matchIndexID {
-			if segmentDesc.EnableIndex {
-				getIndexStatesRequest.IndexBuildIDs = append(getIndexStatesRequest.IndexBuildIDs, segmentDesc.BuildID)
-				buildIndexMap[segmentID] = segmentDesc.BuildID
-			}
-		}
-	}
-
-	states, err := gibpt.indexCoord.GetIndexStates(ctx, getIndexStatesRequest)
-	if err != nil {
-		return err
-	}
-
-	if states.Status.ErrorCode != commonpb.ErrorCode_Success {
-		gibpt.result = &milvuspb.GetIndexBuildProgressResponse{
-			Status: states.Status,
-		}
-	}
-
-	buildFinishMap := make(map[int64]bool)
-	for _, state := range states.States {
-		if state.State == commonpb.IndexState_Finished {
-			buildFinishMap[state.IndexBuildID] = true
-		}
-	}
-
-	infoResp, err := gibpt.dataCoord.GetSegmentInfo(ctx, &datapb.GetSegmentInfoRequest{
-		Base: &commonpb.MsgBase{
-			MsgType:   commonpb.MsgType_SegmentInfo,
-			MsgID:     0,
-			Timestamp: 0,
-			SourceID:  Params.ProxyCfg.GetNodeID(),
-		},
-		SegmentIDs: allSegmentIDs,
-	})
-	if err != nil {
-		return err
-	}
-
-	total := int64(0)
-	indexed := int64(0)
-
-	for _, info := range infoResp.Infos {
-		total += info.NumOfRows
-		if buildFinishMap[buildIndexMap[info.ID]] {
-			indexed += info.NumOfRows
-		}
-	}
-
-	gibpt.result = &milvuspb.GetIndexBuildProgressResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		TotalRows:   total,
-		IndexedRows: indexed,
-	}
-
-	return nil
-}
-
-func (gibpt *getIndexBuildProgressTask) PostExecute(ctx context.Context) error {
-	return nil
-}
-
-type getIndexStateTask struct {
-	Condition
-	*milvuspb.GetIndexStateRequest
-	ctx        context.Context
-	indexCoord types.IndexCoord
-	rootCoord  types.RootCoord
-	result     *milvuspb.GetIndexStateResponse
-
-	collectionID UniqueID
-}
-
-func (gist *getIndexStateTask) TraceCtx() context.Context {
-	return gist.ctx
-}
-
-func (gist *getIndexStateTask) ID() UniqueID {
-	return gist.Base.MsgID
-}
-
-func (gist *getIndexStateTask) SetID(uid UniqueID) {
-	gist.Base.MsgID = uid
-}
-
-func (gist *getIndexStateTask) Name() string {
-	return GetIndexStateTaskName
-}
-
-func (gist *getIndexStateTask) Type() commonpb.MsgType {
-	return gist.Base.MsgType
-}
-
-func (gist *getIndexStateTask) BeginTs() Timestamp {
-	return gist.Base.Timestamp
-}
-
-func (gist *getIndexStateTask) EndTs() Timestamp {
-	return gist.Base.Timestamp
-}
-
-func (gist *getIndexStateTask) SetTs(ts Timestamp) {
-	gist.Base.Timestamp = ts
-}
-
-func (gist *getIndexStateTask) OnEnqueue() error {
-	gist.Base = &commonpb.MsgBase{}
-	return nil
-}
-
-func (gist *getIndexStateTask) PreExecute(ctx context.Context) error {
-	gist.Base.MsgType = commonpb.MsgType_GetIndexState
-	gist.Base.SourceID = Params.ProxyCfg.GetNodeID()
-
-	if err := validateCollectionName(gist.CollectionName); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (gist *getIndexStateTask) Execute(ctx context.Context) error {
-
-	if gist.IndexName == "" {
-		gist.IndexName = Params.CommonCfg.DefaultIndexName
-	}
-	states, err := gist.rootCoord.GetIndexState(ctx, gist.GetIndexStateRequest)
-	if err != nil {
-		return err
-	}
-
-	gist.result = &milvuspb.GetIndexStateResponse{
-		Status: &commonpb.Status{
-			ErrorCode: commonpb.ErrorCode_Success,
-			Reason:    "",
-		},
-		State:      commonpb.IndexState_Finished,
-		FailReason: "",
-	}
-
-	if states.Status.ErrorCode != commonpb.ErrorCode_Success {
-		gist.result = &milvuspb.GetIndexStateResponse{
-			Status: states.Status,
-			State:  commonpb.IndexState_Failed,
-		}
-		return nil
-	}
-
-	for _, state := range states.States {
-		if state.State == commonpb.IndexState_IndexStateNone {
-			continue
-		}
-		if state.State != commonpb.IndexState_Finished {
-			gist.result = &milvuspb.GetIndexStateResponse{
-				Status:     states.Status,
-				State:      state.State,
-				FailReason: state.Reason,
-			}
-			return nil
-		}
-	}
-
-	return nil
-}
-
-func (gist *getIndexStateTask) PostExecute(ctx context.Context) error {
-	return nil
-}
-
 type flushTask struct {
 	Condition
 	*milvuspb.FlushRequest
@@ -1863,6 +1176,8 @@ func (ft *flushTask) PreExecute(ctx context.Context) error {
 
 func (ft *flushTask) Execute(ctx context.Context) error {
 	coll2Segments := make(map[string]*schemapb.LongArray)
+	flushColl2Segments := make(map[string]*schemapb.LongArray)
+	coll2SealTimes := make(map[string]int64)
 	for _, collName := range ft.CollectionNames {
 		collID, err := globalMetaCache.GetCollectionID(ctx, collName)
 		if err != nil {
@@ -1886,14 +1201,18 @@ func (ft *flushTask) Execute(ctx context.Context) error {
 			return errors.New(resp.Status.Reason)
 		}
 		coll2Segments[collName] = &schemapb.LongArray{Data: resp.GetSegmentIDs()}
+		flushColl2Segments[collName] = &schemapb.LongArray{Data: resp.GetFlushSegmentIDs()}
+		coll2SealTimes[collName] = resp.GetTimeOfSeal()
 	}
 	ft.result = &milvuspb.FlushResponse{
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_Success,
 			Reason:    "",
 		},
-		DbName:     "",
-		CollSegIDs: coll2Segments,
+		DbName:          "",
+		CollSegIDs:      coll2Segments,
+		FlushCollSegIDs: flushColl2Segments,
+		CollSealTimes:   coll2SealTimes,
 	}
 	return nil
 }

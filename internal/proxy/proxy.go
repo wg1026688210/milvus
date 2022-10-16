@@ -19,6 +19,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"os"
 	"strconv"
@@ -30,16 +31,17 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/metrics"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
+	"github.com/milvus-io/milvus/internal/util/ratelimitutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
@@ -59,6 +61,9 @@ var _ types.Proxy = (*Proxy)(nil)
 
 var Params paramtable.ComponentParam
 
+// rateCol is global rateCollector in Proxy.
+var rateCol *ratelimitutil.RateCollector
+
 // Proxy of milvus
 type Proxy struct {
 	ctx    context.Context
@@ -77,15 +82,17 @@ type Proxy struct {
 	dataCoord  types.DataCoord
 	queryCoord types.QueryCoord
 
+	multiRateLimiter *MultiRateLimiter
+
 	chMgr channelsMgr
 
 	sched *taskScheduler
 
 	chTicker channelsTimeTicker
 
-	idAllocator  *allocator.IDAllocator
-	tsoAllocator *timestampAllocator
-	segAssigner  *segIDAssigner
+	rowIDAllocator *allocator.IDAllocator
+	tsoAllocator   *timestampAllocator
+	segAssigner    *segIDAssigner
 
 	metricsCacheManager *metricsinfo.MetricsCacheManager
 
@@ -107,16 +114,16 @@ func NewProxy(ctx context.Context, factory dependency.Factory) (*Proxy, error) {
 	ctx1, cancel := context.WithCancel(ctx)
 	n := 1024 // better to be configurable
 	node := &Proxy{
-		ctx:            ctx1,
-		cancel:         cancel,
-		factory:        factory,
-		searchResultCh: make(chan *internalpb.SearchResults, n),
-		shardMgr:       newShardClientMgr(),
+		ctx:              ctx1,
+		cancel:           cancel,
+		factory:          factory,
+		searchResultCh:   make(chan *internalpb.SearchResults, n),
+		shardMgr:         newShardClientMgr(),
+		multiRateLimiter: NewMultiRateLimiter(),
 	}
-	node.UpdateStateCode(internalpb.StateCode_Abnormal)
+	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 	logutil.Logger(ctx).Debug("create a new Proxy instance", zap.Any("state", node.stateCode.Load()))
 	return node, nil
-
 }
 
 // Register registers proxy at etcd
@@ -150,6 +157,22 @@ func (node *Proxy) initSession() error {
 	return nil
 }
 
+// initRateCollector creates and starts rateCollector in Proxy.
+func (node *Proxy) initRateCollector() error {
+	var err error
+	rateCol, err = ratelimitutil.NewRateCollector(ratelimitutil.DefaultWindow, ratelimitutil.DefaultGranularity)
+	if err != nil {
+		return err
+	}
+	rateCol.Register(internalpb.RateType_DMLInsert.String())
+	rateCol.Register(internalpb.RateType_DMLDelete.String())
+	// TODO: add bulkLoad rate
+	rateCol.Register(internalpb.RateType_DQLSearch.String())
+	rateCol.Register(internalpb.RateType_DQLQuery.String())
+	rateCol.Register(metricsinfo.ReadResultThroughput)
+	return nil
+}
+
 // Init initialize proxy.
 func (node *Proxy) Init() error {
 	log.Info("init session for Proxy")
@@ -162,6 +185,12 @@ func (node *Proxy) Init() error {
 	node.factory.Init(&Params)
 	log.Debug("init parameters for factory", zap.String("role", typeutil.ProxyRole), zap.Any("parameters", Params.ServiceParam))
 
+	err := node.initRateCollector()
+	if err != nil {
+		return err
+	}
+	log.Info("Proxy init rateCollector done", zap.Int64("nodeID", Params.ProxyCfg.GetNodeID()))
+
 	log.Debug("create id allocator", zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", Params.ProxyCfg.GetNodeID()))
 	idAllocator, err := allocator.NewIDAllocator(node.ctx, node.rootCoord, Params.ProxyCfg.GetNodeID())
 	if err != nil {
@@ -170,7 +199,7 @@ func (node *Proxy) Init() error {
 			zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", Params.ProxyCfg.GetNodeID()))
 		return err
 	}
-	node.idAllocator = idAllocator
+	node.rowIDAllocator = idAllocator
 	log.Debug("create id allocator done", zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", Params.ProxyCfg.GetNodeID()))
 
 	log.Debug("create timestamp allocator", zap.String("role", typeutil.ProxyRole), zap.Int64("ProxyID", Params.ProxyCfg.GetNodeID()))
@@ -203,7 +232,7 @@ func (node *Proxy) Init() error {
 	log.Debug("create channels manager done", zap.String("role", typeutil.ProxyRole))
 
 	log.Debug("create task scheduler", zap.String("role", typeutil.ProxyRole))
-	node.sched, err = newTaskScheduler(node.ctx, node.idAllocator, node.tsoAllocator, node.factory)
+	node.sched, err = newTaskScheduler(node.ctx, node.tsoAllocator, node.factory)
 	if err != nil {
 		log.Warn("failed to create task scheduler", zap.Error(err), zap.String("role", typeutil.ProxyRole))
 		return err
@@ -221,7 +250,7 @@ func (node *Proxy) Init() error {
 	log.Debug("create metrics cache manager done", zap.String("role", typeutil.ProxyRole))
 
 	log.Debug("init meta cache", zap.String("role", typeutil.ProxyRole))
-	if err := InitMetaCache(node.rootCoord, node.queryCoord, node.shardMgr); err != nil {
+	if err := InitMetaCache(node.ctx, node.rootCoord, node.queryCoord, node.shardMgr); err != nil {
 		log.Warn("failed to init meta cache", zap.Error(err), zap.String("role", typeutil.ProxyRole))
 		return err
 	}
@@ -308,7 +337,7 @@ func (node *Proxy) Start() error {
 	log.Debug("start task scheduler done", zap.String("role", typeutil.ProxyRole))
 
 	log.Debug("start id allocator", zap.String("role", typeutil.ProxyRole))
-	if err := node.idAllocator.Start(); err != nil {
+	if err := node.rowIDAllocator.Start(); err != nil {
 		log.Warn("failed to start id allocator", zap.Error(err), zap.String("role", typeutil.ProxyRole))
 		return err
 	}
@@ -339,8 +368,8 @@ func (node *Proxy) Start() error {
 	Params.ProxyCfg.CreatedTime = now
 	Params.ProxyCfg.UpdatedTime = now
 
-	log.Debug("update state code", zap.String("role", typeutil.ProxyRole), zap.String("State", internalpb.StateCode_Healthy.String()))
-	node.UpdateStateCode(internalpb.StateCode_Healthy)
+	log.Debug("update state code", zap.String("role", typeutil.ProxyRole), zap.String("State", commonpb.StateCode_Healthy.String()))
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
 
 	return nil
 }
@@ -349,8 +378,8 @@ func (node *Proxy) Start() error {
 func (node *Proxy) Stop() error {
 	node.cancel()
 
-	if node.idAllocator != nil {
-		node.idAllocator.Close()
+	if node.rowIDAllocator != nil {
+		node.rowIDAllocator.Close()
 		log.Info("close id allocator", zap.String("role", typeutil.ProxyRole))
 	}
 
@@ -384,8 +413,12 @@ func (node *Proxy) Stop() error {
 		node.shardMgr.Close()
 	}
 
+	if node.chMgr != nil {
+		_ = node.chMgr.removeAllDMLStream()
+	}
+
 	// https://github.com/milvus-io/milvus/issues/12282
-	node.UpdateStateCode(internalpb.StateCode_Abnormal)
+	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 
 	return nil
 }
@@ -428,4 +461,12 @@ func (node *Proxy) SetDataCoordClient(cli types.DataCoord) {
 // SetQueryCoordClient sets QueryCoord client for proxy.
 func (node *Proxy) SetQueryCoordClient(cli types.QueryCoord) {
 	node.queryCoord = cli
+}
+
+// GetRateLimiter returns the rateLimiter in Proxy.
+func (node *Proxy) GetRateLimiter() (types.Limiter, error) {
+	if node.multiRateLimiter == nil {
+		return nil, fmt.Errorf("nil rate limiter in Proxy")
+	}
+	return node.multiRateLimiter, nil
 }

@@ -17,6 +17,8 @@
 package flowgraph
 
 import (
+	"sync"
+
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
 	"github.com/milvus-io/milvus/internal/util/trace"
@@ -28,8 +30,9 @@ import (
 // InputNode is the entry point of flowgragh
 type InputNode struct {
 	BaseNode
-	inStream msgstream.MsgStream
-	name     string
+	inStream  msgstream.MsgStream
+	name      string
+	closeOnce sync.Once
 }
 
 // IsInputNode returns whether Node is InputNode
@@ -44,10 +47,9 @@ func (inNode *InputNode) Start() {
 
 // Close implements node
 func (inNode *InputNode) Close() {
-	inNode.inStream.Close()
-	log.Debug("message stream closed",
-		zap.String("node name", inNode.name),
-	)
+	inNode.closeOnce.Do(func() {
+		inNode.inStream.Close()
+	})
 }
 
 // Name returns node name
@@ -65,12 +67,14 @@ func (inNode *InputNode) Operate(in []Msg) []Msg {
 	msgPack, ok := <-inNode.inStream.Chan()
 	if !ok {
 		log.Warn("MsgStream closed", zap.Any("input node", inNode.Name()))
-		return []Msg{}
+		return []Msg{&MsgStreamMsg{
+			isCloseMsg: true,
+		}}
 	}
 
 	// TODO: add status
 	if msgPack == nil {
-		return nil
+		return []Msg{}
 	}
 	var spans []opentracing.Span
 	for _, msg := range msgPack.Msgs {
@@ -92,6 +96,7 @@ func (inNode *InputNode) Operate(in []Msg) []Msg {
 		span.Finish()
 	}
 
+	// TODO batch operate msg
 	return []Msg{msgStreamMsg}
 }
 

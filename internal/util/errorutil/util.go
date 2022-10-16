@@ -1,8 +1,11 @@
 package errorutil
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/milvus-io/milvus/api/commonpb"
 )
 
 // ErrorList for print error log
@@ -24,4 +27,19 @@ func (el ErrorList) Error() string {
 		builder.WriteString(fmt.Sprintf("attempt #%d:%s\n", index+1, err.Error()))
 	}
 	return builder.String()
+}
+
+func UnhealthyStatus(code commonpb.StateCode) *commonpb.Status {
+	return &commonpb.Status{
+		ErrorCode: commonpb.ErrorCode_UnexpectedError,
+		Reason:    "proxy not healthy, StateCode=" + commonpb.StateCode_name[int32(code)],
+	}
+}
+
+func UnhealthyError() error {
+	return errors.New("unhealthy node")
+}
+
+func PermissionDenyError() error {
+	return errors.New("permission deny")
 }

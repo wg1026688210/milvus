@@ -12,8 +12,14 @@ import "schema.proto";
 // TODO: import google/protobuf/empty.proto
 message Empty {}
 
+enum SegmentType {
+  New = 0;
+  Normal = 1;
+  Flushed = 2;
+}
+
 service DataCoord {
-  rpc GetComponentStates(internal.GetComponentStatesRequest) returns (internal.ComponentStates) {}
+  rpc GetComponentStates(milvus.GetComponentStatesRequest) returns (milvus.ComponentStates) {}
   rpc GetTimeTickChannel(internal.GetTimeTickChannelRequest) returns(milvus.StringResponse) {}
   rpc GetStatisticsChannel(internal.GetStatisticsChannelRequest) returns(milvus.StringResponse){}
 
@@ -33,10 +39,11 @@ service DataCoord {
   rpc SaveBinlogPaths(SaveBinlogPathsRequest) returns (common.Status){}
   rpc GetRecoveryInfo(GetRecoveryInfoRequest) returns (GetRecoveryInfoResponse){}
   rpc GetFlushedSegments(GetFlushedSegmentsRequest) returns(GetFlushedSegmentsResponse){}
+  rpc GetSegmentsByStates(GetSegmentsByStatesRequest) returns(GetSegmentsByStatesResponse){}
 
+  rpc ShowConfigurations(internal.ShowConfigurationsRequest) returns (internal.ShowConfigurationsResponse){}
   // https://wiki.lfaidata.foundation/display/MIL/MEP+8+--+Add+metrics+for+proxy
   rpc GetMetrics(milvus.GetMetricsRequest) returns (milvus.GetMetricsResponse) {}
-  rpc CompleteCompaction(CompactionResult) returns (common.Status) {}
   rpc ManualCompaction(milvus.ManualCompactionRequest) returns (milvus.ManualCompactionResponse) {}
   rpc GetCompactionState(milvus.GetCompactionStateRequest) returns (milvus.GetCompactionStateResponse) {}
   rpc GetCompactionStateWithPlans(milvus.GetCompactionPlansRequest) returns (milvus.GetCompactionPlansResponse) {}
@@ -53,26 +60,34 @@ service DataCoord {
   rpc AcquireSegmentLock(AcquireSegmentLockRequest) returns (common.Status) {}
   rpc ReleaseSegmentLock(ReleaseSegmentLockRequest) returns (common.Status) {}
 
-  rpc AddSegment(AddSegmentRequest) returns(common.Status) {}
+  rpc SaveImportSegment(SaveImportSegmentRequest) returns(common.Status) {}
+  rpc UnsetIsImportingState(UnsetIsImportingStateRequest) returns(common.Status) {}
+  rpc MarkSegmentsDropped(MarkSegmentsDroppedRequest) returns(common.Status) {}
+
+  rpc BroadcastAlteredCollection(milvus.AlterCollectionRequest) returns (common.Status) {}
 }
 
 service DataNode {
-  rpc GetComponentStates(internal.GetComponentStatesRequest) returns (internal.ComponentStates) {}
-  rpc GetStatisticsChannel(internal.GetStatisticsChannelRequest) returns(milvus.StringResponse){}
+  rpc GetComponentStates(milvus.GetComponentStatesRequest) returns (milvus.ComponentStates) {}
+  rpc GetStatisticsChannel(internal.GetStatisticsChannelRequest) returns (milvus.StringResponse) {}
 
   rpc WatchDmChannels(WatchDmChannelsRequest) returns (common.Status) {}
   rpc FlushSegments(FlushSegmentsRequest) returns(common.Status) {}
 
+  rpc ShowConfigurations(internal.ShowConfigurationsRequest) returns (internal.ShowConfigurationsResponse){}
   // https://wiki.lfaidata.foundation/display/MIL/MEP+8+--+Add+metrics+for+proxy
   rpc GetMetrics(milvus.GetMetricsRequest) returns (milvus.GetMetricsResponse) {}
+
   rpc Compaction(CompactionPlan) returns (common.Status) {}
+  rpc GetCompactionState(CompactionStateRequest) returns (CompactionStateResponse) {}
+  rpc SyncSegments(SyncSegmentsRequest) returns (common.Status) {}
 
   // https://wiki.lfaidata.foundation/display/MIL/MEP+24+--+Support+bulk+load
   rpc Import(ImportTaskRequest) returns(common.Status) {}
 
   rpc ResendSegmentStats(ResendSegmentStatsRequest) returns(ResendSegmentStatsResponse) {}
 
-  rpc AddSegment(AddSegmentRequest) returns(common.Status) {}
+  rpc AddImportSegment(AddImportSegmentRequest) returns(AddImportSegmentResponse) {}
 }
 
 message FlushRequest {
@@ -86,7 +101,9 @@ message FlushResponse {
   common.Status status = 1;
   int64 dbID = 2;
   int64 collectionID = 3;
-  repeated int64 segmentIDs = 4;
+  repeated int64 segmentIDs = 4; // newly sealed segments
+  repeated int64 flushSegmentIDs = 5; // old flushed segment
+  int64 timeOfSeal = 6;
 }
 
 message SegmentIDRequest {
@@ -229,13 +246,6 @@ message SegmentMsg{
   SegmentInfo segment = 2;
 }
 
-message CollectionInfo {
-  int64 ID = 1;
-  schema.CollectionSchema schema = 2;
-  repeated int64 partitions = 3;
-  repeated common.KeyDataPair start_positions = 4;
-}
-
 message SegmentInfo {
   int64 ID = 1;
   int64 collectionID = 2;
@@ -252,10 +262,13 @@ message SegmentInfo {
   repeated FieldBinlog statslogs = 12;
   // deltalogs consists of delete binlogs. FieldID is not used yet since delete is always applied on primary key
   repeated FieldBinlog deltalogs = 13;
-  
   bool createdByCompaction = 14;
   repeated int64 compactionFrom = 15;
   uint64 dropped_at = 16; // timestamp when segment marked drop
+  // A flag indicating if:
+  // (1) this segment is created by bulk load, and
+  // (2) the bulk load task that creates this segment has not yet reached `ImportCompleted` state.
+  bool is_importing = 17;
 }
 
 message SegmentStartPosition {
@@ -288,7 +301,7 @@ message DeltaLogInfo {
   uint64 timestamp_from = 2;
   uint64 timestamp_to = 3;
   string delta_log_path = 4;
-  int64 delta_log_size = 5; 
+  int64 delta_log_size = 5;
 }
 
 message DataNodeTtMsg {
@@ -344,8 +357,10 @@ message Binlog {
   int64 entries_num = 1;
   uint64 timestamp_from = 2;
   uint64 timestamp_to = 3;
+  // deprecated
   string log_path = 4;
-  int64 log_size = 5; 
+  int64 log_size = 5;
+  int64 logID = 6;
 }
 
 message GetRecoveryInfoResponse {
@@ -358,6 +373,18 @@ message GetRecoveryInfoRequest {
   common.MsgBase base = 1;
   int64 collectionID = 2;
   int64 partitionID = 3;
+}
+
+message GetSegmentsByStatesRequest {
+  common.MsgBase base = 1;
+  int64 collectionID = 2;
+  int64 partitionID = 3;
+  repeated common.SegmentState states = 4;
+}
+
+message GetSegmentsByStatesResponse {
+  common.Status status = 1;
+  repeated int64 segments = 2;
 }
 
 message GetFlushedSegmentsRequest {
@@ -383,13 +410,27 @@ message ChannelWatchInfo {
     // the timeout ts, datanode shall do nothing after it
     // if the timeout is not set(= 0), original infinite retry logic shall be applied
     int64 timeoutTs = 4;
+    // the schema of the collection to watch, to avoid get schema rpc issues.
+    schema.CollectionSchema schema = 5;
 }
 
 enum CompactionType {
   UndefinedCompaction = 0;
-  InnerCompaction = 1;
+  reserved 1;
   MergeCompaction = 2;
   MixCompaction = 3;
+}
+
+message CompactionStateRequest {
+  common.MsgBase base = 1;
+}
+
+message SyncSegmentsRequest {
+  int64 planID = 1;
+  int64 compacted_to = 2;
+  int64 num_of_rows = 3;
+  repeated int64 compacted_from = 4;
+  repeated FieldBinlog stats_logs = 5;
 }
 
 message CompactionSegmentBinlogs {
@@ -408,6 +449,7 @@ message CompactionPlan {
   CompactionType type = 5;
   uint64 timetravel = 6;
   string channel = 7;
+  int64 collection_ttl = 8;
 }
 
 message CompactionResult {
@@ -419,6 +461,17 @@ message CompactionResult {
   repeated FieldBinlog deltalogs = 6;
 }
 
+message CompactionStateResult {
+  int64 planID = 1;
+  common.CompactionState state = 2;
+  CompactionResult result = 3;
+}
+
+message CompactionStateResponse {
+  common.Status status = 1;
+  repeated CompactionStateResult results = 2;
+}
+
 // Deprecated
 message SegmentFieldBinlogMeta {
   int64  fieldID = 1;
@@ -428,6 +481,8 @@ message SegmentFieldBinlogMeta {
 message WatchChannelsRequest {
   int64 collectionID = 1;
   repeated string channelNames = 2;
+  repeated common.KeyDataPair start_positions = 3;
+  schema.CollectionSchema schema = 4; 
 }
 
 message WatchChannelsResponse {
@@ -445,8 +500,8 @@ message SetSegmentStateResponse {
 }
 
 message DropVirtualChannelRequest {
-  common.MsgBase base = 1; 
-  string channel_name = 2; 
+  common.MsgBase base = 1;
+  string channel_name = 2;
   repeated DropVirtualChannelSegment segments = 3;
 }
 
@@ -496,8 +551,8 @@ message ImportTaskInfo {
   repeated string files = 9;                    // A list of files to import.
   int64 create_ts = 10;                         // Timestamp when the import task is created.
   ImportTaskState state = 11;                   // State of the import task.
-  bool data_queryable = 12;                     // A flag indicating whether import data are queryable (i.e. loaded in query nodes)
-  bool data_indexed = 13;                       // A flag indicating whether import data are indexed.
+  string collection_name = 12;                  // Collection name for the import task.
+  string partition_name = 13;                   // Partition name for the import task.
 }
 
 message ImportTaskResponse {
@@ -525,13 +580,40 @@ message ResendSegmentStatsResponse {
   repeated int64 seg_resent = 2;
 }
 
-message AddSegmentRequest {
+message AddImportSegmentRequest {
   common.MsgBase base = 1;
   int64 segment_id = 2;
   string channel_name = 3;
   int64 collection_id = 4;
   int64 partition_id = 5;
   int64 row_num = 6;
+  repeated FieldBinlog stats_log = 7;
+}
+
+message AddImportSegmentResponse {
+  common.Status status = 1;
+  bytes channel_pos = 2;
+}
+
+message SaveImportSegmentRequest {
+  common.MsgBase base = 1;
+  int64 segment_id = 2;
+  string channel_name = 3;
+  int64 collection_id = 4;
+  int64 partition_id = 5;
+  int64 row_num = 6;
+  SaveBinlogPathsRequest save_binlog_path_req = 7;
+  bytes dml_position_id = 8;
+}
+
+message UnsetIsImportingStateRequest {
+  common.MsgBase base = 1;
+  repeated int64 segment_ids = 2;       // IDs of segments whose `isImport` states need to be unset.
+}
+
+message MarkSegmentsDroppedRequest {
+  common.MsgBase base = 1;
+  repeated int64 segment_ids = 2;       // IDs of segments that needs to be marked as `dropped`.
 }
 
 message SegmentReferenceLock {

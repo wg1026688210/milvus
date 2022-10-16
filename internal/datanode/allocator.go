@@ -19,10 +19,10 @@ package datanode
 import (
 	"context"
 	"errors"
-	"path"
-	"strconv"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/internal/util/metautil"
+
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/types"
 )
@@ -98,14 +98,5 @@ func (alloc *allocator) genKey(ids ...UniqueID) (string, error) {
 		return "", err
 	}
 	ids = append(ids, idx)
-	return JoinIDPath(ids...), nil
-}
-
-// JoinIDPath joins ids to path format.
-func JoinIDPath(ids ...UniqueID) string {
-	idStr := make([]string, 0, len(ids))
-	for _, id := range ids {
-		idStr = append(idStr, strconv.FormatInt(id, 10))
-	}
-	return path.Join(idStr...)
+	return metautil.JoinIDPath(ids...), nil
 }

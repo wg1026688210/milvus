@@ -20,14 +20,16 @@ import (
 	"context"
 	"sync"
 
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	grpcindexnodeclient "github.com/milvus-io/milvus/internal/distributed/indexnode/client"
 	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/metrics"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/types"
-	"go.uber.org/zap"
 )
 
 // NodeManager is used by IndexCoord to manage the client of IndexNode.
@@ -51,9 +53,8 @@ func NewNodeManager(ctx context.Context) *NodeManager {
 }
 
 // setClient sets IndexNode client to node manager.
-func (nm *NodeManager) setClient(nodeID UniqueID, client types.IndexNode) error {
+func (nm *NodeManager) setClient(nodeID UniqueID, client types.IndexNode) {
 	log.Debug("IndexCoord NodeManager setClient", zap.Int64("nodeID", nodeID))
-	defer log.Debug("IndexNode NodeManager setClient success", zap.Any("nodeID", nodeID))
 	item := &PQItem{
 		key:      nodeID,
 		priority: 0,
@@ -62,9 +63,9 @@ func (nm *NodeManager) setClient(nodeID UniqueID, client types.IndexNode) error 
 	}
 	nm.lock.Lock()
 	nm.nodeClients[nodeID] = client
+	log.Debug("IndexNode NodeManager setClient success", zap.Int64("nodeID", nodeID), zap.Int("IndexNode num", len(nm.nodeClients)))
 	nm.lock.Unlock()
 	nm.pq.Push(item)
-	return nil
 }
 
 // RemoveNode removes the unused client of IndexNode.
@@ -85,24 +86,29 @@ func (nm *NodeManager) AddNode(nodeID UniqueID, address string) error {
 		log.Warn("IndexCoord", zap.Any("Node client already exist with ID:", nodeID))
 		return nil
 	}
+	var (
+		nodeClient types.IndexNode
+		err        error
+	)
 
-	nodeClient, err := grpcindexnodeclient.NewClient(context.TODO(), address)
+	nodeClient, err = grpcindexnodeclient.NewClient(context.TODO(), address, Params.IndexCoordCfg.WithCredential)
 	if err != nil {
 		log.Error("IndexCoord NodeManager", zap.Any("Add node err", err))
 		return err
 	}
+
 	err = nodeClient.Init()
 	if err != nil {
 		log.Error("IndexCoord NodeManager", zap.Any("Add node err", err))
 		return err
 	}
 	metrics.IndexCoordIndexNodeNum.WithLabelValues().Inc()
-	return nm.setClient(nodeID, nodeClient)
+	nm.setClient(nodeID, nodeClient)
+	return nil
 }
 
 // PeekClient peeks the client with the least load.
-func (nm *NodeManager) PeekClient(meta *Meta) (UniqueID, types.IndexNode) {
-	log.Info("IndexCoord peek client")
+func (nm *NodeManager) PeekClient(meta *model.SegmentIndex) (UniqueID, types.IndexNode) {
 	allClients := nm.GetAllClients()
 	if len(allClients) == 0 {
 		log.Error("there is no IndexNode online")
@@ -123,7 +129,7 @@ func (nm *NodeManager) PeekClient(meta *Meta) (UniqueID, types.IndexNode) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := client.GetTaskSlots(ctx, &indexpb.GetTaskSlotsRequest{})
+			resp, err := client.GetJobStats(ctx, &indexpb.GetJobStatsRequest{})
 			if err != nil {
 				log.Warn("get IndexNode slots failed", zap.Int64("nodeID", nodeID), zap.Error(err))
 				return
@@ -133,7 +139,7 @@ func (nm *NodeManager) PeekClient(meta *Meta) (UniqueID, types.IndexNode) {
 					zap.String("reason", resp.Status.Reason))
 				return
 			}
-			if resp.Slots > 0 {
+			if resp.TaskSlots > 0 {
 				nodeMutex.Lock()
 				defer nodeMutex.Unlock()
 				log.Info("peek client success", zap.Int64("nodeID", nodeID))
@@ -153,8 +159,63 @@ func (nm *NodeManager) PeekClient(meta *Meta) (UniqueID, types.IndexNode) {
 		return peekNodeID, allClients[peekNodeID]
 	}
 
-	log.Warn("IndexCoord peek client fail")
+	log.RatedDebug(30, "IndexCoord peek client fail")
 	return 0, nil
+}
+
+func (nm *NodeManager) ClientSupportDisk() bool {
+	log.Info("IndexCoord check if client support disk index")
+	allClients := nm.GetAllClients()
+	if len(allClients) == 0 {
+		log.Warn("there is no IndexNode online")
+		return false
+	}
+
+	// Note: In order to quickly end other goroutines, an error is returned when the client is successfully selected
+	ctx, cancel := context.WithCancel(nm.ctx)
+	var (
+		enableDisk = false
+		nodeMutex  = sync.Mutex{}
+		wg         = sync.WaitGroup{}
+	)
+
+	for nodeID, client := range allClients {
+		nodeID := nodeID
+		client := client
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.GetJobStats(ctx, &indexpb.GetJobStatsRequest{})
+			if err != nil {
+				log.Warn("get IndexNode slots failed", zap.Int64("nodeID", nodeID), zap.Error(err))
+				return
+			}
+			if resp.Status.ErrorCode != commonpb.ErrorCode_Success {
+				log.Warn("get IndexNode slots failed", zap.Int64("nodeID", nodeID),
+					zap.String("reason", resp.Status.Reason))
+				return
+			}
+			log.Debug("get job stats success", zap.Int64("nodeID", nodeID), zap.Bool("enable disk", resp.EnableDisk))
+			if resp.EnableDisk {
+				nodeMutex.Lock()
+				defer nodeMutex.Unlock()
+				cancel()
+				if !enableDisk {
+					enableDisk = true
+				}
+				return
+			}
+		}()
+	}
+	wg.Wait()
+	cancel()
+	if enableDisk {
+		log.Info("IndexNode support disk index")
+		return true
+	}
+
+	log.Error("all IndexNodes do not support disk indexes")
+	return false
 }
 
 func (nm *NodeManager) GetAllClients() map[UniqueID]types.IndexNode {
@@ -167,6 +228,14 @@ func (nm *NodeManager) GetAllClients() map[UniqueID]types.IndexNode {
 	}
 
 	return allClients
+}
+
+func (nm *NodeManager) GetClientByID(nodeID UniqueID) (types.IndexNode, bool) {
+	nm.lock.RLock()
+	defer nm.lock.RUnlock()
+
+	client, ok := nm.nodeClients[nodeID]
+	return client, ok
 }
 
 // indexNodeGetMetricsResponse record the metrics information of IndexNode.

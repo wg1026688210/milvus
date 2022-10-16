@@ -15,7 +15,6 @@
 set -e
 # Print commands
 # set -x
-
 while (( "$#" )); do
   case "$1" in
 
@@ -23,7 +22,7 @@ while (( "$#" )); do
       RELEASE_NAME=$2
       shift 2
     ;;
-  
+
     -h|--help)
       { set +x; } 2>/dev/null
       HELP="
@@ -62,11 +61,17 @@ if [[ -n "${RELEASE_NAME:-}" ]]; then
    
     for restart_pod in ${restart_pods}
     do 
-      reason=$(kubectl get pod ${restart_pod} -n milvus-ci -o json | jq .status.containerStatuses[0].lastState.terminated.reason )
-      restart_count=$(kubectl get pod ${restart_pod} -n milvus-ci -o json | jq .status.containerStatuses[0].restartCount )
+      reason=$(kubectl get pod ${restart_pod} -n ${MILVUS_HELM_NAMESPACE}  -o json | jq .status.containerStatuses[0].lastState.terminated.reason )
+      restart_count=$(kubectl get pod ${restart_pod} -n${MILVUS_HELM_NAMESPACE}  -o json | jq .status.containerStatuses[0].restartCount )
       echo "${restart_pod} restarts ${restart_count}, last terminateed reason is ${reason}"
     done
     
+    echo "----------------Pod Events --------------------------------------------"
+    for pod in $(kubectl get pods -n ${MILVUS_HELM_NAMESPACE}  -o wide | grep "${MILVUS_HELM_RELEASE_NAME}-"  | awk '{print $1}')
+    do
+      echo "--------------------------------${pod}-----------------------------"
+      kubectl describe pod ${pod} -n ${MILVUS_HELM_NAMESPACE} 
+    done
 fi
 
 # Uninstall Milvus Helm Release
@@ -79,26 +84,3 @@ MILVUS_LABELS2="release=${MILVUS_HELM_RELEASE_NAME}"
 # Clean up pvc
 kubectl delete pvc --wait -n "${MILVUS_HELM_NAMESPACE}" $(kubectl get pvc -n "${MILVUS_HELM_NAMESPACE}" -l "${MILVUS_LABELS1}" -o jsonpath='{range.items[*]}{.metadata.name} ') || true
 kubectl delete pvc --wait -n "${MILVUS_HELM_NAMESPACE}" $(kubectl get pvc -n "${MILVUS_HELM_NAMESPACE}" -l "${MILVUS_LABELS2}" -o jsonpath='{range.items[*]}{.metadata.name} ') || true
-
-# Add check & delete pvc again in case pvc need time to be deleted 
-clean_label_pvc(){
-    local label=${1?label expected as first argument.}
-
-    for i in {1..10}
-    do
-        PVC=$(kubectl get pvc -n "${MILVUS_HELM_NAMESPACE}" -l "${label}" -o jsonpath='{range.items[*]}{.metadata.name} ')
-        STATUS=$(echo ${PVC} | wc -w )
-        echo "status is ${STATUS}"
-        if [ $STATUS == 0 ]; then
-            break
-        else
-            sleep 5
-            echo "PVCs are ${PVC}"
-            kubectl delete pvc --wait -n "${MILVUS_HELM_NAMESPACE}" ${PVC}
-        fi
-    done
-}
-
-echo "Check & Delete Persistent Volumes"
-clean_label_pvc ${MILVUS_LABELS1}
-clean_label_pvc ${MILVUS_LABELS2}

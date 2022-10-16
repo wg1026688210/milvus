@@ -22,11 +22,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
 type mockNodeDetector struct {
@@ -38,6 +40,8 @@ func (m *mockNodeDetector) watchNodes(collectionID int64, replicaID int64, vchan
 	return m.initNodes, m.evtCh
 }
 
+func (m *mockNodeDetector) Close() {}
+
 type mockSegmentDetector struct {
 	initSegments []segmentEvent
 	evtCh        chan segmentEvent
@@ -47,6 +51,8 @@ func (m *mockSegmentDetector) watchSegments(collectionID int64, replicaID int64,
 	return m.initSegments, m.evtCh
 }
 
+func (m *mockSegmentDetector) Close() {}
+
 type mockShardQueryNode struct {
 	statisticResponse     *internalpb.GetStatisticsResponse
 	statisticErr          error
@@ -54,6 +60,8 @@ type mockShardQueryNode struct {
 	searchErr             error
 	queryResult           *internalpb.RetrieveResults
 	queryErr              error
+	loadSegmentsResults   *commonpb.Status
+	loadSegmentsErr       error
 	releaseSegmentsResult *commonpb.Status
 	releaseSegmentsErr    error
 }
@@ -68,6 +76,10 @@ func (m *mockShardQueryNode) Search(_ context.Context, _ *querypb.SearchRequest)
 
 func (m *mockShardQueryNode) Query(_ context.Context, _ *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {
 	return m.queryResult, m.queryErr
+}
+
+func (m *mockShardQueryNode) LoadSegments(ctx context.Context, in *querypb.LoadSegmentsRequest) (*commonpb.Status, error) {
+	return m.loadSegmentsResults, m.loadSegmentsErr
 }
 
 func (m *mockShardQueryNode) ReleaseSegments(ctx context.Context, in *querypb.ReleaseSegmentsRequest) (*commonpb.Status, error) {
@@ -101,6 +113,7 @@ func segmentEventsToSyncInfo(events []segmentEvent) []*querypb.ReplicaSegmentsIn
 				NodeId:      nodeID,
 				SegmentIds:  []int64{event.segmentID},
 				PartitionId: event.partitionID,
+				Versions:    []int64{0},
 			})
 		}
 	}
@@ -883,14 +896,17 @@ func TestShardCluster_SyncSegments(t *testing.T) {
 			{
 				NodeId:     1,
 				SegmentIds: []int64{1},
+				Versions:   []int64{1},
 			},
 			{
 				NodeId:     2,
 				SegmentIds: []int64{2},
+				Versions:   []int64{1},
 			},
 			{
 				NodeId:     3,
 				SegmentIds: []int64{3},
+				Versions:   []int64{1},
 			},
 		}, segmentStateLoaded)
 		assert.Eventually(t, func() bool {
@@ -954,14 +970,17 @@ func TestShardCluster_SyncSegments(t *testing.T) {
 			{
 				NodeId:     1,
 				SegmentIds: []int64{1},
+				Versions:   []int64{1},
 			},
 			{
 				NodeId:     2,
 				SegmentIds: []int64{2},
+				Versions:   []int64{1},
 			},
 			{
 				NodeId:     3,
 				SegmentIds: []int64{3},
+				Versions:   []int64{1},
 			},
 		}, segmentStateLoaded)
 		assert.Eventually(t, func() bool {
@@ -978,6 +997,49 @@ func TestShardCluster_SyncSegments(t *testing.T) {
 		}, time.Second, time.Millisecond)
 	})
 
+	t.Run("sync segments with offline nodes", func(t *testing.T) {
+		nodeEvents := []nodeEvent{}
+
+		segmentEvents := []segmentEvent{}
+
+		evtCh := make(chan segmentEvent, 10)
+		sc := NewShardCluster(collectionID, replicaID, vchannelName,
+			&mockNodeDetector{initNodes: nodeEvents}, &mockSegmentDetector{
+				initSegments: segmentEvents,
+				evtCh:        evtCh,
+			}, buildMockQueryNode)
+		defer sc.Close()
+
+		sc.SyncSegments([]*querypb.ReplicaSegmentsInfo{
+			{
+				NodeId:     1,
+				SegmentIds: []int64{1},
+				Versions:   []int64{1},
+			},
+			{
+				NodeId:     2,
+				SegmentIds: []int64{2},
+				Versions:   []int64{1},
+			},
+			{
+				NodeId:     3,
+				SegmentIds: []int64{3},
+				Versions:   []int64{1},
+			},
+		}, segmentStateLoaded)
+		assert.Eventually(t, func() bool {
+			seg, has := sc.getSegment(1)
+			return has && seg.nodeID == common.InvalidNodeID && seg.state == segmentStateLoaded
+		}, time.Second, time.Millisecond)
+		assert.Eventually(t, func() bool {
+			seg, has := sc.getSegment(2)
+			return has && seg.nodeID == common.InvalidNodeID && seg.state == segmentStateLoaded
+		}, time.Second, time.Millisecond)
+		assert.Eventually(t, func() bool {
+			seg, has := sc.getSegment(3)
+			return has && seg.nodeID == common.InvalidNodeID && seg.state == segmentStateLoaded
+		}, time.Second, time.Millisecond)
+	})
 }
 
 var streamingDoNothing = func(context.Context) error { return nil }
@@ -2341,4 +2403,109 @@ func TestShardCluster_HandoffSegments(t *testing.T) {
 		assert.Error(t, err)
 
 	})
+}
+
+type ShardClusterSuite struct {
+	suite.Suite
+
+	collectionID      int64
+	otherCollectionID int64
+	vchannelName      string
+	otherVchannelName string
+
+	replicaID int64
+
+	sc *ShardCluster
+}
+
+func (suite *ShardClusterSuite) SetupSuite() {
+	suite.collectionID = int64(1)
+	suite.otherCollectionID = int64(2)
+	suite.vchannelName = "dml_1_1_v0"
+	suite.otherVchannelName = "dml_1_2_v0"
+	suite.replicaID = int64(0)
+}
+
+func (suite *ShardClusterSuite) SetupTest() {
+	nodeEvents := []nodeEvent{
+		{
+			nodeID:   1,
+			nodeAddr: "addr_1",
+			isLeader: true,
+		},
+		{
+			nodeID:   2,
+			nodeAddr: "addr_2",
+		},
+	}
+
+	segmentEvents := []segmentEvent{
+		{
+			segmentID: 1,
+			nodeIDs:   []int64{1},
+			state:     segmentStateLoaded,
+		},
+		{
+			segmentID: 2,
+			nodeIDs:   []int64{2},
+			state:     segmentStateLoaded,
+		},
+	}
+	suite.sc = NewShardCluster(suite.collectionID, suite.replicaID, suite.vchannelName,
+		&mockNodeDetector{
+			initNodes: nodeEvents,
+		}, &mockSegmentDetector{
+			initSegments: segmentEvents,
+		}, buildMockQueryNode)
+}
+
+func (suite *ShardClusterSuite) TearDownTest() {
+	suite.sc.Close()
+	suite.sc = nil
+}
+
+func (suite *ShardClusterSuite) TestReleaseSegments() {
+	type TestCase struct {
+		tag        string
+		segmentIDs []int64
+		nodeID     int64
+		scope      querypb.DataScope
+
+		expectError bool
+		force       bool
+	}
+
+	cases := []TestCase{
+		{
+			tag:         "normal release",
+			segmentIDs:  []int64{2},
+			nodeID:      2,
+			scope:       querypb.DataScope_All,
+			expectError: false,
+			force:       false,
+		},
+	}
+
+	for _, test := range cases {
+		suite.Run(test.tag, func() {
+			suite.TearDownTest()
+			suite.SetupTest()
+
+			err := suite.sc.ReleaseSegments(context.Background(), &querypb.ReleaseSegmentsRequest{
+				Base:       &commonpb.MsgBase{},
+				NodeID:     test.nodeID,
+				SegmentIDs: test.segmentIDs,
+				Scope:      test.scope,
+			}, test.force)
+			if test.expectError {
+				suite.Error(err)
+			} else {
+				suite.NoError(err)
+			}
+		})
+	}
+}
+
+func TestShardClusterSuite(t *testing.T) {
+	suite.Run(t, new(ShardClusterSuite))
 }

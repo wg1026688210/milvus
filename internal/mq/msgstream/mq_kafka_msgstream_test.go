@@ -22,13 +22,14 @@ import (
 	"log"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 
 	"github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper"
 
 	kafkawrapper "github.com/milvus-io/milvus/internal/mq/msgstream/mqwrapper/kafka"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/stretchr/testify/assert"
@@ -36,7 +37,7 @@ import (
 
 //	 Note: kafka does not support get all data when consuming from the earliest position again.
 //func TestStream_KafkaTtMsgStream_NoSeek(t *testing.T) {
-//	kafkaAddress, _ := Params.Load("_KafkaBrokerList")
+//	kafkaAddress := getKafkaBrokerList()
 //	c1 := funcutil.RandomString(8)
 //	producerChannels := []string{c1}
 //	consumerChannels := []string{c1}
@@ -108,8 +109,7 @@ func skipTest(t *testing.T) {
 
 func TestStream_KafkaMsgStream_SeekToLast(t *testing.T) {
 	skipTest(t)
-
-	kafkaAddress, _ := Params.Load("_KafkaBrokerList")
+	kafkaAddress := getKafkaBrokerList()
 	c := funcutil.RandomString(8)
 	producerChannels := []string{c}
 	consumerChannels := []string{c}
@@ -185,8 +185,7 @@ func TestStream_KafkaMsgStream_SeekToLast(t *testing.T) {
 
 func TestStream_KafkaTtMsgStream_Seek(t *testing.T) {
 	skipTest(t)
-
-	kafkaAddress, _ := Params.Load("_KafkaBrokerList")
+	kafkaAddress := getKafkaBrokerList()
 	c1 := funcutil.RandomString(8)
 	producerChannels := []string{c1}
 	consumerChannels := []string{c1}
@@ -299,8 +298,7 @@ func TestStream_KafkaTtMsgStream_Seek(t *testing.T) {
 
 func TestStream_KafkaTtMsgStream_1(t *testing.T) {
 	skipTest(t)
-
-	kafkaAddress, _ := Params.Load("_KafkaBrokerList")
+	kafkaAddress := getKafkaBrokerList()
 	c1 := funcutil.RandomString(8)
 	c2 := funcutil.RandomString(8)
 	p1Channels := []string{c1}
@@ -346,8 +344,7 @@ func TestStream_KafkaTtMsgStream_1(t *testing.T) {
 
 func TestStream_KafkaTtMsgStream_2(t *testing.T) {
 	skipTest(t)
-
-	kafkaAddress, _ := Params.Load("_KafkaBrokerList")
+	kafkaAddress := getKafkaBrokerList()
 	c1 := funcutil.RandomString(8)
 	c2 := funcutil.RandomString(8)
 	p1Channels := []string{c1}
@@ -357,10 +354,12 @@ func TestStream_KafkaTtMsgStream_2(t *testing.T) {
 
 	ctx := context.Background()
 	inputStream1 := getKafkaInputStream(ctx, kafkaAddress, p1Channels)
+	defer inputStream1.Close()
 	msgPacks1 := createRandMsgPacks(3, 10, 10)
 	assert.Nil(t, sendMsgPacks(inputStream1, msgPacks1))
 
 	inputStream2 := getKafkaInputStream(ctx, kafkaAddress, p2Channels)
+	defer inputStream2.Close()
 	msgPacks2 := createRandMsgPacks(5, 10, 10)
 	assert.Nil(t, sendMsgPacks(inputStream2, msgPacks2))
 
@@ -376,17 +375,17 @@ func TestStream_KafkaTtMsgStream_2(t *testing.T) {
 		} else {
 			outputStream = getKafkaTtOutputStreamAndSeek(ctx, kafkaAddress, rcvMsgPacks[msgCount-1].EndPositions)
 		}
+		defer outputStream.Close()
 		msgPack := consumer(ctx, outputStream)
 		rcvMsgPacks = append(rcvMsgPacks, msgPack)
 		if len(msgPack.Msgs) > 0 {
 			for _, msg := range msgPack.Msgs {
-				log.Println("msg type: ", msg.Type(), ", msg value: ", msg)
+				log.Println("TestStream_KafkaTtMsgStream_2 msg type: ", msg.Type(), ", msg value: ", msg)
 				assert.Greater(t, msg.BeginTs(), msgPack.BeginTs)
 				assert.LessOrEqual(t, msg.BeginTs(), msgPack.EndTs)
 			}
 			log.Println("================")
 		}
-		outputStream.Close()
 		return len(rcvMsgPacks[msgCount].Msgs)
 	}
 
@@ -398,14 +397,11 @@ func TestStream_KafkaTtMsgStream_2(t *testing.T) {
 	cnt2 := (len(msgPacks2)/2 - 1) * len(msgPacks2[0].Msgs)
 	assert.Equal(t, (cnt1 + cnt2), msgCount)
 
-	inputStream1.Close()
-	inputStream2.Close()
 }
 
 func TestStream_KafkaTtMsgStream_DataNodeTimetickMsgstream(t *testing.T) {
 	skipTest(t)
-
-	kafkaAddress, _ := Params.Load("_KafkaBrokerList")
+	kafkaAddress := getKafkaBrokerList()
 	c1 := funcutil.RandomString(8)
 	p1Channels := []string{c1}
 	consumerChannels := []string{c1}
@@ -440,11 +436,8 @@ func TestStream_KafkaTtMsgStream_DataNodeTimetickMsgstream(t *testing.T) {
 		}
 	}()
 
-	// make producer start to produce messages after invoking Chan
-	time.Sleep(5 * time.Second)
-
 	inputStream1 := getKafkaInputStream(ctx, kafkaAddress, p1Channels)
-	msgPacks1 := createRandMsgPacks(2, 1, 1)
+	msgPacks1 := createRandMsgPacks(2, 10, 1)
 	assert.Nil(t, sendMsgPacks(inputStream1, msgPacks1))
 	wg.Wait()
 
@@ -454,7 +447,14 @@ func TestStream_KafkaTtMsgStream_DataNodeTimetickMsgstream(t *testing.T) {
 
 func getKafkaInputStream(ctx context.Context, kafkaAddress string, producerChannels []string, opts ...RepackFunc) MsgStream {
 	factory := ProtoUDFactory{}
-	kafkaClient := kafkawrapper.NewKafkaClientInstance(kafkaAddress)
+	config := kafka.ConfigMap{
+		"bootstrap.servers":   kafkaAddress,
+		"socket.timeout.ms":   500,
+		"socket.max.fails":    2,
+		"api.version.request": true,
+		"linger.ms":           10,
+	}
+	kafkaClient := kafkawrapper.NewKafkaClientInstanceWithConfigMap(config, nil, nil)
 	inputStream, _ := NewMqMsgStream(ctx, 100, 100, kafkaClient, factory.NewUnmarshalDispatcher())
 	inputStream.AsProducer(producerChannels)
 	for _, opt := range opts {

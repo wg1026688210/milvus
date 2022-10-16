@@ -24,25 +24,27 @@ import (
 	"sync"
 	"time"
 
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	dcc "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
 	icc "github.com/milvus-io/milvus/internal/distributed/indexcoord/client"
 	rcc "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	qc "github.com/milvus-io/milvus/internal/querycoord"
+	qc "github.com/milvus-io/milvus/internal/querycoordv2"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/trace"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
@@ -222,8 +224,8 @@ func (s *Server) init() error {
 		panic(err)
 	}
 
-	s.queryCoord.UpdateStateCode(internalpb.StateCode_Initializing)
-	log.Debug("QueryCoord", zap.Any("State", internalpb.StateCode_Initializing))
+	s.queryCoord.UpdateStateCode(commonpb.StateCode_Initializing)
+	log.Debug("QueryCoord", zap.Any("State", commonpb.StateCode_Initializing))
 	if err := s.queryCoord.Init(); err != nil {
 		return err
 	}
@@ -259,8 +261,12 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
-		grpc.UnaryInterceptor(ot.UnaryServerInterceptor(opts...)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			ot.UnaryServerInterceptor(opts...),
+			logutil.UnaryTraceLoggerInterceptor)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			ot.StreamServerInterceptor(opts...),
+			logutil.StreamTraceLoggerInterceptor)))
 	querypb.RegisterQueryCoordServer(s.grpcServer, s)
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
@@ -322,7 +328,7 @@ func (s *Server) SetIndexCoord(d types.IndexCoord) error {
 }
 
 // GetComponentStates gets the component states of QueryCoord.
-func (s *Server) GetComponentStates(ctx context.Context, req *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return s.queryCoord.GetComponentStates(ctx)
 }
 
@@ -379,6 +385,11 @@ func (s *Server) GetSegmentInfo(ctx context.Context, req *querypb.GetSegmentInfo
 // LoadBalance migrate the sealed segments on the source node to the dst nodes
 func (s *Server) LoadBalance(ctx context.Context, req *querypb.LoadBalanceRequest) (*commonpb.Status, error) {
 	return s.queryCoord.LoadBalance(ctx, req)
+}
+
+// ShowConfigurations gets specified configurations para of QueryCoord
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return s.queryCoord.ShowConfigurations(ctx, req)
 }
 
 // GetMetrics gets the metrics information of QueryCoord.

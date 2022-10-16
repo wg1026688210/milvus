@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/milvus-io/milvus/internal/util/funcutil"
+
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
@@ -908,4 +910,35 @@ func TestElapse(t *testing.T) {
 	time.Sleep(2001 * time.Millisecond)
 	isElapse = etcdkv.CheckElapseAndWarn(start, "err message")
 	assert.Equal(t, isElapse, true)
+}
+
+func TestCheckValueSizeAndWarn(t *testing.T) {
+	ret := etcdkv.CheckValueSizeAndWarn("k", "v")
+	assert.False(t, ret)
+
+	v := make([]byte, 1024000)
+	ret = etcdkv.CheckValueSizeAndWarn("k", v)
+	assert.True(t, ret)
+}
+
+func TestCheckTnxBytesValueSizeAndWarn(t *testing.T) {
+	kvs := make(map[string][]byte, 0)
+	kvs["k"] = []byte("v")
+	ret := etcdkv.CheckTnxBytesValueSizeAndWarn(kvs)
+	assert.False(t, ret)
+
+	kvs["k"] = make([]byte, 1024000)
+	ret = etcdkv.CheckTnxBytesValueSizeAndWarn(kvs)
+	assert.True(t, ret)
+}
+
+func TestCheckTnxStringValueSizeAndWarn(t *testing.T) {
+	kvs := make(map[string]string, 0)
+	kvs["k"] = "v"
+	ret := etcdkv.CheckTnxStringValueSizeAndWarn(kvs)
+	assert.False(t, ret)
+
+	kvs["k1"] = funcutil.RandomString(1024000)
+	ret = etcdkv.CheckTnxStringValueSizeAndWarn(kvs)
+	assert.True(t, ret)
 }

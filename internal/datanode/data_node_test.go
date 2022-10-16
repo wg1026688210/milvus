@@ -28,26 +28,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
-
 	"github.com/milvus-io/milvus/internal/util/etcd"
+	"github.com/milvus-io/milvus/internal/util/importutil"
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -68,11 +66,19 @@ func TestMain(t *testing.M) {
 	// change to specific channel for test
 	Params.CommonCfg.DataCoordTimeTick = Params.CommonCfg.DataCoordTimeTick + strconv.Itoa(rand.Int())
 
+	var err error
+	rateCol, err = newRateCollector()
+	if err != nil {
+		panic("init test failed, err = " + err.Error())
+	}
+
 	code := t.Run()
 	os.Exit(code)
 }
 
 func TestDataNode(t *testing.T) {
+	importutil.ReportImportAttempts = 1
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -149,6 +155,41 @@ func TestDataNode(t *testing.T) {
 		assert.Equal(t, commonpb.ErrorCode_Success, stat.Status.ErrorCode)
 	})
 
+	t.Run("Test GetCompactionState", func(t *testing.T) {
+		node.compactionExecutor.executing.Store(int64(3), 0)
+		node.compactionExecutor.executing.Store(int64(2), 0)
+		node.compactionExecutor.completed.Store(int64(1), &datapb.CompactionResult{
+			PlanID:    1,
+			SegmentID: 10,
+		})
+		stat, err := node.GetCompactionState(node.ctx, nil)
+		assert.NoError(t, err)
+
+		assert.Equal(t, 3, len(stat.GetResults()))
+
+		cnt := 0
+		for _, v := range stat.GetResults() {
+			if v.GetState() == commonpb.CompactionState_Completed {
+				cnt++
+			}
+		}
+		assert.Equal(t, 1, cnt)
+
+		cnt = 0
+		node.compactionExecutor.completed.Range(func(k, v any) bool {
+			cnt++
+			return true
+		})
+		assert.Equal(t, 0, cnt)
+	})
+
+	t.Run("Test GetCompactionState unhealthy", func(t *testing.T) {
+		node.UpdateStateCode(commonpb.StateCode_Abnormal)
+		resp, _ := node.GetCompactionState(ctx, nil)
+		assert.Equal(t, "DataNode is unhealthy", resp.GetStatus().GetReason())
+		node.UpdateStateCode(commonpb.StateCode_Healthy)
+	})
+
 	t.Run("Test FlushSegments", func(t *testing.T) {
 		dmChannelName := "fake-by-dev-rootcoord-dml-channel-test-FlushSegments"
 
@@ -170,13 +211,21 @@ func TestDataNode(t *testing.T) {
 			FlushedSegmentIds:   []int64{},
 		}
 
-		err := node1.flowgraphManager.addAndStart(node1, vchan)
+		err := node1.flowgraphManager.addAndStart(node1, vchan, nil)
 		require.Nil(t, err)
 
 		fgservice, ok := node1.flowgraphManager.getFlowgraphService(dmChannelName)
 		assert.True(t, ok)
 
-		err = fgservice.replica.addNewSegment(0, 1, 1, dmChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+		err = fgservice.replica.addSegment(addSegmentReq{
+			segType:     datapb.SegmentType_New,
+			segID:       0,
+			collID:      1,
+			partitionID: 1,
+			channelName: dmChannelName,
+			startPos:    &internalpb.MsgPosition{},
+			endPos:      &internalpb.MsgPosition{},
+		})
 		assert.Nil(t, err)
 
 		req := &datapb.FlushSegmentsRequest{
@@ -277,25 +326,70 @@ func TestDataNode(t *testing.T) {
 	t.Run("Test getSystemInfoMetrics", func(t *testing.T) {
 		emptyNode := &DataNode{}
 		emptyNode.session = &sessionutil.Session{ServerID: 1}
+		emptyNode.flowgraphManager = newFlowgraphManager()
 
 		req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
 		assert.NoError(t, err)
 		resp, err := emptyNode.getSystemInfoMetrics(context.TODO(), req)
 		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 		log.Info("Test DataNode.getSystemInfoMetrics",
 			zap.String("name", resp.ComponentName),
 			zap.String("response", resp.Response))
 	})
 
+	t.Run("Test getSystemInfoMetrics with quotaMetric error", func(t *testing.T) {
+		emptyNode := &DataNode{}
+		emptyNode.session = &sessionutil.Session{ServerID: 1}
+		emptyNode.flowgraphManager = newFlowgraphManager()
+
+		req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.SystemInfoMetrics)
+		assert.NoError(t, err)
+		rateCol.Deregister(metricsinfo.InsertConsumeThroughput)
+		resp, err := emptyNode.getSystemInfoMetrics(context.TODO(), req)
+		assert.NoError(t, err)
+		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+		rateCol.Register(metricsinfo.InsertConsumeThroughput)
+	})
+
+	t.Run("Test ShowConfigurations", func(t *testing.T) {
+		pattern := "Port"
+		req := &internalpb.ShowConfigurationsRequest{
+			Base: &commonpb.MsgBase{
+				MsgType: commonpb.MsgType_WatchQueryChannels,
+				MsgID:   rand.Int63(),
+			},
+			Pattern: pattern,
+		}
+
+		//test closed server
+		node := &DataNode{}
+		node.session = &sessionutil.Session{ServerID: 1}
+		node.stateCode.Store(commonpb.StateCode_Abnormal)
+
+		resp, err := node.ShowConfigurations(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, resp.Status.ErrorCode)
+		node.stateCode.Store(commonpb.StateCode_Healthy)
+
+		resp, err = node.ShowConfigurations(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
+
+		assert.Equal(t, 1, len(resp.Configuations))
+		assert.Equal(t, "datanode.port", resp.Configuations[0].Key)
+	})
+
 	t.Run("Test GetMetrics", func(t *testing.T) {
 		node := &DataNode{}
 		node.session = &sessionutil.Session{ServerID: 1}
+		node.flowgraphManager = newFlowgraphManager()
 		// server is closed
-		node.State.Store(internalpb.StateCode_Abnormal)
+		node.stateCode.Store(commonpb.StateCode_Abnormal)
 		resp, err := node.GetMetrics(ctx, &milvuspb.GetMetricsRequest{})
 		assert.NoError(t, err)
 		assert.NotEqual(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
-		node.State.Store(internalpb.StateCode_Healthy)
+		node.stateCode.Store(commonpb.StateCode_Healthy)
 
 		// failed to parse metric type
 		invalidRequest := "invalid request"
@@ -339,18 +433,60 @@ func TestDataNode(t *testing.T) {
 		]
 		}`)
 
+		chName1 := "fake-by-dev-rootcoord-dml-testimport-1"
+		chName2 := "fake-by-dev-rootcoord-dml-testimport-2"
+		err := node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{
+			CollectionID:        100,
+			ChannelName:         chName1,
+			UnflushedSegmentIds: []int64{},
+			FlushedSegmentIds:   []int64{},
+		}, nil)
+		require.Nil(t, err)
+		err = node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{
+			CollectionID:        100,
+			ChannelName:         chName2,
+			UnflushedSegmentIds: []int64{},
+			FlushedSegmentIds:   []int64{},
+		}, nil)
+		require.Nil(t, err)
+
+		_, ok := node.flowgraphManager.getFlowgraphService(chName1)
+		assert.True(t, ok)
+		_, ok = node.flowgraphManager.getFlowgraphService(chName2)
+		assert.True(t, ok)
+
 		filePath := "import/rows_1.json"
-		err = node.chunkManager.Write(filePath, content)
+		err = node.chunkManager.Write(ctx, filePath, content)
 		assert.NoError(t, err)
 		req := &datapb.ImportTaskRequest{
 			ImportTask: &datapb.ImportTask{
 				CollectionId: 100,
 				PartitionId:  100,
-				ChannelNames: []string{"ch1", "ch2"},
+				ChannelNames: []string{chName1, chName2},
 				Files:        []string{filePath},
 				RowBased:     true,
 			},
 		}
+		node.rootCoord.(*RootCoordFactory).ReportImportErr = true
+		_, err = node.Import(node.ctx, req)
+		assert.NoError(t, err)
+		node.rootCoord.(*RootCoordFactory).ReportImportErr = false
+
+		node.rootCoord.(*RootCoordFactory).ReportImportNotSuccess = true
+		_, err = node.Import(context.WithValue(ctx, ctxKey{}, ""), req)
+		assert.NoError(t, err)
+		node.rootCoord.(*RootCoordFactory).ReportImportNotSuccess = false
+
+		node.dataCoord.(*DataCoordFactory).AddSegmentError = true
+		_, err = node.Import(context.WithValue(ctx, ctxKey{}, ""), req)
+		assert.NoError(t, err)
+		node.dataCoord.(*DataCoordFactory).AddSegmentError = false
+
+		node.dataCoord.(*DataCoordFactory).AddSegmentNotSuccess = true
+		_, err = node.Import(context.WithValue(ctx, ctxKey{}, ""), req)
+		assert.NoError(t, err)
+		node.dataCoord.(*DataCoordFactory).AddSegmentNotSuccess = false
+
 		stat, err := node.Import(context.WithValue(ctx, ctxKey{}, ""), req)
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, stat.GetErrorCode())
@@ -370,14 +506,14 @@ func TestDataNode(t *testing.T) {
 			ChannelName:         chName1,
 			UnflushedSegmentIds: []int64{},
 			FlushedSegmentIds:   []int64{},
-		})
+		}, nil)
 		require.Nil(t, err)
 		err = node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{
 			CollectionID:        999, // wrong collection ID.
 			ChannelName:         chName2,
 			UnflushedSegmentIds: []int64{},
 			FlushedSegmentIds:   []int64{},
-		})
+		}, nil)
 		require.Nil(t, err)
 
 		_, ok := node.flowgraphManager.getFlowgraphService(chName1)
@@ -396,7 +532,7 @@ func TestDataNode(t *testing.T) {
 		}`)
 
 		filePath := "import/rows_1.json"
-		err = node.chunkManager.Write(filePath, content)
+		err = node.chunkManager.Write(ctx, filePath, content)
 		assert.NoError(t, err)
 		req := &datapb.ImportTaskRequest{
 			ImportTask: &datapb.ImportTask{
@@ -415,8 +551,9 @@ func TestDataNode(t *testing.T) {
 
 	t.Run("Test Import report import error", func(t *testing.T) {
 		node.rootCoord = &RootCoordFactory{
-			collectionID: 100,
-			pkType:       schemapb.DataType_Int64,
+			collectionID:    100,
+			pkType:          schemapb.DataType_Int64,
+			ReportImportErr: true,
 		}
 		content := []byte(`{
 		"rows":[
@@ -429,7 +566,7 @@ func TestDataNode(t *testing.T) {
 		}`)
 
 		filePath := "import/rows_1.json"
-		err = node.chunkManager.Write(filePath, content)
+		err = node.chunkManager.Write(ctx, filePath, content)
 		assert.NoError(t, err)
 		req := &datapb.ImportTaskRequest{
 			ImportTask: &datapb.ImportTask{
@@ -440,7 +577,7 @@ func TestDataNode(t *testing.T) {
 				RowBased:     true,
 			},
 		}
-		stat, err := node.Import(context.WithValue(node.ctx, ctxKey{}, returnError), req)
+		stat, err := node.Import(node.ctx, req)
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, stat.GetErrorCode())
 	})
@@ -461,7 +598,7 @@ func TestDataNode(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, stat.GetErrorCode())
 
-		node.State.Store(internalpb.StateCode_Abnormal)
+		node.stateCode.Store(commonpb.StateCode_Abnormal)
 		stat, err = node.Import(context.WithValue(ctx, ctxKey{}, ""), req)
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, stat.GetErrorCode())
@@ -511,12 +648,95 @@ func TestDataNode(t *testing.T) {
 
 		for i, test := range testDataSyncs {
 			if i <= 2 {
-				err = node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{CollectionID: 1, ChannelName: test.dmChannelName})
+				err = node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{CollectionID: 1, ChannelName: test.dmChannelName}, nil)
 				assert.Nil(t, err)
 				vchanNameCh <- test.dmChannelName
 			}
 		}
 		cancel()
+	})
+
+	t.Run("Test SyncSegments", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		chanName := "fake-by-dev-rootcoord-dml-test-syncsegments-1"
+
+		node := newIDLEDataNodeMock(ctx, schemapb.DataType_Int64)
+		etcdCli, err := etcd.GetEtcdClient(&Params.EtcdCfg)
+		assert.Nil(t, err)
+		defer etcdCli.Close()
+		node.SetEtcdClient(etcdCli)
+		err = node.Init()
+		assert.Nil(t, err)
+		err = node.Start()
+		assert.Nil(t, err)
+		defer node.Stop()
+
+		err = node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{
+			ChannelName:         chanName,
+			UnflushedSegmentIds: []int64{},
+			FlushedSegmentIds:   []int64{},
+		}, nil)
+		require.NoError(t, err)
+		fg, ok := node.flowgraphManager.getFlowgraphService(chanName)
+		assert.True(t, ok)
+
+		fg.replica.(*SegmentReplica).flushedSegments = map[UniqueID]*Segment{
+			100: {channelName: chanName},
+			101: {channelName: chanName},
+			102: {channelName: chanName},
+		}
+
+		t.Run("invalid compacted from", func(t *testing.T) {
+			invalidCompactedFroms := [][]UniqueID{
+				{},
+				{100, 200},
+			}
+			req := &datapb.SyncSegmentsRequest{}
+
+			for _, invalid := range invalidCompactedFroms {
+				req.CompactedFrom = invalid
+				status, err := node.SyncSegments(ctx, req)
+				assert.NoError(t, err)
+				assert.Equal(t, commonpb.ErrorCode_UnexpectedError, status.GetErrorCode())
+			}
+		})
+
+		t.Run("valid request numRows>0", func(t *testing.T) {
+			req := &datapb.SyncSegmentsRequest{
+				CompactedFrom: []int64{100, 101},
+				CompactedTo:   200,
+				NumOfRows:     100,
+			}
+			status, err := node.SyncSegments(ctx, req)
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+
+			assert.True(t, fg.replica.hasSegment(req.CompactedTo, true))
+			assert.False(t, fg.replica.hasSegment(req.CompactedFrom[0], true))
+			assert.False(t, fg.replica.hasSegment(req.CompactedFrom[1], true))
+		})
+
+		t.Run("valid request numRows=0", func(t *testing.T) {
+			fg.replica.(*SegmentReplica).flushedSegments = map[UniqueID]*Segment{
+				100: {channelName: chanName},
+				101: {channelName: chanName},
+				102: {channelName: chanName},
+			}
+
+			req := &datapb.SyncSegmentsRequest{
+				CompactedFrom: []int64{100, 101},
+				CompactedTo:   200,
+				NumOfRows:     0,
+			}
+			status, err := node.SyncSegments(ctx, req)
+			assert.NoError(t, err)
+			assert.Equal(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+
+			assert.False(t, fg.replica.hasSegment(req.CompactedTo, true))
+			assert.False(t, fg.replica.hasSegment(req.CompactedFrom[0], true))
+			assert.False(t, fg.replica.hasSegment(req.CompactedFrom[1], true))
+		})
 	})
 }
 
@@ -551,14 +771,14 @@ func TestDataNode_AddSegment(t *testing.T) {
 			ChannelName:         chName1,
 			UnflushedSegmentIds: []int64{},
 			FlushedSegmentIds:   []int64{},
-		})
+		}, nil)
 		require.Nil(t, err)
 		err = node.flowgraphManager.addAndStart(node, &datapb.VchannelInfo{
 			CollectionID:        100,
 			ChannelName:         chName2,
 			UnflushedSegmentIds: []int64{},
 			FlushedSegmentIds:   []int64{},
-		})
+		}, nil)
 		require.Nil(t, err)
 
 		_, ok := node.flowgraphManager.getFlowgraphService(chName1)
@@ -566,7 +786,7 @@ func TestDataNode_AddSegment(t *testing.T) {
 		_, ok = node.flowgraphManager.getFlowgraphService(chName2)
 		assert.True(t, ok)
 
-		stat, err := node.AddSegment(context.WithValue(ctx, ctxKey{}, ""), &datapb.AddSegmentRequest{
+		stat, err := node.AddImportSegment(context.WithValue(ctx, ctxKey{}, ""), &datapb.AddImportSegmentRequest{
 			SegmentId:    100,
 			CollectionId: 100,
 			PartitionId:  100,
@@ -574,10 +794,12 @@ func TestDataNode_AddSegment(t *testing.T) {
 			RowNum:       500,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_Success, stat.GetErrorCode())
-		assert.Equal(t, "", stat.GetReason())
+		assert.Equal(t, commonpb.ErrorCode_Success, stat.GetStatus().GetErrorCode())
+		assert.Equal(t, "", stat.GetStatus().GetReason())
+		assert.NotEqual(t, nil, stat.GetChannelPos())
 
-		stat, err = node.AddSegment(context.WithValue(ctx, ctxKey{}, ""), &datapb.AddSegmentRequest{
+		getFlowGraphServiceAttempts = 3
+		stat, err = node.AddImportSegment(context.WithValue(ctx, ctxKey{}, ""), &datapb.AddImportSegmentRequest{
 			SegmentId:    100,
 			CollectionId: 100,
 			PartitionId:  100,
@@ -585,7 +807,7 @@ func TestDataNode_AddSegment(t *testing.T) {
 			RowNum:       500,
 		})
 		assert.NoError(t, err)
-		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, stat.GetErrorCode())
+		assert.Equal(t, commonpb.ErrorCode_UnexpectedError, stat.GetStatus().GetErrorCode())
 	})
 }
 
@@ -850,7 +1072,7 @@ func TestWatchChannel(t *testing.T) {
 
 func TestDataNode_GetComponentStates(t *testing.T) {
 	n := &DataNode{}
-	n.State.Store(internalpb.StateCode_Healthy)
+	n.stateCode.Store(commonpb.StateCode_Healthy)
 	resp, err := n.GetComponentStates(context.Background())
 	assert.NoError(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, resp.Status.ErrorCode)
@@ -886,17 +1108,41 @@ func TestDataNode_ResendSegmentStats(t *testing.T) {
 		FlushedSegmentIds:   []int64{},
 	}
 
-	err = node.flowgraphManager.addAndStart(node, vChan)
+	err = node.flowgraphManager.addAndStart(node, vChan, nil)
 	require.Nil(t, err)
 
 	fgService, ok := node.flowgraphManager.getFlowgraphService(dmChannelName)
 	assert.True(t, ok)
 
-	err = fgService.replica.addNewSegment(0, 1, 1, dmChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+	err = fgService.replica.addSegment(addSegmentReq{
+		segType:     datapb.SegmentType_New,
+		segID:       0,
+		collID:      1,
+		partitionID: 1,
+		channelName: dmChannelName,
+		startPos:    &internalpb.MsgPosition{},
+		endPos:      &internalpb.MsgPosition{},
+	})
 	assert.Nil(t, err)
-	err = fgService.replica.addNewSegment(1, 1, 2, dmChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+	err = fgService.replica.addSegment(addSegmentReq{
+		segType:     datapb.SegmentType_New,
+		segID:       1,
+		collID:      1,
+		partitionID: 2,
+		channelName: dmChannelName,
+		startPos:    &internalpb.MsgPosition{},
+		endPos:      &internalpb.MsgPosition{},
+	})
 	assert.Nil(t, err)
-	err = fgService.replica.addNewSegment(2, 1, 3, dmChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+	err = fgService.replica.addSegment(addSegmentReq{
+		segType:     datapb.SegmentType_New,
+		segID:       2,
+		collID:      1,
+		partitionID: 3,
+		channelName: dmChannelName,
+		startPos:    &internalpb.MsgPosition{},
+		endPos:      &internalpb.MsgPosition{},
+	})
 	assert.Nil(t, err)
 
 	req := &datapb.ResendSegmentStatsRequest{

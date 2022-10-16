@@ -19,29 +19,26 @@ package datanode
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/retry"
-
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
-	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/types"
-	"github.com/milvus-io/milvus/internal/util/flowgraph"
-
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/flowgraph"
+	"github.com/milvus-io/milvus/internal/util/retry"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var insertNodeTestDir = "/tmp/milvus_test/insert_node"
@@ -65,7 +62,7 @@ func TestFlowGraphInsertBufferNodeCreate(t *testing.T) {
 	defer cancel()
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(insertNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 	insertChannelName := "datanode-01-test-flowgraphinsertbuffernode-create"
 
 	testPath := "/test/datanode/root/meta"
@@ -79,10 +76,18 @@ func TestFlowGraphInsertBufferNodeCreate(t *testing.T) {
 		pkType: schemapb.DataType_Int64,
 	}
 
-	replica, err := newReplica(ctx, mockRootCoord, cm, collMeta.ID)
+	replica, err := newReplica(ctx, mockRootCoord, cm, collMeta.ID, collMeta.GetSchema())
 	assert.Nil(t, err)
-
-	err = replica.addNewSegment(1, collMeta.ID, 0, insertChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:     datapb.SegmentType_New,
+			segID:       1,
+			collID:      collMeta.ID,
+			partitionID: 0,
+			channelName: insertChannelName,
+			startPos:    &internalpb.MsgPosition{},
+			endPos:      &internalpb.MsgPosition{},
+		})
 	require.NoError(t, err)
 
 	factory := dependency.NewDefaultFactory(true)
@@ -154,7 +159,7 @@ func TestFlowGraphInsertBufferNode_Operate(t *testing.T) {
 	insertChannelName := "datanode-01-test-flowgraphinsertbuffernode-operate"
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(insertNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 	testPath := "/test/datanode/root/meta"
 	err := clearEtcd(testPath)
 	require.NoError(t, err)
@@ -166,10 +171,19 @@ func TestFlowGraphInsertBufferNode_Operate(t *testing.T) {
 		pkType: schemapb.DataType_Int64,
 	}
 
-	replica, err := newReplica(ctx, mockRootCoord, cm, collMeta.ID)
+	replica, err := newReplica(ctx, mockRootCoord, cm, collMeta.ID, collMeta.GetSchema())
 	assert.Nil(t, err)
 
-	err = replica.addNewSegment(1, collMeta.ID, 0, insertChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:     datapb.SegmentType_New,
+			segID:       1,
+			collID:      collMeta.ID,
+			partitionID: 0,
+			channelName: insertChannelName,
+			startPos:    &internalpb.MsgPosition{},
+			endPos:      &internalpb.MsgPosition{},
+		})
 	require.NoError(t, err)
 
 	factory := dependency.NewDefaultFactory(true)
@@ -234,7 +248,7 @@ func TestFlowGraphInsertBufferNode_Operate(t *testing.T) {
 	assert.Panics(t, func() { iBNode.Operate([]flowgraph.Msg{&inMsg}) })
 
 	// test flushBufferData failed
-	flowGraphRetryOpt = retry.Attempts(1)
+	setFlowGraphRetryOpt(retry.Attempts(1))
 	inMsg = genFlowGraphInsertMsg(insertChannelName)
 	iBNode.flushManager = &mockFlushManager{returnError: true}
 	iBNode.insertBuffer.Store(inMsg.insertMessages[0].SegmentID, &BufferData{})
@@ -415,7 +429,7 @@ func TestFlowGraphInsertBufferNode_AutoFlush(t *testing.T) {
 	wg := sync.WaitGroup{}
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(insertNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 	fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, colRep, func(pack *segmentFlushPack) {
 		fpMut.Lock()
 		flushPacks = append(flushPacks, pack)
@@ -671,7 +685,7 @@ func TestFlowGraphInsertBufferNode_DropPartition(t *testing.T) {
 	wg := sync.WaitGroup{}
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(insertNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 	fm := NewRendezvousFlushManager(NewAllocatorFactory(), cm, colRep, func(pack *segmentFlushPack) {
 		fpMut.Lock()
 		flushPacks = append(flushPacks, pack)
@@ -908,7 +922,7 @@ func TestInsertBufferNode_bufferInsertMsg(t *testing.T) {
 	}
 
 	cm := storage.NewLocalChunkManager(storage.RootPath(insertNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 	for _, test := range tests {
 		collMeta := Factory.GetCollectionMeta(test.collID, "collection", test.pkType)
 		rcf := &RootCoordFactory{
@@ -919,10 +933,18 @@ func TestInsertBufferNode_bufferInsertMsg(t *testing.T) {
 			compactTs: 100,
 		}
 
-		replica, err := newReplica(ctx, mockRootCoord, cm, collMeta.ID)
+		replica, err := newReplica(ctx, mockRootCoord, cm, collMeta.ID, collMeta.GetSchema())
 		assert.Nil(t, err)
-
-		err = replica.addNewSegment(1, collMeta.ID, 0, insertChannelName, &internalpb.MsgPosition{}, &internalpb.MsgPosition{Timestamp: 101})
+		err = replica.addSegment(
+			addSegmentReq{
+				segType:     datapb.SegmentType_New,
+				segID:       1,
+				collID:      collMeta.ID,
+				partitionID: 0,
+				channelName: insertChannelName,
+				startPos:    &internalpb.MsgPosition{},
+				endPos:      &internalpb.MsgPosition{Timestamp: 101},
+			})
 		require.NoError(t, err)
 
 		factory := dependency.NewDefaultFactory(true)
@@ -957,8 +979,10 @@ func TestInsertBufferNode_bufferInsertMsg(t *testing.T) {
 }
 
 func TestInsertBufferNode_updateSegStatesInReplica(te *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	cm := storage.NewLocalChunkManager(storage.RootPath(insertNodeTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 	invalideTests := []struct {
 		replicaCollID UniqueID
 
@@ -970,7 +994,7 @@ func TestInsertBufferNode_updateSegStatesInReplica(te *testing.T) {
 	}
 
 	for _, test := range invalideTests {
-		replica, err := newReplica(context.Background(), &RootCoordFactory{pkType: schemapb.DataType_Int64}, cm, test.replicaCollID)
+		replica, err := newReplica(context.Background(), &RootCoordFactory{pkType: schemapb.DataType_Int64}, cm, test.replicaCollID, nil)
 		assert.Nil(te, err)
 
 		ibNode := &insertBufferNode{
@@ -1030,6 +1054,100 @@ func TestInsertBufferNode_BufferData(te *testing.T) {
 				assert.Nil(t, idata)
 			}
 		})
+	}
+}
 
+func TestInsertBufferNode_BufferData_updateTimeRange(t *testing.T) {
+	Params.DataNodeCfg.FlushInsertBufferSize = 16 * (1 << 20) // 16 MB
+
+	type testCase struct {
+		tag string
+
+		trs        []TimeRange
+		expectFrom Timestamp
+		expectTo   Timestamp
+	}
+
+	cases := []testCase{
+		{
+			tag:        "no input range",
+			expectTo:   0,
+			expectFrom: math.MaxUint64,
+		},
+		{
+			tag: "single range",
+			trs: []TimeRange{
+				{timestampMin: 100, timestampMax: 200},
+			},
+			expectFrom: 100,
+			expectTo:   200,
+		},
+		{
+			tag: "multiple range",
+			trs: []TimeRange{
+				{timestampMin: 150, timestampMax: 250},
+				{timestampMin: 100, timestampMax: 200},
+				{timestampMin: 50, timestampMax: 180},
+			},
+			expectFrom: 50,
+			expectTo:   250,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tag, func(t *testing.T) {
+			bd, err := newBufferData(16)
+			require.NoError(t, err)
+			for _, tr := range tc.trs {
+				bd.updateTimeRange(tr)
+			}
+
+			assert.Equal(t, tc.expectFrom, bd.tsFrom)
+			assert.Equal(t, tc.expectTo, bd.tsTo)
+		})
+	}
+}
+
+func TestInsertBufferNode_getTimestampRange(t *testing.T) {
+
+	type testCase struct {
+		tag string
+
+		timestamps []int64
+		expectFrom Timestamp
+		expectTo   Timestamp
+	}
+
+	cases := []testCase{
+		{
+			tag:        "no input",
+			timestamps: []int64{},
+			expectFrom: math.MaxUint64,
+			expectTo:   0,
+		},
+		{
+			tag:        "only one input",
+			timestamps: []int64{1234},
+			expectFrom: 1234,
+			expectTo:   1234,
+		},
+		{
+			tag:        "input reverse order",
+			timestamps: []int64{3, 2, 1},
+			expectFrom: 1,
+			expectTo:   3,
+		},
+	}
+
+	ibNode := &insertBufferNode{}
+	for _, tc := range cases {
+		t.Run(tc.tag, func(t *testing.T) {
+			tr := ibNode.getTimestampRange(&storage.Int64FieldData{
+				Data: tc.timestamps,
+			})
+
+			assert.Equal(t, tc.expectFrom, tr.timestampMin)
+			assert.Equal(t, tc.expectTo, tr.timestampMax)
+		})
 	}
 }

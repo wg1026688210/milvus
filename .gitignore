@@ -8,6 +8,7 @@
 **/cmake-build-release/*
 **/cmake_build_release/*
 **/cmake_build/*
+.cache
 
 internal/core/output/*
 internal/core/build/*
@@ -88,3 +89,6 @@ deployments/docker/*/volumes
 # rocksdb
 cwrapper_rocksdb_build/
 internal/kv/rocksdb/cwrapper/
+
+# local file data
+**/data/*

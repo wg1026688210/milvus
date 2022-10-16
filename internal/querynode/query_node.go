@@ -17,11 +17,12 @@
 package querynode
 
 /*
-#cgo pkg-config: milvus_segcore
+#cgo pkg-config: milvus_segcore milvus_common
 
 #include "segcore/collection_c.h"
 #include "segcore/segment_c.h"
 #include "segcore/segcore_init_c.h"
+#include "common/init_c.h"
 
 */
 import "C"
@@ -29,9 +30,12 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -40,20 +44,22 @@ import (
 	"unsafe"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/panjf2000/ants/v2"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
-	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
-
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util"
+	"github.com/milvus-io/milvus/internal/util/concurrency"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/internal/util/initcore"
+	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
@@ -66,6 +72,9 @@ var _ types.QueryNode = (*QueryNode)(nil)
 var _ types.QueryNodeComponent = (*QueryNode)(nil)
 
 var Params paramtable.ComponentParam
+
+// rateCol is global rateCollector in QueryNode.
+var rateCol *rateCollector
 
 // QueryNode communicates with outside services and union all
 // services in querynode package.
@@ -107,13 +116,15 @@ type QueryNode struct {
 	eventCh <-chan *sessionutil.SessionEvent
 
 	vectorStorage storage.ChunkManager
-	cacheStorage  storage.ChunkManager
 	etcdKV        *etcdkv.EtcdKV
 
 	// shard cluster service, handle shard leader functions
 	ShardClusterService *ShardClusterService
 	//shard query service, handles shard-level query & search
 	queryShardService *queryShardService
+
+	// cgoPool is the worker pool to control concurrency of cgo call
+	cgoPool *concurrency.Pool
 }
 
 // NewQueryNode will return a QueryNode with abnormal state.
@@ -127,7 +138,7 @@ func NewQueryNode(ctx context.Context, factory dependency.Factory) *QueryNode {
 
 	node.tSafeReplica = newTSafeReplica()
 	node.scheduler = newTaskScheduler(ctx1, node.tSafeReplica)
-	node.UpdateStateCode(internalpb.StateCode_Abnormal)
+	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 
 	return node
 }
@@ -166,6 +177,20 @@ func (node *QueryNode) Register() error {
 	return nil
 }
 
+// initRateCollector creates and starts rateCollector in QueryNode.
+func (node *QueryNode) initRateCollector() error {
+	var err error
+	rateCol, err = newRateCollector()
+	if err != nil {
+		return err
+	}
+	rateCol.Register(metricsinfo.NQPerSecond)
+	rateCol.Register(metricsinfo.SearchThroughput)
+	rateCol.Register(metricsinfo.InsertConsumeThroughput)
+	rateCol.Register(metricsinfo.DeleteConsumeThroughput)
+	return nil
+}
+
 // InitSegcore set init params of segCore, such as chunckRows, SIMD type...
 func (node *QueryNode) InitSegcore() {
 	cEasyloggingYaml := C.CString(path.Join(Params.BaseTable.GetConfigDir(), paramtable.DefaultEasyloggingYaml))
@@ -192,6 +217,8 @@ func (node *QueryNode) InitSegcore() {
 	// override segcore index slice size
 	cIndexSliceSize := C.int64_t(Params.CommonCfg.IndexSliceSize)
 	C.SegcoreSetIndexSliceSize(cIndexSliceSize)
+
+	initcore.InitLocalStorageConfig(&Params)
 }
 
 // Init function init historical and streaming module to manage segments
@@ -209,16 +236,17 @@ func (node *QueryNode) Init() error {
 
 		node.factory.Init(&Params)
 
-		node.vectorStorage, err = node.factory.NewVectorStorageChunkManager(node.queryNodeLoopCtx)
+		err = node.initRateCollector()
 		if err != nil {
-			log.Error("QueryNode init vector storage failed", zap.Error(err))
+			log.Error("QueryNode init rateCollector failed", zap.Int64("nodeID", Params.QueryNodeCfg.GetNodeID()), zap.Error(err))
 			initError = err
 			return
 		}
+		log.Info("QueryNode init rateCollector done", zap.Int64("nodeID", Params.QueryNodeCfg.GetNodeID()))
 
-		node.cacheStorage, err = node.factory.NewCacheStorageChunkManager(node.queryNodeLoopCtx)
+		node.vectorStorage, err = node.factory.NewPersistentStorageChunkManager(node.queryNodeLoopCtx)
 		if err != nil {
-			log.Error("QueryNode init cache storage failed", zap.Error(err))
+			log.Error("QueryNode init vector storage failed", zap.Error(err))
 			initError = err
 			return
 		}
@@ -226,13 +254,39 @@ func (node *QueryNode) Init() error {
 		node.etcdKV = etcdkv.NewEtcdKV(node.etcdCli, Params.EtcdCfg.MetaRootPath)
 		log.Info("queryNode try to connect etcd success", zap.Any("MetaRootPath", Params.EtcdCfg.MetaRootPath))
 
-		node.metaReplica = newCollectionReplica()
+		cpuNum := runtime.GOMAXPROCS(0)
+		node.cgoPool, err = concurrency.NewPool(cpuNum, ants.WithPreAlloc(true),
+			ants.WithExpiryDuration(math.MaxInt64))
+		if err != nil {
+			log.Error("QueryNode init cgo pool failed", zap.Error(err))
+			initError = err
+			return
+		}
+
+		// ensure every cgopool go routine is locked with a OS thread
+		// so openmp in knowhere won't create too much request
+		sig := make(chan struct{})
+		wg := sync.WaitGroup{}
+		wg.Add(cpuNum)
+		for i := 0; i < cpuNum; i++ {
+			node.cgoPool.Submit(func() (interface{}, error) {
+				runtime.LockOSThread()
+				wg.Done()
+				<-sig
+				return nil, nil
+			})
+		}
+		wg.Wait()
+		close(sig)
+
+		node.metaReplica = newCollectionReplica(node.cgoPool)
 
 		node.loader = newSegmentLoader(
 			node.metaReplica,
 			node.etcdKV,
 			node.vectorStorage,
-			node.factory)
+			node.factory,
+			node.cgoPool)
 
 		node.dataSyncService = newDataSyncService(node.queryNodeLoopCtx, node.metaReplica, node.tSafeReplica, node.factory)
 
@@ -259,13 +313,17 @@ func (node *QueryNode) Start() error {
 	// create shardClusterService for shardLeader functions.
 	node.ShardClusterService = newShardClusterService(node.etcdCli, node.session, node)
 	// create shard-level query service
-	node.queryShardService = newQueryShardService(node.queryNodeLoopCtx, node.metaReplica, node.tSafeReplica,
+	queryShardService, err := newQueryShardService(node.queryNodeLoopCtx, node.metaReplica, node.tSafeReplica,
 		node.ShardClusterService, node.factory, node.scheduler)
+	if err != nil {
+		return err
+	}
+	node.queryShardService = queryShardService
 
 	Params.QueryNodeCfg.CreatedTime = time.Now()
 	Params.QueryNodeCfg.UpdatedTime = time.Now()
 
-	node.UpdateStateCode(internalpb.StateCode_Healthy)
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
 	log.Info("query node start successfully",
 		zap.Any("queryNodeID", Params.QueryNodeCfg.GetNodeID()),
 		zap.Any("IP", Params.QueryNodeCfg.QueryNodeIP),
@@ -277,7 +335,7 @@ func (node *QueryNode) Start() error {
 // Stop mainly stop QueryNode's query service, historical loop and streaming loop.
 func (node *QueryNode) Stop() error {
 	log.Warn("Query node stop..")
-	node.UpdateStateCode(internalpb.StateCode_Abnormal)
+	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 	node.queryNodeLoopCancel()
 
 	// close services
@@ -299,7 +357,7 @@ func (node *QueryNode) Stop() error {
 }
 
 // UpdateStateCode updata the state of query node, which can be initializing, healthy, and abnormal
-func (node *QueryNode) UpdateStateCode(code internalpb.StateCode) {
+func (node *QueryNode) UpdateStateCode(code commonpb.StateCode) {
 	node.stateCode.Store(code)
 }
 
@@ -330,7 +388,7 @@ func (node *QueryNode) watchChangeInfo() {
 					return
 				}
 				// if watch loop return due to event canceled, the datanode is not functional anymore
-				log.Panic("querynoe3 is not functional for event canceled", zap.Error(err))
+				log.Panic("querynode is not functional for event canceled", zap.Error(err))
 				return
 			}
 			for _, event := range resp.Events {

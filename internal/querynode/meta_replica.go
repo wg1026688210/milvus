@@ -31,14 +31,30 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/metrics"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/internal/util/concurrency"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/samber/lo"
 )
+
+var (
+	ErrSegmentNotFound    = errors.New("SegmentNotFound")
+	ErrCollectionNotFound = errors.New("CollectionNotFound")
+)
+
+func WrapSegmentNotFound(segmentID int64) error {
+	return fmt.Errorf("%w(%v)", ErrSegmentNotFound, segmentID)
+}
+
+func WrapCollectionNotFound(collectionID int64) error {
+	return fmt.Errorf("%w(%v)", ErrCollectionNotFound, collectionID)
+}
 
 // ReplicaInterface specifies all the methods that the Collection object needs to implement in QueryNode.
 // In common cases, the system has multiple query nodes. The full data of a collection will be distributed
@@ -85,7 +101,7 @@ type ReplicaInterface interface {
 
 	// segment
 	// addSegment add a new segment to collectionReplica
-	addSegment(segmentID UniqueID, partitionID UniqueID, collectionID UniqueID, vChannelID Channel, segType segmentType) error
+	addSegment(segmentID UniqueID, partitionID UniqueID, collectionID UniqueID, vChannelID Channel, version UniqueID, segType segmentType) error
 	// setSegment adds a segment to collectionReplica
 	setSegment(segment *Segment) error
 	// removeSegment removes a segment from collectionReplica
@@ -113,6 +129,14 @@ type ReplicaInterface interface {
 	freeAll()
 	// printReplica prints the collections, partitions and segments in the collectionReplica
 	printReplica()
+
+	// addSegmentsLoadingList add segment into black list, so get sealed segments will not return them.
+	addSegmentsLoadingList(segmentIDs []UniqueID)
+	// removeSegmentsLoadingList add segment into black list, so get sealed segments will not return them.
+	removeSegmentsLoadingList(segmentIDs []UniqueID)
+
+	getGrowingSegments() []*Segment
+	getSealedSegments() []*Segment
 }
 
 // collectionReplica is the data replication of memory data in query node.
@@ -125,6 +149,11 @@ type metaReplica struct {
 	sealedSegments  map[UniqueID]*Segment
 
 	excludedSegments map[UniqueID][]*datapb.SegmentInfo // map[collectionID]segmentIDs
+
+	// segmentsBlackList stores segments which are still loading
+	segmentsBlackList typeutil.UniqueSet
+
+	cgoPool *concurrency.Pool
 }
 
 // getSegmentsMemSize get the memory size in bytes of all the Segments
@@ -202,7 +231,7 @@ func (replica *metaReplica) removeCollectionPrivate(collectionID UniqueID) error
 	// delete partitions
 	for _, partitionID := range collection.partitionIDs {
 		// ignore error, try to delete
-		_ = replica.removePartitionPrivate(partitionID, true)
+		_ = replica.removePartitionPrivate(partitionID)
 	}
 
 	deleteCollection(collection)
@@ -224,7 +253,7 @@ func (replica *metaReplica) getCollectionByID(collectionID UniqueID) (*Collectio
 func (replica *metaReplica) getCollectionByIDPrivate(collectionID UniqueID) (*Collection, error) {
 	collection, ok := replica.collections[collectionID]
 	if !ok {
-		return nil, fmt.Errorf("collection hasn't been loaded or has been released, collection id = %d", collectionID)
+		return nil, fmt.Errorf("collection hasn't been loaded or has been released %w", WrapCollectionNotFound(collectionID))
 	}
 
 	return collection, nil
@@ -390,12 +419,7 @@ func (replica *metaReplica) addPartitionPrivate(collectionID UniqueID, partition
 func (replica *metaReplica) removePartition(partitionID UniqueID) error {
 	replica.mu.Lock()
 	defer replica.mu.Unlock()
-	return replica.removePartitionPrivate(partitionID, false)
-}
 
-// removePartitionPrivate is the private function in collectionReplica, to remove the partition from collectionReplica
-// `locked` flag indicates whether corresponding collection lock is accquired before calling this method
-func (replica *metaReplica) removePartitionPrivate(partitionID UniqueID, locked bool) error {
 	partition, err := replica.getPartitionByIDPrivate(partitionID)
 	if err != nil {
 		return err
@@ -405,10 +429,23 @@ func (replica *metaReplica) removePartitionPrivate(partitionID UniqueID, locked 
 	if err != nil {
 		return err
 	}
+	collection.Lock()
+	defer collection.Unlock()
 
-	if !locked {
-		collection.Lock()
-		defer collection.Unlock()
+	return replica.removePartitionPrivate(partitionID)
+}
+
+// removePartitionPrivate is the private function in collectionReplica, to remove the partition from collectionReplica
+// `locked` flag indicates whether corresponding collection lock is accquired before calling this method
+func (replica *metaReplica) removePartitionPrivate(partitionID UniqueID) error {
+	partition, err := replica.getPartitionByIDPrivate(partitionID)
+	if err != nil {
+		return err
+	}
+
+	collection, err := replica.getCollectionByIDPrivate(partition.collectionID)
+	if err != nil {
+		return err
 	}
 
 	// delete segments
@@ -522,7 +559,7 @@ func (replica *metaReplica) getSegmentIDsPrivate(partitionID UniqueID, segType s
 
 //----------------------------------------------------------------------------------------------------- segment
 // addSegment add a new segment to collectionReplica
-func (replica *metaReplica) addSegment(segmentID UniqueID, partitionID UniqueID, collectionID UniqueID, vChannelID Channel, segType segmentType) error {
+func (replica *metaReplica) addSegment(segmentID UniqueID, partitionID UniqueID, collectionID UniqueID, vChannelID Channel, version UniqueID, segType segmentType) error {
 	replica.mu.Lock()
 	defer replica.mu.Unlock()
 
@@ -530,7 +567,7 @@ func (replica *metaReplica) addSegment(segmentID UniqueID, partitionID UniqueID,
 	if err != nil {
 		return err
 	}
-	seg, err := newSegment(collection, segmentID, partitionID, collectionID, vChannelID, segType)
+	seg, err := newSegment(collection, segmentID, partitionID, collectionID, vChannelID, segType, version, replica.cgoPool)
 	if err != nil {
 		return err
 	}
@@ -593,6 +630,25 @@ func (replica *metaReplica) setSegment(segment *Segment) error {
 func (replica *metaReplica) removeSegment(segmentID UniqueID, segType segmentType) {
 	replica.mu.Lock()
 	defer replica.mu.Unlock()
+
+	switch segType {
+	case segmentTypeGrowing:
+		if segment, ok := replica.growingSegments[segmentID]; ok {
+			if collection, ok := replica.collections[segment.collectionID]; ok {
+				collection.RLock()
+				defer collection.RUnlock()
+			}
+		}
+	case segmentTypeSealed:
+		if segment, ok := replica.sealedSegments[segmentID]; ok {
+			if collection, ok := replica.collections[segment.collectionID]; ok {
+				collection.RLock()
+				defer collection.RUnlock()
+			}
+		}
+	default:
+		panic(fmt.Sprintf("unsupported segment type %s", segType.String()))
+	}
 	replica.removeSegmentPrivate(segmentID, segType)
 }
 
@@ -642,13 +698,13 @@ func (replica *metaReplica) getSegmentByIDPrivate(segmentID UniqueID, segType se
 	case segmentTypeGrowing:
 		segment, ok := replica.growingSegments[segmentID]
 		if !ok {
-			return nil, fmt.Errorf("cannot find growing segment %d in QueryNode", segmentID)
+			return nil, fmt.Errorf("growing %w", WrapSegmentNotFound(segmentID))
 		}
 		return segment, nil
 	case segmentTypeSealed:
 		segment, ok := replica.sealedSegments[segmentID]
 		if !ok {
-			return nil, fmt.Errorf("cannot find sealed segment %d in QueryNode", segmentID)
+			return nil, fmt.Errorf("sealed %w", WrapSegmentNotFound(segmentID))
 		}
 		return segment, nil
 	default:
@@ -746,8 +802,50 @@ func (replica *metaReplica) freeAll() {
 	replica.sealedSegments = make(map[UniqueID]*Segment)
 }
 
+func (replica *metaReplica) addSegmentsLoadingList(segmentIDs []UniqueID) {
+	replica.mu.Lock()
+	defer replica.mu.Unlock()
+
+	// add to black list only segment is not loaded before
+	replica.segmentsBlackList.Insert(lo.Filter(segmentIDs, func(id UniqueID, idx int) bool {
+		_, isSealed := replica.sealedSegments[id]
+		return !isSealed
+	})...)
+}
+
+func (replica *metaReplica) removeSegmentsLoadingList(segmentIDs []UniqueID) {
+	replica.mu.Lock()
+	defer replica.mu.Unlock()
+
+	replica.segmentsBlackList.Remove(segmentIDs...)
+}
+
+func (replica *metaReplica) getGrowingSegments() []*Segment {
+	replica.mu.RLock()
+	defer replica.mu.RUnlock()
+
+	ret := make([]*Segment, 0, len(replica.growingSegments))
+	for _, s := range replica.growingSegments {
+		ret = append(ret, s)
+	}
+	return ret
+}
+
+func (replica *metaReplica) getSealedSegments() []*Segment {
+	replica.mu.RLock()
+	defer replica.mu.RUnlock()
+
+	ret := make([]*Segment, 0, len(replica.sealedSegments))
+	for _, s := range replica.sealedSegments {
+		if !replica.segmentsBlackList.Contain(s.segmentID) {
+			ret = append(ret, s)
+		}
+	}
+	return ret
+}
+
 // newCollectionReplica returns a new ReplicaInterface
-func newCollectionReplica() ReplicaInterface {
+func newCollectionReplica(pool *concurrency.Pool) ReplicaInterface {
 	var replica ReplicaInterface = &metaReplica{
 		collections:     make(map[UniqueID]*Collection),
 		partitions:      make(map[UniqueID]*Partition),
@@ -755,6 +853,10 @@ func newCollectionReplica() ReplicaInterface {
 		sealedSegments:  make(map[UniqueID]*Segment),
 
 		excludedSegments: make(map[UniqueID][]*datapb.SegmentInfo),
+
+		segmentsBlackList: make(typeutil.UniqueSet),
+
+		cgoPool: pool,
 	}
 
 	return replica
@@ -785,7 +887,7 @@ func (replica *metaReplica) getSegmentInfo(segment *Segment) *querypb.SegmentInf
 		IndexName:    indexName,
 		IndexID:      indexID,
 		DmChannel:    segment.vChannelID,
-		SegmentState: segment.segmentType,
+		SegmentState: segment.getType(),
 		IndexInfos:   indexInfos,
 		NodeIds:      []UniqueID{Params.QueryNodeCfg.GetNodeID()},
 	}

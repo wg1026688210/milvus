@@ -41,6 +41,7 @@ type readTask interface {
 	CanMergeWith(readTask) bool
 	CPUUsage() int32
 	Timeout() bool
+	TimeoutError() error
 
 	SetMaxCPUUsage(int32)
 	SetStep(step TaskStep)
@@ -64,6 +65,8 @@ type baseReadTask struct {
 	step               TaskStep
 	queueDur           time.Duration
 	reduceDur          time.Duration
+	waitTsDur          time.Duration
+	waitTSafeTr        *timerecord.TimeRecorder
 	tr                 *timerecord.TimeRecorder
 }
 
@@ -130,9 +133,16 @@ func (b *baseReadTask) Timeout() bool {
 	return !funcutil.CheckCtxValid(b.Ctx())
 }
 
+func (b *baseReadTask) TimeoutError() error {
+	return b.ctx.Err()
+}
+
 func (b *baseReadTask) Ready() (bool, error) {
+	if b.waitTSafeTr == nil {
+		b.waitTSafeTr = timerecord.NewTimeRecorder("waitTSafeTimeRecorder")
+	}
 	if b.Timeout() {
-		return false, fmt.Errorf("deadline exceed")
+		return false, b.TimeoutError()
 	}
 	var channel Channel
 	if b.DataScope == querypb.DataScope_Streaming {
@@ -165,5 +175,6 @@ func (b *baseReadTask) Ready() (bool, error) {
 		zap.Any("delta milliseconds", gt.Sub(st).Milliseconds()),
 		zap.Any("channel", channel),
 		zap.Any("msgID", b.ID()))
+	b.waitTsDur = b.waitTSafeTr.ElapseSpan()
 	return true, nil
 }

@@ -22,7 +22,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/internal/common"
+
+	"github.com/milvus-io/milvus/internal/util/tsoutil"
+
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/stretchr/testify/assert"
 )
@@ -49,7 +54,7 @@ func (h *spyCompactionHandler) getCompaction(planID int64) *compactionTask {
 }
 
 // expireCompaction set the compaction state to expired
-func (h *spyCompactionHandler) expireCompaction(ts Timestamp) error {
+func (h *spyCompactionHandler) updateCompaction(ts Timestamp) error {
 	panic("not implemented") // TODO: Implement
 }
 
@@ -78,17 +83,21 @@ func Test_compactionTrigger_force(t *testing.T) {
 		globalTrigger     *time.Ticker
 		segRefer          *SegmentReferenceManager
 	}
-	type args struct {
-		collectionID int64
-		compactTime  *compactTime
-	}
+
 	Params.Init()
+	Params.CommonCfg.RetentionDuration = 200
+
+	pts, _ := tsoutil.ParseTS(0)
+	ttRetention := pts.Add(-time.Duration(Params.CommonCfg.RetentionDuration) * time.Second)
+	timeTravel := tsoutil.ComposeTS(ttRetention.UnixNano()/int64(time.Millisecond), 0)
+
+	vecFieldID := int64(201)
 	tests := []struct {
-		name      string
-		fields    fields
-		args      args
-		wantErr   bool
-		wantPlans []*datapb.CompactionPlan
+		name         string
+		fields       fields
+		collectionID UniqueID
+		wantErr      bool
+		wantPlans    []*datapb.CompactionPlan
 	}{
 		{
 			"test force compaction",
@@ -148,23 +157,141 @@ func Test_compactionTrigger_force(t *testing.T) {
 									},
 								},
 							},
+							3: {
+								SegmentInfo: &datapb.SegmentInfo{
+									ID:             3,
+									CollectionID:   1111,
+									PartitionID:    1,
+									LastExpireTime: 100,
+									NumOfRows:      100,
+									MaxRowNum:      300,
+									InsertChannel:  "ch1",
+									State:          commonpb.SegmentState_Flushed,
+								},
+							},
+						},
+					},
+					collections: map[int64]*collectionInfo{
+						2: {
+							ID: 2,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+									},
+								},
+							},
+							Properties: map[string]string{
+								common.CollectionTTLConfigKey: "0",
+							},
+						},
+						1111: {
+							ID: 1111,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+										TypeParams: []*commonpb.KeyValuePair{
+											{
+												Key:   "dim",
+												Value: "128",
+											},
+										},
+									},
+								},
+							},
+							Properties: map[string]string{
+								common.CollectionTTLConfigKey: "error",
+							},
+						},
+						1000: {
+							ID: 1000,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+										TypeParams: []*commonpb.KeyValuePair{
+											{
+												Key:   "dim",
+												Value: "128",
+											},
+										},
+									},
+								},
+							},
+						},
+						// error (has no vector field)
+						2000: {
+							ID: 2000,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_Int16,
+									},
+								},
+							},
+						},
+						// error (has no dim)
+						3000: {
+							ID: 3000,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+										TypeParams: []*commonpb.KeyValuePair{
+											{},
+										},
+									},
+								},
+							},
+						},
+						// error (dim parse fail)
+						4000: {
+							ID: 4000,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+										TypeParams: []*commonpb.KeyValuePair{
+											{
+												Key:   "dim",
+												Value: "128error",
+											},
+										},
+									},
+								},
+							},
+						},
+						10000: {
+							ID: 10000,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+									},
+								},
+							},
 						},
 					},
 				},
-				newMockAllocator(),
+				&MockAllocator0{},
 				nil,
 				&spyCompactionHandler{spyChan: make(chan *datapb.CompactionPlan, 1)},
 				nil,
 				&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}},
 			},
-			args{
-				2,
-				&compactTime{travelTime: 200, expireTime: 0},
-			},
+			2,
 			false,
 			[]*datapb.CompactionPlan{
 				{
-					PlanID: 2,
+					PlanID: 0,
 					SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
 						{
 							SegmentID: 1,
@@ -203,10 +330,10 @@ func Test_compactionTrigger_force(t *testing.T) {
 							},
 						},
 					},
-					StartTime:        3,
+					StartTime:        0,
 					TimeoutInSeconds: Params.DataCoordCfg.CompactionTimeoutInSeconds,
 					Type:             datapb.CompactionType_MixCompaction,
-					Timetravel:       200,
+					Timetravel:       timeTravel,
 					Channel:          "ch1",
 				},
 			},
@@ -214,20 +341,301 @@ func Test_compactionTrigger_force(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			indexCoord := newMockIndexCoord()
+
 			tr := &compactionTrigger{
 				meta:              tt.fields.meta,
+				handler:           newMockHandlerWithMeta(tt.fields.meta),
 				allocator:         tt.fields.allocator,
 				signals:           tt.fields.signals,
 				compactionHandler: tt.fields.compactionHandler,
 				globalTrigger:     tt.fields.globalTrigger,
 				segRefer:          tt.fields.segRefer,
+				indexCoord:        indexCoord,
 			}
-			_, err := tr.forceTriggerCompaction(tt.args.collectionID, tt.args.compactTime)
+			_, err := tr.forceTriggerCompaction(tt.collectionID)
 			assert.Equal(t, tt.wantErr, err != nil)
 			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
 			plan := <-spy.spyChan
 			sortPlanCompactionBinlogs(plan)
 			assert.EqualValues(t, tt.wantPlans[0], plan)
+		})
+
+		t.Run(tt.name+" with DiskANN index", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			segmentIDs := make([]int64, 0)
+			for _, segment := range tt.fields.meta.segments.GetSegments() {
+				segmentIDs = append(segmentIDs, segment.GetID())
+				// Collection 1000 means it has DiskANN index
+				segment.CollectionID = 1000
+			}
+			tr := &compactionTrigger{
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 tt.fields.allocator,
+				signals:                   tt.fields.signals,
+				compactionHandler:         tt.fields.compactionHandler,
+				globalTrigger:             tt.fields.globalTrigger,
+				segRefer:                  tt.fields.segRefer,
+				indexCoord:                indexCood,
+				estimateDiskSegmentPolicy: calBySchemaPolicyWithDiskIndex,
+			}
+			tt.collectionID = 1000
+			_, err := tr.forceTriggerCompaction(tt.collectionID)
+			assert.Equal(t, tt.wantErr, err != nil)
+			// expect max row num =  2048*1024*1024/(128*4) = 4194304
+			assert.EqualValues(t, 4194304, tt.fields.meta.segments.GetSegments()[0].MaxRowNum)
+			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+			<-spy.spyChan
+		})
+
+		t.Run(tt.name+" with no filtered segments", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			segmentIDs := make([]int64, 0)
+			for _, segment := range tt.fields.meta.segments.GetSegments() {
+				segmentIDs = append(segmentIDs, segment.GetID())
+				// Collection 2000 means has no vector field
+				segment.CollectionID = 2000
+			}
+			tr := &compactionTrigger{
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 tt.fields.allocator,
+				signals:                   tt.fields.signals,
+				compactionHandler:         tt.fields.compactionHandler,
+				globalTrigger:             tt.fields.globalTrigger,
+				segRefer:                  tt.fields.segRefer,
+				indexCoord:                indexCood,
+				estimateDiskSegmentPolicy: calBySchemaPolicyWithDiskIndex,
+			}
+			tt.collectionID = 2000
+			_, err := tr.forceTriggerCompaction(tt.collectionID)
+			assert.Equal(t, tt.wantErr, err != nil)
+			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+			hasPlan := true
+			select {
+			case <-spy.spyChan:
+				hasPlan = true
+			case <-time.After(2 * time.Second):
+				hasPlan = false
+			}
+			assert.Equal(t, false, hasPlan)
+		})
+
+		t.Run(tt.name+" with meta error", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			segmentIDs := make([]int64, 0)
+			for _, segment := range tt.fields.meta.segments.GetSegments() {
+				segmentIDs = append(segmentIDs, segment.GetID())
+				// Collection 3000 means field has no dim info
+				segment.CollectionID = 3000
+			}
+			tr := &compactionTrigger{
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 tt.fields.allocator,
+				signals:                   tt.fields.signals,
+				compactionHandler:         tt.fields.compactionHandler,
+				globalTrigger:             tt.fields.globalTrigger,
+				segRefer:                  tt.fields.segRefer,
+				indexCoord:                indexCood,
+				estimateDiskSegmentPolicy: calBySchemaPolicyWithDiskIndex,
+			}
+			tt.collectionID = 3000
+			_, err := tr.forceTriggerCompaction(tt.collectionID)
+			assert.Equal(t, tt.wantErr, err != nil)
+			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+			hasPlan := true
+			select {
+			case <-spy.spyChan:
+				hasPlan = true
+			case <-time.After(2 * time.Second):
+				hasPlan = false
+			}
+			assert.Equal(t, false, hasPlan)
+		})
+
+		t.Run(tt.name+" with meta error", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			segmentIDs := make([]int64, 0)
+			for _, segment := range tt.fields.meta.segments.GetSegments() {
+				segmentIDs = append(segmentIDs, segment.GetID())
+				// Collection 4000 means field has dim mistake
+				segment.CollectionID = 4000
+			}
+			tr := &compactionTrigger{
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 tt.fields.allocator,
+				signals:                   tt.fields.signals,
+				compactionHandler:         tt.fields.compactionHandler,
+				globalTrigger:             tt.fields.globalTrigger,
+				segRefer:                  tt.fields.segRefer,
+				indexCoord:                indexCood,
+				estimateDiskSegmentPolicy: calBySchemaPolicyWithDiskIndex,
+			}
+			tt.collectionID = 4000
+			_, err := tr.forceTriggerCompaction(tt.collectionID)
+			assert.Equal(t, tt.wantErr, err != nil)
+			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+			hasPlan := true
+			select {
+			case <-spy.spyChan:
+				hasPlan = true
+			case <-time.After(2 * time.Second):
+				hasPlan = false
+			}
+			assert.Equal(t, false, hasPlan)
+		})
+
+		t.Run(tt.name+" with index info error", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			segmentIDs := make([]int64, 0)
+			for _, segment := range tt.fields.meta.segments.GetSegments() {
+				segmentIDs = append(segmentIDs, segment.GetID())
+				// Collection 10000 means it has DescribeIndexInfo error
+				segment.CollectionID = 10000
+			}
+			tr := &compactionTrigger{
+				meta:              tt.fields.meta,
+				handler:           newMockHandlerWithMeta(tt.fields.meta),
+				allocator:         tt.fields.allocator,
+				signals:           tt.fields.signals,
+				compactionHandler: tt.fields.compactionHandler,
+				globalTrigger:     tt.fields.globalTrigger,
+				segRefer:          tt.fields.segRefer,
+				indexCoord:        indexCood,
+			}
+			tt.collectionID = 10000
+			_, err := tr.forceTriggerCompaction(tt.collectionID)
+			assert.Equal(t, tt.wantErr, err != nil)
+			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+			hasPlan := true
+			select {
+			case <-spy.spyChan:
+				hasPlan = true
+			case <-time.After(2 * time.Second):
+				hasPlan = false
+			}
+
+			assert.Equal(t, false, hasPlan)
+
+		})
+		t.Run(tt.name+" with allocate ts error", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			tr := &compactionTrigger{
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 &FailsAllocator{allocIDSucceed: true},
+				signals:                   tt.fields.signals,
+				compactionHandler:         tt.fields.compactionHandler,
+				globalTrigger:             tt.fields.globalTrigger,
+				segRefer:                  tt.fields.segRefer,
+				indexCoord:                indexCood,
+				estimateDiskSegmentPolicy: calBySchemaPolicyWithDiskIndex,
+			}
+
+			{
+				// test alloc ts fail for handle global signal
+				signal := &compactionSignal{
+					id:           0,
+					isForce:      true,
+					isGlobal:     true,
+					collectionID: tt.collectionID,
+				}
+				tr.handleGlobalSignal(signal)
+
+				spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+				hasPlan := true
+				select {
+				case <-spy.spyChan:
+					hasPlan = true
+				case <-time.After(2 * time.Second):
+					hasPlan = false
+				}
+				assert.Equal(t, false, hasPlan)
+			}
+
+			{
+				// test alloc ts fail for handle signal
+				signal := &compactionSignal{
+					id:           0,
+					isForce:      true,
+					collectionID: tt.collectionID,
+					segmentID:    3,
+				}
+				tr.handleSignal(signal)
+
+				spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+				hasPlan := true
+				select {
+				case <-spy.spyChan:
+					hasPlan = true
+				case <-time.After(2 * time.Second):
+					hasPlan = false
+				}
+				assert.Equal(t, false, hasPlan)
+			}
+		})
+
+		t.Run(tt.name+" with getCompact error", func(t *testing.T) {
+			indexCood := newMockIndexCoord()
+			for _, segment := range tt.fields.meta.segments.GetSegments() {
+				segment.CollectionID = 1111
+			}
+			tr := &compactionTrigger{
+				meta:                      tt.fields.meta,
+				handler:                   newMockHandlerWithMeta(tt.fields.meta),
+				allocator:                 tt.fields.allocator,
+				signals:                   tt.fields.signals,
+				compactionHandler:         tt.fields.compactionHandler,
+				globalTrigger:             tt.fields.globalTrigger,
+				segRefer:                  tt.fields.segRefer,
+				indexCoord:                indexCood,
+				estimateDiskSegmentPolicy: calBySchemaPolicyWithDiskIndex,
+			}
+
+			{
+				// test getCompactTime fail for handle global signal
+				signal := &compactionSignal{
+					id:           0,
+					isForce:      true,
+					isGlobal:     true,
+					collectionID: 1111,
+				}
+				tr.handleGlobalSignal(signal)
+
+				spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+				hasPlan := true
+				select {
+				case <-spy.spyChan:
+					hasPlan = true
+				case <-time.After(2 * time.Second):
+					hasPlan = false
+				}
+				assert.Equal(t, false, hasPlan)
+			}
+
+			{
+				// test getCompactTime fail for handle signal
+				signal := &compactionSignal{
+					id:           0,
+					isForce:      true,
+					collectionID: 1111,
+					segmentID:    3,
+				}
+				tr.handleSignal(signal)
+
+				spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
+				hasPlan := true
+				select {
+				case <-spy.spyChan:
+					hasPlan = true
+				case <-time.After(2 * time.Second):
+					hasPlan = false
+				}
+				assert.Equal(t, false, hasPlan)
+			}
 		})
 	}
 }
@@ -246,7 +654,7 @@ func Test_compactionTrigger_force_maxSegmentLimit(t *testing.T) {
 		compactTime  *compactTime
 	}
 	Params.Init()
-
+	vecFieldID := int64(201)
 	segmentInfos := &SegmentsInfo{
 		segments: make(map[UniqueID]*SegmentInfo),
 	}
@@ -292,6 +700,19 @@ func Test_compactionTrigger_force_maxSegmentLimit(t *testing.T) {
 			fields{
 				&meta{
 					segments: segmentInfos,
+					collections: map[int64]*collectionInfo{
+						2: {
+							ID: 2,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+									},
+								},
+							},
+						},
+					},
 				},
 				newMockAllocator(),
 				nil,
@@ -355,15 +776,19 @@ func Test_compactionTrigger_force_maxSegmentLimit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			indexCoord := newMockIndexCoord()
+
 			tr := &compactionTrigger{
 				meta:              tt.fields.meta,
+				handler:           newMockHandlerWithMeta(tt.fields.meta),
 				allocator:         tt.fields.allocator,
 				signals:           tt.fields.signals,
 				compactionHandler: tt.fields.compactionHandler,
 				globalTrigger:     tt.fields.globalTrigger,
 				segRefer:          &SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}},
+				indexCoord:        indexCoord,
 			}
-			_, err := tr.forceTriggerCompaction(tt.args.collectionID, tt.args.compactTime)
+			_, err := tr.forceTriggerCompaction(tt.args.collectionID)
 			assert.Equal(t, tt.wantErr, err != nil)
 			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
 
@@ -397,6 +822,7 @@ func Test_compactionTrigger_noplan(t *testing.T) {
 		compactTime  *compactTime
 	}
 	Params.Init()
+	vecFieldID := int64(201)
 	tests := []struct {
 		name      string
 		fields    fields
@@ -496,6 +922,19 @@ func Test_compactionTrigger_noplan(t *testing.T) {
 							},
 						},
 					},
+					collections: map[int64]*collectionInfo{
+						2: {
+							ID: 2,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+									},
+								},
+							},
+						},
+					},
 				},
 				newMockAllocator(),
 				make(chan *compactionSignal, 1),
@@ -512,17 +951,21 @@ func Test_compactionTrigger_noplan(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			indexCoord := newMockIndexCoord()
+
 			tr := &compactionTrigger{
 				meta:              tt.fields.meta,
+				handler:           newMockHandlerWithMeta(tt.fields.meta),
 				allocator:         tt.fields.allocator,
 				signals:           tt.fields.signals,
 				compactionHandler: tt.fields.compactionHandler,
 				globalTrigger:     tt.fields.globalTrigger,
 				segRefer:          &SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}},
+				indexCoord:        indexCoord,
 			}
 			tr.start()
 			defer tr.stop()
-			err := tr.triggerCompaction(tt.args.compactTime)
+			err := tr.triggerCompaction()
 			assert.Equal(t, tt.wantErr, err != nil)
 			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
 			select {
@@ -550,6 +993,7 @@ func Test_compactionTrigger_smallfiles(t *testing.T) {
 		compactTime  *compactTime
 	}
 	Params.Init()
+	vecFieldID := int64(201)
 	tests := []struct {
 		name      string
 		fields    fields
@@ -670,6 +1114,19 @@ func Test_compactionTrigger_smallfiles(t *testing.T) {
 							},
 						},
 					},
+					collections: map[int64]*collectionInfo{
+						2: {
+							ID: 2,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+									},
+								},
+							},
+						},
+					},
 				},
 				newMockAllocator(),
 				make(chan *compactionSignal, 1),
@@ -686,17 +1143,21 @@ func Test_compactionTrigger_smallfiles(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			indexCoord := newMockIndexCoord()
+
 			tr := &compactionTrigger{
 				meta:              tt.fields.meta,
+				handler:           newMockHandlerWithMeta(tt.fields.meta),
 				allocator:         tt.fields.allocator,
 				signals:           tt.fields.signals,
 				compactionHandler: tt.fields.compactionHandler,
 				globalTrigger:     tt.fields.globalTrigger,
 				segRefer:          &SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}},
+				indexCoord:        indexCoord,
 			}
 			tr.start()
 			defer tr.stop()
-			err := tr.triggerCompaction(tt.args.compactTime)
+			err := tr.triggerCompaction()
 			assert.Equal(t, tt.wantErr, err != nil)
 			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
 			select {
@@ -739,6 +1200,7 @@ func Test_compactionTrigger_noplan_random_size(t *testing.T) {
 		10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
 	}
 
+	vecFieldID := int64(201)
 	for i := UniqueID(0); i < 50; i++ {
 		info := &SegmentInfo{
 			SegmentInfo: &datapb.SegmentInfo{
@@ -774,6 +1236,19 @@ func Test_compactionTrigger_noplan_random_size(t *testing.T) {
 			fields{
 				&meta{
 					segments: segmentInfos,
+					collections: map[int64]*collectionInfo{
+						2: {
+							ID: 2,
+							Schema: &schemapb.CollectionSchema{
+								Fields: []*schemapb.FieldSchema{
+									{
+										FieldID:  vecFieldID,
+										DataType: schemapb.DataType_FloatVector,
+									},
+								},
+							},
+						},
+					},
 				},
 				newMockAllocator(),
 				make(chan *compactionSignal, 1),
@@ -790,17 +1265,21 @@ func Test_compactionTrigger_noplan_random_size(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			indexCoord := newMockIndexCoord()
+
 			tr := &compactionTrigger{
 				meta:              tt.fields.meta,
+				handler:           newMockHandlerWithMeta(tt.fields.meta),
 				allocator:         tt.fields.allocator,
 				signals:           tt.fields.signals,
 				compactionHandler: tt.fields.compactionHandler,
 				globalTrigger:     tt.fields.globalTrigger,
 				segRefer:          &SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}},
+				indexCoord:        indexCoord,
 			}
 			tr.start()
 			defer tr.stop()
-			err := tr.triggerCompaction(tt.args.compactTime)
+			err := tr.triggerCompaction()
 			assert.Equal(t, tt.wantErr, err != nil)
 			spy := (tt.fields.compactionHandler).(*spyCompactionHandler)
 
@@ -839,8 +1318,9 @@ func Test_compactionTrigger_noplan_random_size(t *testing.T) {
 func Test_compactionTrigger_shouldDoSingleCompaction(t *testing.T) {
 	Params.Init()
 
+	indexCoord := newMockIndexCoord()
 	trigger := newCompactionTrigger(&meta{}, &compactionPlanHandler{}, newMockAllocator(),
-		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}})
+		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}}, indexCoord, newMockHandler())
 
 	// Test too many files.
 	var binlogs []*datapb.FieldBinlog
@@ -972,8 +1452,9 @@ func Test_newCompactionTrigger(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			indexCoord := newMockIndexCoord()
 			got := newCompactionTrigger(tt.args.meta, tt.args.compactionHandler, tt.args.allocator,
-				&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}})
+				&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}}, indexCoord, newMockHandler())
 			assert.Equal(t, tt.args.meta, got.meta)
 			assert.Equal(t, tt.args.compactionHandler, got.compactionHandler)
 			assert.Equal(t, tt.args.allocator, got.allocator)
@@ -983,12 +1464,61 @@ func Test_newCompactionTrigger(t *testing.T) {
 
 func Test_handleSignal(t *testing.T) {
 
+	indexCoord := newMockIndexCoord()
 	got := newCompactionTrigger(&meta{segments: NewSegmentsInfo()}, &compactionPlanHandler{}, newMockAllocator(),
-		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}})
+		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}}, indexCoord, newMockHandler())
 	signal := &compactionSignal{
 		segmentID: 1,
 	}
 	assert.NotPanics(t, func() {
 		got.handleSignal(signal)
 	})
+}
+
+func Test_allocTs(t *testing.T) {
+	got := newCompactionTrigger(&meta{segments: NewSegmentsInfo()}, &compactionPlanHandler{}, newMockAllocator(),
+		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}}, nil, newMockHandler())
+	ts, err := got.allocTs()
+	assert.NoError(t, err)
+	assert.True(t, ts > 0)
+
+	got = newCompactionTrigger(&meta{segments: NewSegmentsInfo()}, &compactionPlanHandler{}, &FailsAllocator{},
+		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}}, nil, newMockHandler())
+	ts, err = got.allocTs()
+	assert.Error(t, err)
+	assert.Equal(t, uint64(0), ts)
+}
+
+func Test_getCompactTime(t *testing.T) {
+	collections := map[UniqueID]*collectionInfo{
+		1: {
+			ID:         1,
+			Schema:     newTestSchema(),
+			Partitions: []UniqueID{1},
+			Properties: map[string]string{
+				common.CollectionTTLConfigKey: "10",
+			},
+		},
+		2: {
+			ID:         2,
+			Schema:     newTestSchema(),
+			Partitions: []UniqueID{1},
+			Properties: map[string]string{
+				common.CollectionTTLConfigKey: "error",
+			},
+		},
+	}
+
+	m := &meta{segments: NewSegmentsInfo(), collections: collections}
+	got := newCompactionTrigger(m, &compactionPlanHandler{}, newMockAllocator(),
+		&SegmentReferenceManager{segmentsLock: map[UniqueID]map[UniqueID]*datapb.SegmentReferenceLock{}}, nil, &ServerHandler{
+			&Server{
+				meta: m,
+			},
+		})
+
+	now := tsoutil.GetCurrentTime()
+	ct, err := got.getCompactTime(now, 1)
+	assert.NoError(t, err)
+	assert.NotNil(t, ct)
 }

@@ -19,28 +19,31 @@ package querynode
 import (
 	"context"
 	"fmt"
-	"log"
 	"math"
+	"runtime"
 	"testing"
-
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-
-	"github.com/milvus-io/milvus/internal/storage"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/planpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/segcorepb"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/concurrency"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
 )
 
 //-------------------------------------------------------------------------------------- constructor and destructor
 func TestSegment_newSegment(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 	collectionMeta := genCollectionMeta(collectionID, schema)
@@ -49,7 +52,7 @@ func TestSegment_newSegment(t *testing.T) {
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Nil(t, err)
 	assert.Equal(t, segmentID, segment.segmentID)
 	deleteSegment(segment)
@@ -59,12 +62,15 @@ func TestSegment_newSegment(t *testing.T) {
 		_, err = newSegment(collection,
 			defaultSegmentID,
 			defaultPartitionID,
-			collectionID, "", 100)
+			collectionID, "", 100, defaultSegmentVersion, pool)
 		assert.Error(t, err)
 	})
 }
 
 func TestSegment_deleteSegment(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 	collectionMeta := genCollectionMeta(collectionID, schema)
@@ -73,7 +79,7 @@ func TestSegment_deleteSegment(t *testing.T) {
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -83,13 +89,16 @@ func TestSegment_deleteSegment(t *testing.T) {
 	t.Run("test delete nil ptr", func(t *testing.T) {
 		s, err := genSimpleSealedSegment(defaultMsgLength)
 		assert.NoError(t, err)
-		s.segmentPtr = nil
+		s.setUnhealthy()
 		deleteSegment(s)
 	})
 }
 
 //-------------------------------------------------------------------------------------- stats functions
 func TestSegment_getRowCount(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 
@@ -97,7 +106,7 @@ func TestSegment_getRowCount(t *testing.T) {
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -125,13 +134,16 @@ func TestSegment_getRowCount(t *testing.T) {
 	t.Run("test getRowCount nil ptr", func(t *testing.T) {
 		s, err := genSimpleSealedSegment(defaultMsgLength)
 		assert.NoError(t, err)
-		s.segmentPtr = nil
+		s.setUnhealthy()
 		res := s.getRowCount()
 		assert.Equal(t, int64(-1), res)
 	})
 }
 
 func TestSegment_retrieve(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 
@@ -139,7 +151,7 @@ func TestSegment_retrieve(t *testing.T) {
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -186,18 +198,8 @@ func TestSegment_retrieve(t *testing.T) {
 				},
 			},
 		},
-		OutputFieldIds: []FieldID{simpleInt32Field.id},
+		OutputFieldIds: []FieldID{simpleInt32Field.id, simpleInt64Field.id},
 	}
-	// reqIds := &segcorepb.RetrieveRequest{
-	// 	Ids: &schemapb.IDs{
-	// 		IdField: &schemapb.IDs_IntId{
-	// 			IntId: &schemapb.LongArray{
-	// 				Data: []int64{2, 3, 1},
-	// 			},
-	// 		},
-	// 	},
-	// 	OutputFieldsId: []int64{100},
-	// }
 	planExpr, err := proto.Marshal(planNode)
 	assert.NoError(t, err)
 	plan, err := createRetrievePlanByExpr(collection, planExpr, 100, 100)
@@ -208,9 +210,27 @@ func TestSegment_retrieve(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equal(t, res.GetFieldsData()[0].GetScalars().Data.(*schemapb.ScalarField_IntData).IntData.Data, []int32{1, 2, 3})
+	assert.Equal(t, []int64{1, 2, 3}, res.GetIds().GetIntId().GetData())
+
+	t.Run("Test sort", func(t *testing.T) {
+		offset, err := segment.segmentPreInsert(defaultMsgLength)
+		require.NoError(t, err)
+		require.Equal(t, offset, int64(100))
+		err = segment.segmentInsert(offset, insertMsg.RowIDs, insertMsg.Timestamps, insertRecord)
+		require.NoError(t, err)
+
+		res, err := segment.retrieve(plan)
+		assert.NoError(t, err)
+
+		assert.Equal(t, []int32{1, 1, 2, 2, 3, 3}, res.GetFieldsData()[0].GetScalars().Data.(*schemapb.ScalarField_IntData).IntData.Data)
+		assert.Equal(t, []int64{1, 1, 2, 2, 3, 3}, res.GetIds().GetIntId().GetData())
+	})
 }
 
 func TestSegment_getDeletedCount(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 
@@ -218,7 +238,7 @@ func TestSegment_getDeletedCount(t *testing.T) {
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -253,13 +273,16 @@ func TestSegment_getDeletedCount(t *testing.T) {
 	t.Run("test getDeletedCount nil ptr", func(t *testing.T) {
 		s, err := genSimpleSealedSegment(defaultMsgLength)
 		assert.NoError(t, err)
-		s.segmentPtr = nil
+		s.setUnhealthy()
 		res := s.getDeletedCount()
 		assert.Equal(t, int64(-1), res)
 	})
 }
 
 func TestSegment_getMemSize(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 
@@ -267,7 +290,7 @@ func TestSegment_getMemSize(t *testing.T) {
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -296,13 +319,16 @@ func TestSegment_getMemSize(t *testing.T) {
 
 //-------------------------------------------------------------------------------------- dm & search functions
 func TestSegment_segmentInsert(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 
 	collection := newCollection(collectionID, schema)
 	assert.Equal(t, collection.ID(), collectionID)
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -340,13 +366,16 @@ func TestSegment_segmentInsert(t *testing.T) {
 }
 
 func TestSegment_segmentDelete(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 	collection := newCollection(collectionID, schema)
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -412,9 +441,7 @@ func TestSegment_segmentSearch(t *testing.T) {
 	}
 
 	placeGroupByte, err := proto.Marshal(&placeholderGroup)
-	if err != nil {
-		log.Print("marshal placeholderGroup failed")
-	}
+	require.NoError(t, err)
 
 	dslString := "{\"bool\": { \n\"vector\": {\n \"floatVectorField\": {\n \"metric_type\": \"L2\", \n \"params\": {\n \"nprobe\": 10 \n},\n \"query\": \"$0\",\n \"topk\": 10 \n,\"round_decimal\": 6\n } \n } \n } \n }"
 
@@ -436,13 +463,16 @@ func TestSegment_segmentSearch(t *testing.T) {
 
 //-------------------------------------------------------------------------------------- preDm functions
 func TestSegment_segmentPreInsert(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 	collection := newCollection(collectionID, schema)
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -455,13 +485,16 @@ func TestSegment_segmentPreInsert(t *testing.T) {
 }
 
 func TestSegment_segmentPreDelete(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	collectionID := UniqueID(0)
 	schema := genTestCollectionSchema()
 	collection := newCollection(collectionID, schema)
 	assert.Equal(t, collection.ID(), collectionID)
 
 	segmentID := UniqueID(0)
-	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing)
+	segment, err := newSegment(collection, segmentID, defaultPartitionID, collectionID, "", segmentTypeGrowing, defaultSegmentVersion, pool)
 	assert.Equal(t, segmentID, segment.segmentID)
 	assert.Nil(t, err)
 
@@ -487,6 +520,9 @@ func TestSegment_segmentPreDelete(t *testing.T) {
 }
 
 func TestSegment_segmentLoadDeletedRecord(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	fieldParam := constFieldParam{
 		id:       100,
 		dataType: schemapb.DataType_Int64,
@@ -505,7 +541,9 @@ func TestSegment_segmentLoadDeletedRecord(t *testing.T) {
 		defaultPartitionID,
 		defaultCollectionID,
 		defaultDMLChannel,
-		segmentTypeSealed)
+		segmentTypeSealed,
+		defaultSegmentVersion,
+		pool)
 	assert.Nil(t, err)
 	ids := []int64{1, 2, 3}
 	pks := make([]primaryKey, 0)
@@ -574,6 +612,9 @@ func TestSegment_indexInfo(t *testing.T) {
 }
 
 func TestSegment_BasicMetrics(t *testing.T) {
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
+
 	schema := genTestCollectionSchema()
 	collection := newCollection(defaultCollectionID, schema)
 	segment, err := newSegment(collection,
@@ -581,7 +622,9 @@ func TestSegment_BasicMetrics(t *testing.T) {
 		defaultPartitionID,
 		defaultCollectionID,
 		defaultDMLChannel,
-		segmentTypeSealed)
+		segmentTypeSealed,
+		defaultSegmentVersion,
+		pool)
 	assert.Nil(t, err)
 
 	t.Run("test id binlog row size", func(t *testing.T) {
@@ -620,6 +663,8 @@ func TestSegment_BasicMetrics(t *testing.T) {
 func TestSegment_fillIndexedFieldsData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	require.NoError(t, err)
 
 	schema := genTestCollectionSchema()
 	collection := newCollection(defaultCollectionID, schema)
@@ -628,7 +673,9 @@ func TestSegment_fillIndexedFieldsData(t *testing.T) {
 		defaultPartitionID,
 		defaultCollectionID,
 		defaultDMLChannel,
-		segmentTypeSealed)
+		segmentTypeSealed,
+		defaultSegmentVersion,
+		pool)
 	assert.Nil(t, err)
 
 	vecCM, err := genVectorChunkManager(ctx, collection)
@@ -667,7 +714,7 @@ func TestSegment_fillIndexedFieldsData(t *testing.T) {
 			Offset:     []int64{0},
 			FieldsData: fieldData,
 		}
-		err = segment.fillIndexedFieldsData(defaultCollectionID, vecCM, result)
+		err = segment.fillIndexedFieldsData(ctx, defaultCollectionID, vecCM, result)
 		assert.Error(t, err)
 	})
 }
@@ -700,6 +747,8 @@ func Test_getFieldDataPath(t *testing.T) {
 }
 
 func Test_fillBinVecFieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	m = newMockChunkManager(withDefaultReadAt())
@@ -711,13 +760,15 @@ func Test_fillBinVecFieldData(t *testing.T) {
 	offset := int64(100)
 	endian := common.Endian
 
-	assert.NoError(t, fillBinVecFieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillBinVecFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillBinVecFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillBinVecFieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillFloatVecFieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	m = newMockChunkManager(withDefaultReadAt())
@@ -729,16 +780,18 @@ func Test_fillFloatVecFieldData(t *testing.T) {
 	offset := int64(100)
 	endian := common.Endian
 
-	assert.NoError(t, fillFloatVecFieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillFloatVecFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillFloatVecFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillFloatVecFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillFloatVecFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillFloatVecFieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillBoolFieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -750,16 +803,19 @@ func Test_fillBoolFieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillBoolFieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillBoolFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadErr())
-	assert.Error(t, fillBoolFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillBoolFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadIllegalBool())
-	assert.Error(t, fillBoolFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillBoolFieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillStringFieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -771,16 +827,19 @@ func Test_fillStringFieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillStringFieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillStringFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadErr())
-	assert.Error(t, fillStringFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillStringFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadIllegalString())
-	assert.Error(t, fillStringFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillStringFieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillInt8FieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -792,16 +851,19 @@ func Test_fillInt8FieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillInt8FieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillInt8FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillInt8FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt8FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillInt8FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt8FieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillInt16FieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -813,16 +875,18 @@ func Test_fillInt16FieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillInt16FieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillInt16FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillInt16FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt16FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillInt16FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt16FieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillInt32FieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -834,16 +898,18 @@ func Test_fillInt32FieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillInt32FieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillInt32FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillInt32FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt32FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillInt32FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt32FieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillInt64FieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -855,16 +921,18 @@ func Test_fillInt64FieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillInt64FieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillInt64FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillInt64FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt64FieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillInt64FieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillInt64FieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillFloatFieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -876,16 +944,18 @@ func Test_fillFloatFieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillFloatFieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillFloatFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillFloatFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillFloatFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillFloatFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillFloatFieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillDoubleFieldData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var m storage.ChunkManager
 
 	offset := int64(100)
@@ -897,13 +967,13 @@ func Test_fillDoubleFieldData(t *testing.T) {
 	index := 0
 	endian := common.Endian
 
-	assert.NoError(t, fillDoubleFieldData(m, path, f, index, offset, endian))
+	assert.NoError(t, fillDoubleFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtErr())
-	assert.Error(t, fillDoubleFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillDoubleFieldData(ctx, m, path, f, index, offset, endian))
 
 	m = newMockChunkManager(withReadAtEmptyContent())
-	assert.Error(t, fillDoubleFieldData(m, path, f, index, offset, endian))
+	assert.Error(t, fillDoubleFieldData(ctx, m, path, f, index, offset, endian))
 }
 
 func Test_fillFieldData(t *testing.T) {
@@ -939,10 +1009,10 @@ func Test_fillFieldData(t *testing.T) {
 			m = newMockChunkManager(withDefaultReadAt())
 		}
 
-		assert.NoError(t, fillFieldData(m, path, f, index, offset, endian))
+		assert.NoError(t, fillFieldData(context.Background(), m, path, f, index, offset, endian))
 	}
 
-	assert.Error(t, fillFieldData(m, path, &schemapb.FieldData{Type: schemapb.DataType_None}, index, offset, endian))
+	assert.Error(t, fillFieldData(context.Background(), m, path, &schemapb.FieldData{Type: schemapb.DataType_None}, index, offset, endian))
 }
 
 func TestUpdateBloomFilter(t *testing.T) {
@@ -953,6 +1023,7 @@ func TestUpdateBloomFilter(t *testing.T) {
 			defaultPartitionID,
 			defaultCollectionID,
 			defaultDMLChannel,
+			defaultSegmentVersion,
 			segmentTypeSealed)
 		assert.NoError(t, err)
 		seg, err := replica.getSegmentByID(defaultSegmentID, segmentTypeSealed)
@@ -976,6 +1047,7 @@ func TestUpdateBloomFilter(t *testing.T) {
 			defaultPartitionID,
 			defaultCollectionID,
 			defaultDMLChannel,
+			defaultSegmentVersion,
 			segmentTypeSealed)
 		assert.NoError(t, err)
 		seg, err := replica.getSegmentByID(defaultSegmentID, segmentTypeSealed)

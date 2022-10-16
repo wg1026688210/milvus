@@ -180,6 +180,22 @@ class TestPartitionParams(TestcaseBase):
                                            )
 
     @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize("partition_name", ["_Partiti0n", "pArt1_ti0n"])
+    def test_partition_naming_rules(self, partition_name):
+        """
+        target: test partition naming rules
+        method: 1. connect milvus
+                2. Create a collection
+                3. Create a partition with a name which uses all the supported elements in the naming rules
+        expected: Partition create successfully
+        """
+        self._connect()
+        collection_w = self.init_collection_wrap()
+        self.partition_wrap.init_partition(collection_w.collection, partition_name,
+                                           check_task=CheckTasks.check_partition_property,
+                                           check_items={"name": partition_name})
+
+    @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("partition_name", ct.get_invalid_strs)
     def test_partition_invalid_name(self, partition_name):
         """
@@ -360,6 +376,8 @@ class TestPartitionParams(TestcaseBase):
                 2.load with a new replica number
                 3.release partition
                 4.load with a new replica
+                5.create index is a must because get_query_segment_info could
+                  only return indexed and loaded segment
         expected: The second time successfully loaded with a new replica number
         """
         # create, insert
@@ -368,6 +386,7 @@ class TestPartitionParams(TestcaseBase):
         partition_w = self.init_partition_wrap(collection_w)
         partition_w.insert(cf.gen_default_list_data())
         assert partition_w.num_entities == ct.default_nb
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
 
         partition_w.load(replica_number=1)
         collection_w.query(expr=f"{ct.default_int64_field_name} in [0]", check_task=CheckTasks.check_query_results,
@@ -396,7 +415,9 @@ class TestPartitionParams(TestcaseBase):
         """
         target: test load with different replicas between partitions
         method: 1.Create two partitions and insert data
-                2.Load two partitions with different replicas
+                2.Create index is a must because get_query_segment_info could
+                  only return indexed and loaded segment
+                3.Load two partitions with different replicas
         expected: Raise an exception
         """
         # Create two partitions and insert data
@@ -406,6 +427,7 @@ class TestPartitionParams(TestcaseBase):
         partition_w1.insert(cf.gen_default_dataframe_data())
         partition_w2.insert(cf.gen_default_dataframe_data(start=ct.default_nb))
         assert collection_w.num_entities == ct.default_nb * 2
+        collection_w.create_index(ct.default_float_vec_field_name, ct.default_index)
 
         # load with different replicas
         partition_w1.load(replica_number=1)

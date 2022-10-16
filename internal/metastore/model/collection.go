@@ -1,10 +1,10 @@
 package model
 
 import (
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 )
 
 type Collection struct {
@@ -15,15 +15,19 @@ type Collection struct {
 	Description          string
 	AutoID               bool
 	Fields               []*Field
-	FieldIDToIndexID     []common.Int64Tuple
 	VirtualChannelNames  []string
 	PhysicalChannelNames []string
 	ShardsNum            int32
 	StartPositions       []*commonpb.KeyDataPair
 	CreateTime           uint64
 	ConsistencyLevel     commonpb.ConsistencyLevel
-	Aliases              []string
-	Extra                map[string]string // extra kvs
+	Aliases              []string // TODO: deprecate this.
+	Properties           []*commonpb.KeyValuePair
+	State                pb.CollectionState
+}
+
+func (c Collection) Available() bool {
+	return c.State == pb.CollectionState_CollectionCreated
 }
 
 func (c Collection) Clone() *Collection {
@@ -33,18 +37,29 @@ func (c Collection) Clone() *Collection {
 		Name:                 c.Name,
 		Description:          c.Description,
 		AutoID:               c.AutoID,
-		Fields:               c.Fields,
-		Partitions:           c.Partitions,
-		FieldIDToIndexID:     c.FieldIDToIndexID,
-		VirtualChannelNames:  c.VirtualChannelNames,
-		PhysicalChannelNames: c.PhysicalChannelNames,
+		Fields:               CloneFields(c.Fields),
+		Partitions:           ClonePartitions(c.Partitions),
+		VirtualChannelNames:  common.CloneStringList(c.VirtualChannelNames),
+		PhysicalChannelNames: common.CloneStringList(c.PhysicalChannelNames),
 		ShardsNum:            c.ShardsNum,
 		ConsistencyLevel:     c.ConsistencyLevel,
 		CreateTime:           c.CreateTime,
-		StartPositions:       c.StartPositions,
-		Aliases:              c.Aliases,
-		Extra:                c.Extra,
+		StartPositions:       common.CloneKeyDataPairs(c.StartPositions),
+		Aliases:              common.CloneStringList(c.Aliases),
+		Properties:           common.CloneKeyValuePairs(c.Properties),
+		State:                c.State,
 	}
+}
+
+func (c Collection) Equal(other Collection) bool {
+	return c.TenantID == other.TenantID &&
+		CheckPartitionsEqual(c.Partitions, other.Partitions) &&
+		c.Name == other.Name &&
+		c.Description == other.Description &&
+		c.AutoID == other.AutoID &&
+		CheckFieldsEqual(c.Fields, other.Fields) &&
+		c.ShardsNum == other.ShardsNum &&
+		c.ConsistencyLevel == other.ConsistencyLevel
 }
 
 func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
@@ -53,32 +68,12 @@ func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
 	}
 
 	// backward compatible for deprecated fields
-	var partitions []*Partition
-	if len(coll.Partitions) != 0 {
-		partitions = make([]*Partition, len(coll.Partitions))
-		for idx, partition := range coll.Partitions {
-			partitions[idx] = &Partition{
-				PartitionID:               partition.GetPartitionID(),
-				PartitionName:             partition.GetPartitionName(),
-				PartitionCreatedTimestamp: partition.GetPartitionCreatedTimestamp(),
-			}
-		}
-	} else {
-		partitions = make([]*Partition, len(coll.PartitionIDs))
-		for idx := range coll.PartitionIDs {
-			partitions[idx] = &Partition{
-				PartitionID:               coll.PartitionIDs[idx],
-				PartitionName:             coll.PartitionNames[idx],
-				PartitionCreatedTimestamp: coll.PartitionCreatedTimestamps[idx],
-			}
-		}
-	}
-
-	filedIDToIndexIDs := make([]common.Int64Tuple, len(coll.FieldIndexes))
-	for idx, fieldIndexInfo := range coll.FieldIndexes {
-		filedIDToIndexIDs[idx] = common.Int64Tuple{
-			Key:   fieldIndexInfo.FiledID,
-			Value: fieldIndexInfo.IndexID,
+	partitions := make([]*Partition, len(coll.PartitionIDs))
+	for idx := range coll.PartitionIDs {
+		partitions[idx] = &Partition{
+			PartitionID:               coll.PartitionIDs[idx],
+			PartitionName:             coll.PartitionNames[idx],
+			PartitionCreatedTimestamp: coll.PartitionCreatedTimestamps[idx],
 		}
 	}
 
@@ -87,69 +82,92 @@ func UnmarshalCollectionModel(coll *pb.CollectionInfo) *Collection {
 		Name:                 coll.Schema.Name,
 		Description:          coll.Schema.Description,
 		AutoID:               coll.Schema.AutoID,
-		Fields:               UnmarshalFieldModels(coll.Schema.Fields),
+		Fields:               UnmarshalFieldModels(coll.GetSchema().GetFields()),
 		Partitions:           partitions,
-		FieldIDToIndexID:     filedIDToIndexIDs,
 		VirtualChannelNames:  coll.VirtualChannelNames,
 		PhysicalChannelNames: coll.PhysicalChannelNames,
 		ShardsNum:            coll.ShardsNum,
 		ConsistencyLevel:     coll.ConsistencyLevel,
 		CreateTime:           coll.CreateTime,
 		StartPositions:       coll.StartPositions,
+		State:                coll.State,
+		Properties:           coll.Properties,
 	}
 }
 
+// MarshalCollectionModel marshal only collection-related information.
+// partitions, aliases and fields won't be marshaled. They should be written to newly path.
 func MarshalCollectionModel(coll *Collection) *pb.CollectionInfo {
+	return marshalCollectionModelWithConfig(coll, newDefaultConfig())
+}
+
+type config struct {
+	withFields     bool
+	withPartitions bool
+}
+
+type Option func(c *config)
+
+func newDefaultConfig() *config {
+	return &config{withFields: false, withPartitions: false}
+}
+
+func WithFields() Option {
+	return func(c *config) {
+		c.withFields = true
+	}
+}
+
+func WithPartitions() Option {
+	return func(c *config) {
+		c.withPartitions = true
+	}
+}
+
+func marshalCollectionModelWithConfig(coll *Collection, c *config) *pb.CollectionInfo {
 	if coll == nil {
 		return nil
 	}
 
-	fields := make([]*schemapb.FieldSchema, len(coll.Fields))
-	for idx, field := range coll.Fields {
-		fields[idx] = &schemapb.FieldSchema{
-			FieldID:      field.FieldID,
-			Name:         field.Name,
-			IsPrimaryKey: field.IsPrimaryKey,
-			Description:  field.Description,
-			DataType:     field.DataType,
-			TypeParams:   field.TypeParams,
-			IndexParams:  field.IndexParams,
-			AutoID:       field.AutoID,
-		}
-	}
 	collSchema := &schemapb.CollectionSchema{
 		Name:        coll.Name,
 		Description: coll.Description,
 		AutoID:      coll.AutoID,
-		Fields:      fields,
 	}
 
-	partitions := make([]*pb.PartitionInfo, len(coll.Partitions))
-	for idx, partition := range coll.Partitions {
-		partitions[idx] = &pb.PartitionInfo{
-			PartitionID:               partition.PartitionID,
-			PartitionName:             partition.PartitionName,
-			PartitionCreatedTimestamp: partition.PartitionCreatedTimestamp,
-		}
+	if c.withFields {
+		fields := MarshalFieldModels(coll.Fields)
+		collSchema.Fields = fields
 	}
 
-	fieldIndexes := make([]*pb.FieldIndexInfo, len(coll.FieldIDToIndexID))
-	for idx, tuple := range coll.FieldIDToIndexID {
-		fieldIndexes[idx] = &pb.FieldIndexInfo{
-			FiledID: tuple.Key,
-			IndexID: tuple.Value,
-		}
-	}
-	return &pb.CollectionInfo{
+	collectionPb := &pb.CollectionInfo{
 		ID:                   coll.CollectionID,
 		Schema:               collSchema,
-		Partitions:           partitions,
-		FieldIndexes:         fieldIndexes,
 		CreateTime:           coll.CreateTime,
 		VirtualChannelNames:  coll.VirtualChannelNames,
 		PhysicalChannelNames: coll.PhysicalChannelNames,
 		ShardsNum:            coll.ShardsNum,
 		ConsistencyLevel:     coll.ConsistencyLevel,
 		StartPositions:       coll.StartPositions,
+		State:                coll.State,
+		Properties:           coll.Properties,
 	}
+
+	if c.withPartitions {
+		for _, partition := range coll.Partitions {
+			collectionPb.PartitionNames = append(collectionPb.PartitionNames, partition.PartitionName)
+			collectionPb.PartitionIDs = append(collectionPb.PartitionIDs, partition.PartitionID)
+			collectionPb.PartitionCreatedTimestamps = append(collectionPb.PartitionCreatedTimestamps, partition.PartitionCreatedTimestamp)
+		}
+	}
+
+	return collectionPb
+}
+
+func MarshalCollectionModelWithOption(coll *Collection, opts ...Option) *pb.CollectionInfo {
+	c := newDefaultConfig()
+	for _, opt := range opts {
+		opt(c)
+	}
+	return marshalCollectionModelWithConfig(coll, c)
 }

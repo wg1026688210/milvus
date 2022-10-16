@@ -19,6 +19,7 @@ package querynode
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -29,10 +30,10 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/segcorepb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
@@ -71,6 +72,11 @@ func (iNode *insertNode) Name() string {
 
 // Operate handles input messages, to execute insert operations
 func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
+	if in == nil {
+		log.Debug("type assertion failed for insertMsg because it's nil", zap.String("name", iNode.Name()))
+		return []Msg{}
+	}
+
 	if len(in) != 1 {
 		log.Warn("Invalid operate message input in insertNode", zap.Int("input length", len(in)), zap.String("name", iNode.Name()))
 		return []Msg{}
@@ -78,11 +84,7 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 
 	iMsg, ok := in[0].(*insertMsg)
 	if !ok {
-		if in[0] == nil {
-			log.Debug("type assertion failed for insertMsg because it's nil", zap.String("name", iNode.Name()))
-		} else {
-			log.Warn("type assertion failed for insertMsg", zap.String("msgType", reflect.TypeOf(in[0]).Name()), zap.String("name", iNode.Name()))
-		}
+		log.Warn("type assertion failed for insertMsg", zap.String("msgType", reflect.TypeOf(in[0]).Name()), zap.String("name", iNode.Name()))
 		return []Msg{}
 	}
 
@@ -92,10 +94,6 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		insertRecords:    make(map[UniqueID][]*schemapb.FieldData),
 		insertOffset:     make(map[UniqueID]int64),
 		insertPKs:        make(map[UniqueID][]primaryKey),
-	}
-
-	if iMsg == nil {
-		return []Msg{}
 	}
 
 	var spans []opentracing.Span
@@ -137,11 +135,12 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 			panic(err)
 		}
 		if !has {
-			err = iNode.metaReplica.addSegment(insertMsg.SegmentID, insertMsg.PartitionID, insertMsg.CollectionID, insertMsg.ShardName, segmentTypeGrowing)
+			log.Info("Add growing segment", zap.Int64("collectionID", insertMsg.CollectionID), zap.Int64("segmentID", insertMsg.SegmentID))
+			err = iNode.metaReplica.addSegment(insertMsg.SegmentID, insertMsg.PartitionID, insertMsg.CollectionID, insertMsg.ShardName, 0, segmentTypeGrowing)
 			if err != nil {
 				// error occurs when collection or partition cannot be found, collection and partition should be created before
 				err = fmt.Errorf("insertNode addSegment failed, err = %s", err)
-				log.Error(err.Error(), zap.Int64("collection", iNode.collectionID), zap.String("channel", iNode.channel))
+				log.Error(err.Error(), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 				panic(err)
 			}
 		}
@@ -150,7 +149,7 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		if err != nil {
 			// occurs only when schema doesn't have dim param, this should not happen
 			err = fmt.Errorf("failed to transfer msgStream.insertMsg to storage.InsertRecord, err = %s", err)
-			log.Error(err.Error(), zap.Int64("collection", iNode.collectionID), zap.String("channel", iNode.channel))
+			log.Error(err.Error(), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 			panic(err)
 		}
 
@@ -165,7 +164,7 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		if err != nil {
 			// error occurs when cannot find collection or data is misaligned, should not happen
 			err = fmt.Errorf("failed to get primary keys, err = %d", err)
-			log.Error(err.Error(), zap.Int64("collection", iNode.collectionID), zap.String("channel", iNode.channel))
+			log.Error(err.Error(), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 			panic(err)
 		}
 		iData.insertPKs[insertMsg.SegmentID] = append(iData.insertPKs[insertMsg.SegmentID], pks...)
@@ -173,11 +172,13 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 
 	// 2. do preInsert
 	for segmentID := range iData.insertRecords {
+		log := log.With(
+			zap.Int64("segmentID", segmentID))
 		var targetSegment, err = iNode.metaReplica.getSegmentByID(segmentID, segmentTypeGrowing)
 		if err != nil {
 			// should not happen, segment should be created before
 			err = fmt.Errorf("insertNode getSegmentByID failed, err = %s", err)
-			log.Error(err.Error(), zap.Int64("collection", iNode.collectionID), zap.String("channel", iNode.channel))
+			log.Error(err.Error(), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 			panic(err)
 		}
 
@@ -185,13 +186,17 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		if targetSegment != nil {
 			offset, err := targetSegment.segmentPreInsert(numOfRecords)
 			if err != nil {
+				if errors.Is(err, errSegmentUnhealthy) {
+					log.Debug("segment removed before preInsert")
+					continue
+				}
 				// error occurs when cgo function `PreInsert` failed
 				err = fmt.Errorf("segmentPreInsert failed, segmentID = %d, err = %s", segmentID, err)
-				log.Error(err.Error(), zap.Int64("collection", iNode.collectionID), zap.String("channel", iNode.channel))
+				log.Error(err.Error(), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 				panic(err)
 			}
 			iData.insertOffset[segmentID] = offset
-			log.Debug("insertNode operator", zap.Int("insert size", numOfRecords), zap.Int64("insert offset", offset), zap.Int64("segment id", segmentID), zap.Int64("collection", iNode.collectionID), zap.String("channel", iNode.channel))
+			log.Debug("insertNode operator", zap.Int("insert size", numOfRecords), zap.Int64("insert offset", offset), zap.Int64("segmentID", segmentID), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 			targetSegment.updateBloomFilter(iData.insertPKs[segmentID])
 		}
 	}
@@ -202,7 +207,8 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		segmentID := segmentID
 		wg.Add(1)
 		go func() {
-			err := iNode.insert(&iData, segmentID, &wg)
+			defer wg.Done()
+			err := iNode.insert(&iData, segmentID)
 			if err != nil {
 				// error occurs when segment cannot be found or cgo function `Insert` failed
 				err = fmt.Errorf("segment insert failed, segmentID = %d, err = %s", segmentID, err)
@@ -240,13 +246,22 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 	for segmentID, pks := range delData.deleteIDs {
 		segment, err := iNode.metaReplica.getSegmentByID(segmentID, segmentTypeGrowing)
 		if err != nil {
-			// error occurs when segment cannot be found, should not happen
+			if errors.Is(err, ErrSegmentNotFound) {
+				log.Warn("segment not found when do preDelete, it may have been released due to compaction",
+					zap.Int64("segmentID", segmentID),
+					zap.Error(err),
+				)
+				continue
+			}
+
 			err = fmt.Errorf("insertNode getSegmentByID failed, err = %s", err)
 			log.Error(err.Error())
 			panic(err)
 		}
 		offset := segment.segmentPreDelete(len(pks))
-		delData.deleteOffset[segmentID] = offset
+		if offset >= 0 {
+			delData.deleteOffset[segmentID] = offset
+		}
 	}
 
 	// 3. do delete
@@ -254,7 +269,8 @@ func (iNode *insertNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		segmentID := segmentID
 		wg.Add(1)
 		go func() {
-			err := iNode.delete(delData, segmentID, &wg)
+			defer wg.Done()
+			err := iNode.delete(delData, segmentID)
 			if err != nil {
 				// error occurs when segment cannot be found, calling cgo function delete failed and etc...
 				err = fmt.Errorf("segment delete failed, segmentID = %d, err = %s", segmentID, err)
@@ -300,6 +316,13 @@ func processDeleteMessages(replica ReplicaInterface, segType segmentType, msg *m
 	for _, segmentID := range resultSegmentIDs {
 		segment, err := replica.getSegmentByID(segmentID, segType)
 		if err != nil {
+			if errors.Is(err, ErrSegmentNotFound) {
+				log.Warn("segment not found when process delete messages, it may have been released due to compaction",
+					zap.Int64("segmentID", segmentID),
+					zap.Error(err),
+				)
+				continue
+			}
 			return err
 		}
 		pks, tss, err := filterSegmentsByPKs(primaryKeys, msg.Timestamps, segment)
@@ -345,9 +368,10 @@ func filterSegmentsByPKs(pks []primaryKey, timestamps []Timestamp, segment *Segm
 }
 
 // insert would execute insert operations for specific growing segment
-func (iNode *insertNode) insert(iData *insertData, segmentID UniqueID, wg *sync.WaitGroup) error {
-	defer wg.Done()
-
+func (iNode *insertNode) insert(iData *insertData, segmentID UniqueID) error {
+	log := log.With(
+		zap.Int64("collectionID", iNode.collectionID),
+		zap.Int64("segmentID", segmentID))
 	var targetSegment, err = iNode.metaReplica.getSegmentByID(segmentID, segmentTypeGrowing)
 	if err != nil {
 		return fmt.Errorf("getSegmentByID failed, err = %s", err)
@@ -363,22 +387,35 @@ func (iNode *insertNode) insert(iData *insertData, segmentID UniqueID, wg *sync.
 
 	err = targetSegment.segmentInsert(offsets, ids, timestamps, insertRecord)
 	if err != nil {
+		if errors.Is(err, errSegmentUnhealthy) {
+			log.Debug("segment removed before insert")
+			return nil
+		}
 		return fmt.Errorf("segmentInsert failed, segmentID = %d, err = %s", segmentID, err)
 	}
 
-	log.Debug("Do insert done", zap.Int("len", len(iData.insertIDs[segmentID])), zap.Int64("collectionID", targetSegment.collectionID), zap.Int64("segmentID", segmentID))
+	log.Debug("Do insert done", zap.Int("len", len(iData.insertIDs[segmentID])))
 	return nil
 }
 
 // delete would execute delete operations for specific growing segment
-func (iNode *insertNode) delete(deleteData *deleteData, segmentID UniqueID, wg *sync.WaitGroup) error {
-	defer wg.Done()
+func (iNode *insertNode) delete(deleteData *deleteData, segmentID UniqueID) error {
+	log := log.With(
+		zap.Int64("collectionID", iNode.collectionID),
+		zap.Int64("segmentID", segmentID))
 	targetSegment, err := iNode.metaReplica.getSegmentByID(segmentID, segmentTypeGrowing)
 	if err != nil {
+		if errors.Is(err, ErrSegmentNotFound) {
+			log.Warn("segment not found when applying delete message, it may have been released due to compaction",
+				zap.Int64("segmentID", segmentID),
+				zap.Error(err),
+			)
+			return nil
+		}
 		return fmt.Errorf("getSegmentByID failed, err = %s", err)
 	}
 
-	if targetSegment.segmentType != segmentTypeGrowing {
+	if targetSegment.getType() != segmentTypeGrowing {
 		return fmt.Errorf("unexpected segmentType when delete, segmentType = %s", targetSegment.segmentType.String())
 	}
 
@@ -388,10 +425,14 @@ func (iNode *insertNode) delete(deleteData *deleteData, segmentID UniqueID, wg *
 
 	err = targetSegment.segmentDelete(offset, ids, timestamps)
 	if err != nil {
+		if errors.Is(err, errSegmentUnhealthy) {
+			log.Debug("segment removed before delete")
+			return nil
+		}
 		return fmt.Errorf("segmentDelete failed, err = %s", err)
 	}
 
-	log.Debug("Do delete done", zap.Int("len", len(deleteData.deleteIDs[segmentID])), zap.Int64("segmentID", segmentID))
+	log.Debug("Do delete done", zap.Int("len", len(deleteData.deleteIDs[segmentID])))
 	return nil
 }
 

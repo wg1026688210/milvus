@@ -50,6 +50,14 @@ else ()
     message(FATAL_ERROR "Unsupported platform!" )
 endif ()
 
+if (CMAKE_COMPILER_IS_GNUCC)
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 11.99)
+        # ignore deprecated declarations for gcc>=12
+        # TODO: this workaround may removed when protobuf upgraded
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations")
+    endif ()
+endif ()
+
 set( CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake" )
 include( Utils )
 
@@ -224,6 +232,10 @@ if ( BUILD_UNIT_TEST STREQUAL "ON" AND BUILD_COVERAGE STREQUAL "ON" )
                         "-fprofile-arcs"
                         "-ftest-coverage"
                         )
+endif ()
+
+if ( BUILD_DISK_ANN STREQUAL "ON" )
+    ADD_DEFINITIONS(-DBUILD_DISK_ANN=${BUILD_DISK_ANN})
 endif ()
 
 # Warning: add_subdirectory(src) must be after append_flags("-ftest-coverage"),

@@ -19,7 +19,6 @@
 #include "pb/index_cgo_msg.pb.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "indexbuilder/index_c.h"
-#include "indexbuilder/utils.h"
 #include "test_utils/indexbuilder_test_utils.h"
 #include "common/Consts.h"
 
@@ -64,9 +63,10 @@ IndexBuilder_build(benchmark::State& state) {
     auto xb_dataset = knowhere::GenDataset(NB, DIM, xb_data.data());
 
     for (auto _ : state) {
-        auto index =
-            std::make_unique<milvus::indexbuilder::VecIndexCreator>(type_params_str.c_str(), index_params_str.c_str());
-        index->BuildWithoutIds(xb_dataset);
+        auto index = std::make_unique<milvus::indexbuilder::VecIndexCreator>(
+            milvus::DataType::VECTOR_FLOAT, type_params_str.c_str(), index_params_str.c_str(),
+            get_default_storage_config());
+        index->Build(xb_dataset);
     }
 }
 
@@ -93,10 +93,11 @@ IndexBuilder_build_and_codec(benchmark::State& state) {
     auto xb_dataset = knowhere::GenDataset(NB, DIM, xb_data.data());
 
     for (auto _ : state) {
-        auto index =
-            std::make_unique<milvus::indexbuilder::VecIndexCreator>(type_params_str.c_str(), index_params_str.c_str());
+        auto index = std::make_unique<milvus::indexbuilder::VecIndexCreator>(
+            milvus::DataType::VECTOR_FLOAT, type_params_str.c_str(), index_params_str.c_str(),
+            get_default_storage_config());
 
-        index->BuildWithoutIds(xb_dataset);
+        index->Build(xb_dataset);
         index->Serialize();
     }
 }

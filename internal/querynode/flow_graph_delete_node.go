@@ -52,6 +52,11 @@ func (dNode *deleteNode) Name() string {
 
 // Operate handles input messages, do delete operations
 func (dNode *deleteNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
+	if in == nil {
+		log.Debug("type assertion failed for deleteMsg because it's nil", zap.String("name", dNode.Name()))
+		return []Msg{}
+	}
+
 	if len(in) != 1 {
 		log.Warn("Invalid operate message input in deleteNode", zap.Int("input length", len(in)), zap.String("name", dNode.Name()))
 		return []Msg{}
@@ -59,11 +64,7 @@ func (dNode *deleteNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 
 	dMsg, ok := in[0].(*deleteMsg)
 	if !ok {
-		if in[0] == nil {
-			log.Debug("type assertion failed for deleteMsg because it's nil", zap.String("name", dNode.Name()))
-		} else {
-			log.Warn("type assertion failed for deleteMsg", zap.String("msgType", reflect.TypeOf(in[0]).Name()), zap.String("name", dNode.Name()))
-		}
+		log.Warn("type assertion failed for deleteMsg", zap.String("msgType", reflect.TypeOf(in[0]).Name()), zap.String("name", dNode.Name()))
 		return []Msg{}
 	}
 
@@ -71,10 +72,6 @@ func (dNode *deleteNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 		deleteIDs:        map[UniqueID][]primaryKey{},
 		deleteTimestamps: map[UniqueID][]Timestamp{},
 		deleteOffset:     map[UniqueID]int64{},
-	}
-
-	if dMsg == nil {
-		return []Msg{}
 	}
 
 	var spans []opentracing.Span
@@ -166,7 +163,7 @@ func (dNode *deleteNode) delete(deleteData *deleteData, segmentID UniqueID, wg *
 		return fmt.Errorf("getSegmentByID failed, err = %s", err)
 	}
 
-	if targetSegment.segmentType != segmentTypeSealed {
+	if targetSegment.getType() != segmentTypeSealed {
 		return fmt.Errorf("unexpected segmentType when delete, segmentID = %d, segmentType = %s", segmentID, targetSegment.segmentType.String())
 	}
 

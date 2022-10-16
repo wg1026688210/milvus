@@ -8,9 +8,9 @@ import (
 	"reflect"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 )
 
 // We wrap original protobuf structure for 2 reasons:
@@ -37,6 +37,7 @@ type WrappedCreateCollectionRequest struct {
 	ShardsNum int32 `protobuf:"varint,5,opt,name=shards_num,json=shardsNum,proto3" json:"shards_num,omitempty"`
 	// The consistency level that the collection used, modification is not supported now.
 	ConsistencyLevel commonpb.ConsistencyLevel `protobuf:"varint,6,opt,name=consistency_level,json=consistencyLevel,proto3,enum=milvus.proto.common.ConsistencyLevel" json:"consistency_level,omitempty"`
+	Properties       []*commonpb.KeyValuePair  `protobuf:"bytes,13,rep,name=properties,proto3" json:"properties,omitempty"`
 }
 
 // WrappedInsertRequest is the InsertRequest wrapped for RESTful request
@@ -89,7 +90,7 @@ func (f FieldData) AsSchemapb() (*schemapb.FieldData, error) {
 				},
 			},
 		}
-	case schemapb.DataType_String:
+	case schemapb.DataType_VarChar:
 		if len(raw) > 0 {
 			_, ok := raw[0].(string)
 			if !ok {

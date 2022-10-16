@@ -20,20 +20,23 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/metrics"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/retry"
 	"github.com/milvus-io/milvus/internal/util/trace"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
@@ -79,6 +82,11 @@ func (ddn *ddNode) Name() string {
 
 // Operate handles input messages, implementing flowgrpah.Node
 func (ddn *ddNode) Operate(in []Msg) []Msg {
+	if in == nil {
+		log.Debug("type assertion failed for MsgStreamMsg because it's nil")
+		return []Msg{}
+	}
+
 	if len(in) != 1 {
 		log.Warn("Invalid operate message input in ddNode", zap.Int("input length", len(in)))
 		return []Msg{}
@@ -86,11 +94,7 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 
 	msMsg, ok := in[0].(*MsgStreamMsg)
 	if !ok {
-		if in[0] == nil {
-			log.Debug("type assertion failed for MsgStreamMsg because it's nil")
-		} else {
-			log.Warn("type assertion failed for MsgStreamMsg", zap.String("name", reflect.TypeOf(in[0]).Name()))
-		}
+		log.Warn("type assertion failed for MsgStreamMsg", zap.String("name", reflect.TypeOf(in[0]).Name()))
 		return []Msg{}
 	}
 
@@ -157,9 +161,13 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 				log.Info("filter insert messages",
 					zap.Int64("filter segment ID", imsg.GetSegmentID()),
 					zap.Uint64("message timestamp", msg.EndTs()),
-				)
+					zap.String("segment's vChannel", imsg.GetShardName()),
+					zap.String("current vChannel", ddn.vChannelName))
 				continue
 			}
+
+			rateCol.Add(metricsinfo.InsertConsumeThroughput, float64(proto.Size(&imsg.InsertRequest)))
+			metrics.DataNodeConsumeCounter.WithLabelValues(strconv.FormatInt(Params.DataNodeCfg.GetNodeID(), 10), metrics.InsertLabel).Add(float64(proto.Size(&imsg.InsertRequest)))
 
 			log.Debug("DDNode receive insert messages",
 				zap.Int("numRows", len(imsg.GetRowIDs())),
@@ -181,12 +189,14 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 					zap.Int64("Expected collID", ddn.collectionID))
 				continue
 			}
+			rateCol.Add(metricsinfo.DeleteConsumeThroughput, float64(proto.Size(&dmsg.DeleteRequest)))
+			metrics.DataNodeConsumeCounter.WithLabelValues(strconv.FormatInt(Params.DataNodeCfg.GetNodeID(), 10), metrics.DeleteLabel).Add(float64(proto.Size(&dmsg.DeleteRequest)))
 			fgMsg.deleteMessages = append(fgMsg.deleteMessages, dmsg)
 		}
 	}
 	err := retry.Do(ddn.ctx, func() error {
 		return ddn.forwardDeleteMsg(forwardMsgs, msMsg.TimestampMin(), msMsg.TimestampMax())
-	}, flowGraphRetryOpt)
+	}, getFlowGraphRetryOpt())
 	if err != nil {
 		err = fmt.Errorf("DDNode forward delete msg failed, vChannel = %s, err = %s", ddn.vChannelName, err)
 		log.Error(err.Error())
@@ -206,6 +216,10 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 }
 
 func (ddn *ddNode) tryToFilterSegmentInsertMessages(msg *msgstream.InsertMsg) bool {
+	if msg.GetShardName() != ddn.vChannelName {
+		return true
+	}
+
 	// Filter all dropped segments
 	if ddn.isDropped(msg.GetSegmentID()) {
 		return true

@@ -26,24 +26,26 @@ import (
 	"sync"
 	"time"
 
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	dn "github.com/milvus-io/milvus/internal/datanode"
 	dcc "github.com/milvus-io/milvus/internal/distributed/datacoord/client"
 	rcc "github.com/milvus-io/milvus/internal/distributed/rootcoord/client"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/retry"
 	"github.com/milvus-io/milvus/internal/util/trace"
@@ -134,8 +136,12 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
-		grpc.UnaryInterceptor(ot.UnaryServerInterceptor(opts...)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			ot.UnaryServerInterceptor(opts...),
+			logutil.UnaryTraceLoggerInterceptor)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			ot.StreamServerInterceptor(opts...),
+			logutil.StreamTraceLoggerInterceptor)))
 	datapb.RegisterDataNodeServer(s.grpcServer, s)
 
 	ctx, cancel := context.WithCancel(s.ctx)
@@ -143,7 +149,7 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
 	if err := s.grpcServer.Serve(lis); err != nil {
-		log.Warn("DataNode Start Grpc Failed!")
+		log.Warn("DataNode failed to start gRPC")
 		s.grpcErrChan <- err
 	}
 
@@ -164,14 +170,15 @@ func (s *Server) SetDataCoordInterface(ds types.DataCoord) error {
 // Run initializes and starts Datanode's grpc service.
 func (s *Server) Run() error {
 	if err := s.init(); err != nil {
+		// errors are propagated upstream as panic.
 		return err
 	}
-	log.Debug("DataNode init done ...")
-
+	log.Info("DataNode gRPC services successfully initialized")
 	if err := s.start(); err != nil {
+		// errors are propagated upstream as panic.
 		return err
 	}
-	log.Debug("DataNode start done ...")
+	log.Info("DataNode gRPC services successfully started")
 	return nil
 }
 
@@ -220,7 +227,7 @@ func (s *Server) init() error {
 	Params.InitOnce(typeutil.DataNodeRole)
 	if !funcutil.CheckPortAvailable(Params.Port) {
 		Params.Port = funcutil.GetAvailablePort()
-		log.Warn("DataNode get available port when init", zap.Int("Port", Params.Port))
+		log.Warn("DataNode found available port during init", zap.Int("port", Params.Port))
 	}
 	dn.Params.InitOnce()
 	dn.Params.DataNodeCfg.Port = Params.Port
@@ -228,15 +235,14 @@ func (s *Server) init() error {
 
 	etcdCli, err := etcd.GetEtcdClient(&dn.Params.EtcdCfg)
 	if err != nil {
-		log.Debug("DataNode connect to etcd failed", zap.Error(err))
+		log.Error("failed to connect to etcd", zap.Error(err))
 		return err
 	}
 	s.etcdCli = etcdCli
 	s.SetEtcdClient(s.etcdCli)
-	closer := trace.InitTracing(fmt.Sprintf("data_node ip: %s, port: %d", Params.IP, Params.Port))
+	closer := trace.InitTracing(fmt.Sprintf("DataNode IP: %s, port: %d", Params.IP, Params.Port))
 	s.closer = closer
-	addr := Params.IP + ":" + strconv.Itoa(Params.Port)
-	log.Debug("DataNode address", zap.String("address", addr))
+	log.Info("DataNode address", zap.String("address", Params.IP+":"+strconv.Itoa(Params.Port)))
 
 	err = s.startGrpc()
 	if err != nil {
@@ -245,65 +251,63 @@ func (s *Server) init() error {
 
 	// --- RootCoord Client ---
 	if s.newRootCoordClient != nil {
-		log.Debug("Init root coord client ...")
+		log.Info("initializing RootCoord client for DataNode")
 		rootCoordClient, err := s.newRootCoordClient(dn.Params.EtcdCfg.MetaRootPath, s.etcdCli)
 		if err != nil {
-			log.Debug("DataNode newRootCoordClient failed", zap.Error(err))
+			log.Error("failed to create new RootCoord client", zap.Error(err))
 			panic(err)
 		}
 		if err = rootCoordClient.Init(); err != nil {
-			log.Debug("DataNode rootCoordClient Init failed", zap.Error(err))
+			log.Error("failed to init RootCoord client", zap.Error(err))
 			panic(err)
 		}
 		if err = rootCoordClient.Start(); err != nil {
-			log.Debug("DataNode rootCoordClient Start failed", zap.Error(err))
+			log.Error("failed to start RootCoord client", zap.Error(err))
 			panic(err)
 		}
-		err = funcutil.WaitForComponentHealthy(ctx, rootCoordClient, "RootCoord", 1000000, time.Millisecond*200)
-		if err != nil {
-			log.Debug("DataNode wait rootCoord ready failed", zap.Error(err))
+		if err = funcutil.WaitForComponentHealthy(ctx, rootCoordClient, "RootCoord", 1000000, time.Millisecond*200); err != nil {
+			log.Error("failed to wait for RootCoord client to be ready", zap.Error(err))
 			panic(err)
 		}
-		log.Debug("DataNode rootCoord is ready")
+		log.Info("RootCoord client is ready for DataNode")
 		if err = s.SetRootCoordInterface(rootCoordClient); err != nil {
 			panic(err)
 		}
 	}
 
-	// --- Data Server Client ---
+	// --- DataCoord Client ---
 	if s.newDataCoordClient != nil {
-		log.Debug("DataNode Init data service client ...")
+		log.Debug("starting DataCoord client for DataNode")
 		dataCoordClient, err := s.newDataCoordClient(dn.Params.EtcdCfg.MetaRootPath, s.etcdCli)
 		if err != nil {
-			log.Debug("DataNode newDataCoordClient failed", zap.Error(err))
+			log.Error("failed to create new DataCoord client", zap.Error(err))
 			panic(err)
 		}
 		if err = dataCoordClient.Init(); err != nil {
-			log.Debug("DataNode newDataCoord failed", zap.Error(err))
+			log.Error("failed to init DataCoord client", zap.Error(err))
 			panic(err)
 		}
 		if err = dataCoordClient.Start(); err != nil {
-			log.Debug("DataNode dataCoordClient Start failed", zap.Error(err))
+			log.Error("failed to start DataCoord client", zap.Error(err))
 			panic(err)
 		}
-		err = funcutil.WaitForComponentInitOrHealthy(ctx, dataCoordClient, "DataCoord", 1000000, time.Millisecond*200)
-		if err != nil {
-			log.Debug("DataNode wait dataCoordClient ready failed", zap.Error(err))
+		if err = funcutil.WaitForComponentInitOrHealthy(ctx, dataCoordClient, "DataCoord", 1000000, time.Millisecond*200); err != nil {
+			log.Error("failed to wait for DataCoord client to be ready", zap.Error(err))
 			panic(err)
 		}
-		log.Debug("DataNode dataCoord is ready")
+		log.Info("DataCoord client is ready for DataNode")
 		if err = s.SetDataCoordInterface(dataCoordClient); err != nil {
 			panic(err)
 		}
 	}
 
-	s.datanode.UpdateStateCode(internalpb.StateCode_Initializing)
+	s.datanode.UpdateStateCode(commonpb.StateCode_Initializing)
 
 	if err := s.datanode.Init(); err != nil {
-		log.Warn("datanode init error: ", zap.Error(err))
+		log.Error("failed to init DataNode server", zap.Error(err))
 		return err
 	}
-	log.Debug("DataNode", zap.Any("State", internalpb.StateCode_Initializing))
+	log.Info("current DataNode state", zap.Any("state", s.datanode.GetStateCode()))
 	return nil
 }
 
@@ -314,14 +318,14 @@ func (s *Server) start() error {
 	}
 	err := s.datanode.Register()
 	if err != nil {
-		log.Debug("DataNode Register etcd failed", zap.Error(err))
+		log.Debug("failed to register to Etcd", zap.Error(err))
 		return err
 	}
 	return nil
 }
 
 // GetComponentStates gets the component states of Datanode
-func (s *Server) GetComponentStates(ctx context.Context, req *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return s.datanode.GetComponentStates(ctx)
 }
 
@@ -336,13 +340,18 @@ func (s *Server) WatchDmChannels(ctx context.Context, req *datapb.WatchDmChannel
 }
 
 func (s *Server) FlushSegments(ctx context.Context, req *datapb.FlushSegmentsRequest) (*commonpb.Status, error) {
-	if s.datanode.GetStateCode() != internalpb.StateCode_Healthy {
+	if s.datanode.GetStateCode() != commonpb.StateCode_Healthy {
 		return &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_UnexpectedError,
 			Reason:    "DataNode isn't healthy.",
 		}, errors.New("DataNode is not ready yet")
 	}
 	return s.datanode.FlushSegments(ctx, req)
+}
+
+// ShowConfigurations gets specified configurations para of DataNode
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return s.datanode.ShowConfigurations(ctx, req)
 }
 
 // GetMetrics gets the metrics info of Datanode.
@@ -354,6 +363,11 @@ func (s *Server) Compaction(ctx context.Context, request *datapb.CompactionPlan)
 	return s.datanode.Compaction(ctx, request)
 }
 
+// GetCompactionState gets the Compaction tasks state of DataNode
+func (s *Server) GetCompactionState(ctx context.Context, request *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error) {
+	return s.datanode.GetCompactionState(ctx, request)
+}
+
 func (s *Server) Import(ctx context.Context, request *datapb.ImportTaskRequest) (*commonpb.Status, error) {
 	return s.datanode.Import(ctx, request)
 }
@@ -362,6 +376,10 @@ func (s *Server) ResendSegmentStats(ctx context.Context, request *datapb.ResendS
 	return s.datanode.ResendSegmentStats(ctx, request)
 }
 
-func (s *Server) AddSegment(ctx context.Context, request *datapb.AddSegmentRequest) (*commonpb.Status, error) {
-	return s.datanode.AddSegment(ctx, request)
+func (s *Server) AddImportSegment(ctx context.Context, request *datapb.AddImportSegmentRequest) (*datapb.AddImportSegmentResponse, error) {
+	return s.datanode.AddImportSegment(ctx, request)
+}
+
+func (s *Server) SyncSegments(ctx context.Context, request *datapb.SyncSegmentsRequest) (*commonpb.Status, error) {
+	return s.datanode.SyncSegments(ctx, request)
 }

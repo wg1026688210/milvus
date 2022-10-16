@@ -17,8 +17,11 @@
 package common
 
 import (
+	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/milvus-io/milvus/api/commonpb"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -28,4 +31,33 @@ func TestIgnorableError(t *testing.T) {
 	iErr := NewIgnorableError(err)
 	assert.True(t, IsIgnorableError(iErr))
 	assert.False(t, IsIgnorableError(err))
+}
+
+func TestNotExistError(t *testing.T) {
+	err := errors.New("err")
+	assert.Equal(t, false, IsKeyNotExistError(err))
+	assert.Equal(t, true, IsKeyNotExistError(NewKeyNotExistError("foo")))
+}
+
+func TestStatusError_Error(t *testing.T) {
+	err := NewCollectionNotExistError("collection not exist")
+	fmt.Println("test status error: ", err.Error())
+}
+
+func TestIsStatusError(t *testing.T) {
+	err := NewCollectionNotExistError("collection not exist")
+	assert.True(t, IsStatusError(err))
+	assert.False(t, IsStatusError(errors.New("not status error")))
+	assert.False(t, IsStatusError(nil))
+}
+
+func Test_IsCollectionNotExistError(t *testing.T) {
+	assert.False(t, IsCollectionNotExistError(nil))
+	assert.False(t, IsCollectionNotExistError(errors.New("not status error")))
+	for _, code := range collectionNotExistCodes {
+		err := NewStatusError(code, "collection not exist")
+		assert.True(t, IsCollectionNotExistError(err))
+	}
+	assert.True(t, IsCollectionNotExistError(NewCollectionNotExistError("collection not exist")))
+	assert.False(t, IsCollectionNotExistError(NewStatusError(commonpb.ErrorCode_BuildIndexError, "")))
 }

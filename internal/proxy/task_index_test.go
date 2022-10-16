@@ -22,8 +22,8 @@ import (
 
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -60,21 +60,27 @@ func TestGetIndexStateTask_Execute(t *testing.T) {
 
 	shardMgr := newShardClientMgr()
 	// failed to get collection id.
-	_ = InitMetaCache(rootCoord, queryCoord, shardMgr)
+	_ = InitMetaCache(ctx, rootCoord, queryCoord, shardMgr)
 	assert.Error(t, gist.Execute(ctx))
-	rootCoord.GetIndexStateFunc = func(ctx context.Context, request *milvuspb.GetIndexStateRequest) (*indexpb.GetIndexStatesResponse, error) {
-		return &indexpb.GetIndexStatesResponse{
-			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
-			States: []*indexpb.IndexInfo{
-				{
-					State:  commonpb.IndexState_Finished,
-					Reason: "",
-				},
-				{
-					State:  commonpb.IndexState_IndexStateNone,
-					Reason: "",
-				},
+
+	rootCoord.DescribeCollectionFunc = func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+		return &milvuspb.DescribeCollectionResponse{
+			Status: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_Success,
 			},
+			Schema:         newTestSchema(),
+			CollectionID:   collectionID,
+			CollectionName: request.CollectionName,
+		}, nil
+	}
+
+	indexCoord.GetIndexStateFunc = func(ctx context.Context, request *indexpb.GetIndexStateRequest) (*indexpb.GetIndexStateResponse, error) {
+		return &indexpb.GetIndexStateResponse{
+			Status: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_Success,
+			},
+			State:      commonpb.IndexState_Finished,
+			FailReason: "",
 		}, nil
 	}
 

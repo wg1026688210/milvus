@@ -25,9 +25,9 @@ import (
 	"github.com/milvus-io/milvus/internal/util/funcutil"
 	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
@@ -37,6 +37,8 @@ type QueryCoordMockOption func(mock *QueryCoordMock)
 type queryCoordShowCollectionsFuncType func(ctx context.Context, request *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error)
 
 type queryCoordShowPartitionsFuncType func(ctx context.Context, request *querypb.ShowPartitionsRequest) (*querypb.ShowPartitionsResponse, error)
+
+type queryCoordShowConfigurationsFuncType func(ctx context.Context, request *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 
 func SetQueryCoordShowCollectionsFunc(f queryCoordShowCollectionsFuncType) QueryCoordMockOption {
 	return func(mock *QueryCoordMock) {
@@ -60,9 +62,10 @@ type QueryCoordMock struct {
 	inMemoryPercentages []int64
 	colMtx              sync.RWMutex
 
-	showCollectionsFunc queryCoordShowCollectionsFuncType
-	getMetricsFunc      getMetricsFuncType
-	showPartitionsFunc  queryCoordShowPartitionsFuncType
+	showConfigurationsFunc queryCoordShowConfigurationsFuncType
+	showCollectionsFunc    queryCoordShowCollectionsFuncType
+	getMetricsFunc         getMetricsFuncType
+	showPartitionsFunc     queryCoordShowPartitionsFuncType
 
 	statisticsChannel string
 	timeTickChannel   string
@@ -70,38 +73,38 @@ type QueryCoordMock struct {
 	validShardLeaders bool
 }
 
-func (coord *QueryCoordMock) updateState(state internalpb.StateCode) {
+func (coord *QueryCoordMock) updateState(state commonpb.StateCode) {
 	coord.state.Store(state)
 }
 
-func (coord *QueryCoordMock) getState() internalpb.StateCode {
-	return coord.state.Load().(internalpb.StateCode)
+func (coord *QueryCoordMock) getState() commonpb.StateCode {
+	return coord.state.Load().(commonpb.StateCode)
 }
 
 func (coord *QueryCoordMock) healthy() bool {
-	return coord.getState() == internalpb.StateCode_Healthy
+	return coord.getState() == commonpb.StateCode_Healthy
 }
 
 func (coord *QueryCoordMock) Init() error {
-	coord.updateState(internalpb.StateCode_Initializing)
+	coord.updateState(commonpb.StateCode_Initializing)
 	return nil
 }
 
 func (coord *QueryCoordMock) Start() error {
-	defer coord.updateState(internalpb.StateCode_Healthy)
+	defer coord.updateState(commonpb.StateCode_Healthy)
 
 	return nil
 }
 
 func (coord *QueryCoordMock) Stop() error {
-	defer coord.updateState(internalpb.StateCode_Abnormal)
+	defer coord.updateState(commonpb.StateCode_Abnormal)
 
 	return nil
 }
 
-func (coord *QueryCoordMock) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
-	return &internalpb.ComponentStates{
-		State: &internalpb.ComponentInfo{
+func (coord *QueryCoordMock) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+	return &milvuspb.ComponentStates{
+		State: &milvuspb.ComponentInfo{
 			NodeID:    coord.nodeID,
 			Role:      typeutil.QueryCoordRole,
 			StateCode: coord.getState(),
@@ -306,6 +309,29 @@ func (coord *QueryCoordMock) LoadBalance(ctx context.Context, req *querypb.LoadB
 	}
 
 	panic("implement me")
+}
+
+func (coord *QueryCoordMock) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	if !coord.healthy() {
+		return &internalpb.ShowConfigurationsResponse{
+			Status: &commonpb.Status{
+				ErrorCode: commonpb.ErrorCode_UnexpectedError,
+				Reason:    "unhealthy",
+			},
+		}, nil
+	}
+
+	if coord.showConfigurationsFunc != nil {
+		return coord.showConfigurationsFunc(ctx, req)
+	}
+
+	return &internalpb.ShowConfigurationsResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_UnexpectedError,
+			Reason:    "not implemented",
+		},
+	}, nil
+
 }
 
 func (coord *QueryCoordMock) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {

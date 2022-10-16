@@ -124,9 +124,9 @@ func TestRmqClient_GetLatestMsg(t *testing.T) {
 	for {
 		select {
 		case <-ctx.Done():
-			ret, err := actualLastMsg.ID().LessOrEqualThan(expectLastMsg.Serialize())
+			ret, err := expectLastMsg.LessOrEqualThan(actualLastMsg.ID().Serialize())
 			assert.Nil(t, err)
-			assert.False(t, ret)
+			assert.True(t, ret)
 			return
 		case msg := <-consumer.Chan():
 			consumer.Ack(msg)
@@ -192,8 +192,6 @@ func TestRmqClient_Subscribe(t *testing.T) {
 			msgID := rmqmsg.ID()
 			rID := msgID.(*rmqID)
 			assert.NotZero(t, rID)
-			err = consumer.Seek(msgID, true)
-			assert.Nil(t, err)
 		}
 	}
 }

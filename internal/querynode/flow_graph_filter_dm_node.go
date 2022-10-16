@@ -19,14 +19,18 @@ package querynode
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/internal/metrics"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/util/flowgraph"
+	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/trace"
 )
 
@@ -45,6 +49,10 @@ func (fdmNode *filterDmNode) Name() string {
 
 // Operate handles input messages, to filter invalid insert messages
 func (fdmNode *filterDmNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
+	if in == nil {
+		log.Debug("type assertion failed for MsgStreamMsg because it's nil", zap.String("name", fdmNode.Name()))
+		return []Msg{}
+	}
 	if len(in) != 1 {
 		log.Warn("Invalid operate message input in filterDmNode", zap.Int("input length", len(in)), zap.String("name", fdmNode.Name()))
 		return []Msg{}
@@ -52,15 +60,7 @@ func (fdmNode *filterDmNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 
 	msgStreamMsg, ok := in[0].(*MsgStreamMsg)
 	if !ok {
-		if in[0] == nil {
-			log.Debug("type assertion failed for MsgStreamMsg because it's nil", zap.String("name", fdmNode.Name()))
-		} else {
-			log.Warn("type assertion failed for MsgStreamMsg", zap.String("msgType", reflect.TypeOf(in[0]).Name()), zap.String("name", fdmNode.Name()))
-		}
-		return []Msg{}
-	}
-
-	if msgStreamMsg == nil {
+		log.Warn("type assertion failed for MsgStreamMsg", zap.String("msgType", reflect.TypeOf(in[0]).Name()), zap.String("name", fdmNode.Name()))
 		return []Msg{}
 	}
 
@@ -102,6 +102,8 @@ func (fdmNode *filterDmNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 			}
 			if resMsg != nil {
 				iMsg.insertMessages = append(iMsg.insertMessages, resMsg)
+				rateCol.Add(metricsinfo.InsertConsumeThroughput, float64(proto.Size(&resMsg.InsertRequest)))
+				metrics.QueryNodeConsumeCounter.WithLabelValues(strconv.FormatInt(Params.QueryNodeCfg.GetNodeID(), 10), metrics.InsertLabel).Add(float64(proto.Size(&resMsg.InsertRequest)))
 			}
 		case commonpb.MsgType_Delete:
 			resMsg, err := fdmNode.filterInvalidDeleteMessage(msg.(*msgstream.DeleteMsg), collection.getLoadType())
@@ -113,6 +115,8 @@ func (fdmNode *filterDmNode) Operate(in []flowgraph.Msg) []flowgraph.Msg {
 			}
 			if resMsg != nil {
 				iMsg.deleteMessages = append(iMsg.deleteMessages, resMsg)
+				rateCol.Add(metricsinfo.DeleteConsumeThroughput, float64(proto.Size(&resMsg.DeleteRequest)))
+				metrics.QueryNodeConsumeCounter.WithLabelValues(strconv.FormatInt(Params.QueryNodeCfg.GetNodeID(), 10), metrics.DeleteLabel).Add(float64(proto.Size(&resMsg.DeleteRequest)))
 			}
 		default:
 			log.Warn("invalid message type in filterDmNode",
@@ -208,15 +212,17 @@ func (fdmNode *filterDmNode) filterInvalidInsertMessage(msg *msgstream.InsertMsg
 		if segmentInfo.DmlPosition == nil {
 			log.Warn("filter unFlushed segment without checkPoint",
 				zap.String("channel", fdmNode.channel),
-				zap.Any("collectionID", msg.CollectionID),
-				zap.Any("partitionID", msg.PartitionID))
+				zap.Int64("collectionID", msg.CollectionID),
+				zap.Int64("partitionID", msg.PartitionID),
+				zap.Int64("segmentID", msg.SegmentID))
 			continue
 		}
 		if msg.SegmentID == segmentInfo.ID && msg.EndTs() < segmentInfo.DmlPosition.Timestamp {
 			log.Debug("filter invalid insert message, segments are excluded segments",
 				zap.String("channel", fdmNode.channel),
-				zap.Any("collectionID", msg.CollectionID),
-				zap.Any("partitionID", msg.PartitionID))
+				zap.Int64("collectionID", msg.CollectionID),
+				zap.Int64("partitionID", msg.PartitionID),
+				zap.Int64("segmentID", msg.SegmentID))
 			return nil, nil
 		}
 	}

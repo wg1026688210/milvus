@@ -66,7 +66,7 @@ The following scripts are found in the [`build/`](.) directory. Note that all sc
   * `build/builder.sh make unittest`: Run all unit tests.
   * `build/builder.sh make clean`: Clean up all the generated files.
 
-You can specify different OS for builder by setting `OS_NAME` which defaults to `ubuntu18.04`. Valid OS are `ubuntu18.04`, `centos7`.
+You can specify different OS for builder by setting `OS_NAME` which defaults to `ubuntu20.04`. Valid OS are `ubuntu20.04`,`ubuntu18.04`, `centos7`.
 
 To specify `centos7` builder, use these commands:
 
@@ -115,7 +115,7 @@ docker exec -ti milvus_builder_1 bash
 Compile the project and run unit test, see details at the [DEVELOPMENT.md](../DEVELOPMENT.md)
 
 ```shell
-make all
+make milvus
 ```
 
 ```shell

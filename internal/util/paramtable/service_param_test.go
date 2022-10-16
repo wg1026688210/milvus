@@ -12,7 +12,6 @@
 package paramtable
 
 import (
-	"os"
 	"testing"
 
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
@@ -52,20 +51,58 @@ func TestServiceParam(t *testing.T) {
 
 		// test UseEmbedEtcd
 		Params.Base.Save("etcd.use.embed", "true")
-		assert.Nil(t, os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.ClusterDeployMode))
+		t.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.ClusterDeployMode)
 		assert.Panics(t, func() { Params.initUseEmbedEtcd() })
 
-		assert.Nil(t, os.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode))
+		t.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
 		Params.LoadCfgToMemory()
 	})
 
 	t.Run("test pulsarConfig", func(t *testing.T) {
+		{
+			Params := SParams.PulsarCfg
+			assert.NotEqual(t, Params.Address, "")
+			t.Logf("pulsar address = %s", Params.Address)
+			assert.Equal(t, Params.MaxMessageSize, SuggestPulsarMaxMessageSize)
+		}
+
+		address := "pulsar://localhost:6650"
+		{
+			Params := SParams.PulsarCfg
+			SParams.BaseTable.Save("pulsar.address", address)
+			Params.initAddress()
+			assert.Equal(t, Params.Address, address)
+		}
+
+		{
+			Params := SParams.PulsarCfg
+			SParams.BaseTable.Save("pulsar.address", "localhost")
+			SParams.BaseTable.Save("pulsar.port", "6650")
+			Params.initAddress()
+			assert.Equal(t, Params.Address, address)
+		}
+	})
+
+	t.Run("test pulsar web config", func(t *testing.T) {
 		Params := SParams.PulsarCfg
-
 		assert.NotEqual(t, Params.Address, "")
-		t.Logf("pulsar address = %s", Params.Address)
 
-		assert.Equal(t, Params.MaxMessageSize, SuggestPulsarMaxMessageSize)
+		{
+			Params.initWebAddress()
+			assert.NotEqual(t, Params.WebAddress, "")
+		}
+
+		{
+			Params.Address = Params.Address + "invalid"
+			Params.initWebAddress()
+			assert.Equal(t, Params.WebAddress, "")
+		}
+
+		{
+			Params.Address = ""
+			Params.initWebAddress()
+			assert.Equal(t, Params.WebAddress, "")
+		}
 	})
 
 	t.Run("test rocksmqConfig", func(t *testing.T) {

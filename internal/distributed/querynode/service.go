@@ -25,22 +25,24 @@ import (
 	"sync"
 	"time"
 
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	qn "github.com/milvus-io/milvus/internal/querynode"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/milvus-io/milvus/internal/util/retry"
 	"github.com/milvus-io/milvus/internal/util/trace"
@@ -119,8 +121,8 @@ func (s *Server) init() error {
 		return err
 	}
 
-	s.querynode.UpdateStateCode(internalpb.StateCode_Initializing)
-	log.Debug("QueryNode", zap.Any("State", internalpb.StateCode_Initializing))
+	s.querynode.UpdateStateCode(commonpb.StateCode_Initializing)
+	log.Debug("QueryNode", zap.Any("State", commonpb.StateCode_Initializing))
 	if err := s.querynode.Init(); err != nil {
 		log.Error("QueryNode init error: ", zap.Error(err))
 		return err
@@ -179,8 +181,12 @@ func (s *Server) startGrpcLoop(grpcPort int) {
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
-		grpc.UnaryInterceptor(ot.UnaryServerInterceptor(opts...)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			ot.UnaryServerInterceptor(opts...),
+			logutil.UnaryTraceLoggerInterceptor)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			ot.StreamServerInterceptor(opts...),
+			logutil.StreamTraceLoggerInterceptor)))
 	querypb.RegisterQueryNodeServer(s.grpcServer, s)
 
 	ctx, cancel := context.WithCancel(s.ctx)
@@ -251,7 +257,7 @@ func (s *Server) GetStatisticsChannel(ctx context.Context, req *internalpb.GetSt
 }
 
 // GetComponentStates gets the component states of QueryNode.
-func (s *Server) GetComponentStates(ctx context.Context, req *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	// ignore ctx and in
 	return s.querynode.GetComponentStates(ctx)
 }
@@ -262,10 +268,8 @@ func (s *Server) WatchDmChannels(ctx context.Context, req *querypb.WatchDmChanne
 	return s.querynode.WatchDmChannels(ctx, req)
 }
 
-// WatchDeltaChannels watches the channels about data manipulation.
-func (s *Server) WatchDeltaChannels(ctx context.Context, req *querypb.WatchDeltaChannelsRequest) (*commonpb.Status, error) {
-	// ignore ctx
-	return s.querynode.WatchDeltaChannels(ctx, req)
+func (s *Server) UnsubDmChannel(ctx context.Context, req *querypb.UnsubDmChannelRequest) (*commonpb.Status, error) {
+	return s.querynode.UnsubDmChannel(ctx, req)
 }
 
 // LoadSegments loads the segments to search.
@@ -312,7 +316,21 @@ func (s *Server) SyncReplicaSegments(ctx context.Context, req *querypb.SyncRepli
 	return s.querynode.SyncReplicaSegments(ctx, req)
 }
 
+// ShowConfigurations gets specified configurations para of QueryNode
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return s.querynode.ShowConfigurations(ctx, req)
+}
+
 // GetMetrics gets the metrics information of QueryNode.
 func (s *Server) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	return s.querynode.GetMetrics(ctx, req)
+}
+
+// GetDataDistribution gets the distribution information of QueryNode.
+func (s *Server) GetDataDistribution(ctx context.Context, req *querypb.GetDataDistributionRequest) (*querypb.GetDataDistributionResponse, error) {
+	return s.querynode.GetDataDistribution(ctx, req)
+}
+
+func (s *Server) SyncDistribution(ctx context.Context, req *querypb.SyncDistributionRequest) (*commonpb.Status, error) {
+	return s.querynode.SyncDistribution(ctx, req)
 }

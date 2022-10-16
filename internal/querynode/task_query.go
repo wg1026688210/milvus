@@ -24,8 +24,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
@@ -47,12 +47,15 @@ func (q *queryTask) PreExecute(ctx context.Context) error {
 	if !funcutil.CheckCtxValid(q.Ctx()) {
 		return errors.New("search context timeout1$")
 	}
+	q.SetStep(TaskStepPreExecute)
+	rateCol.rtCounter.increaseQueueTime(q)
 	return nil
 }
 
 // TODO: merge queryOnStreaming and queryOnHistorical?
 func (q *queryTask) queryOnStreaming() error {
 	// check ctx timeout
+	ctx := q.Ctx()
 	if !funcutil.CheckCtxValid(q.Ctx()) {
 		return errors.New("query context timeout")
 	}
@@ -66,7 +69,7 @@ func (q *queryTask) queryOnStreaming() error {
 	q.QS.collection.RLock() // locks the collectionPtr
 	defer q.QS.collection.RUnlock()
 	if _, released := q.QS.collection.getReleaseTime(); released {
-		log.Debug("collection release before search", zap.Int64("msgID", q.ID()),
+		log.Ctx(ctx).Debug("collection release before search", zap.Int64("msgID", q.ID()),
 			zap.Int64("collectionID", q.CollectionID))
 		return fmt.Errorf("retrieve failed, collection has been released, collectionID = %d", q.CollectionID)
 	}
@@ -78,13 +81,13 @@ func (q *queryTask) queryOnStreaming() error {
 	}
 	defer plan.delete()
 
-	sResults, _, _, sErr := retrieveStreaming(q.QS.metaReplica, plan, q.CollectionID, q.iReq.GetPartitionIDs(), q.QS.channel, q.QS.vectorChunkManager)
+	sResults, _, _, sErr := retrieveStreaming(ctx, q.QS.metaReplica, plan, q.CollectionID, q.iReq.GetPartitionIDs(), q.QS.channel, q.QS.vectorChunkManager)
 	if sErr != nil {
 		return sErr
 	}
 
 	q.tr.RecordSpan()
-	mergedResult, err := mergeSegcoreRetrieveResults(sResults)
+	mergedResult, err := mergeSegcoreRetrieveResults(ctx, sResults, q.iReq.GetLimit())
 	if err != nil {
 		return err
 	}
@@ -100,8 +103,9 @@ func (q *queryTask) queryOnStreaming() error {
 
 func (q *queryTask) queryOnHistorical() error {
 	// check ctx timeout
-	if !funcutil.CheckCtxValid(q.Ctx()) {
-		return errors.New("search context timeout3$")
+	ctx := q.Ctx()
+	if !funcutil.CheckCtxValid(ctx) {
+		return errors.New("search context timeout")
 	}
 
 	// check if collection has been released, check historical since it's released first
@@ -114,7 +118,7 @@ func (q *queryTask) queryOnHistorical() error {
 	defer q.QS.collection.RUnlock()
 
 	if _, released := q.QS.collection.getReleaseTime(); released {
-		log.Debug("collection release before search", zap.Int64("msgID", q.ID()),
+		log.Ctx(ctx).Debug("collection release before search", zap.Int64("msgID", q.ID()),
 			zap.Int64("collectionID", q.CollectionID))
 		return fmt.Errorf("retrieve failed, collection has been released, collectionID = %d", q.CollectionID)
 	}
@@ -125,11 +129,12 @@ func (q *queryTask) queryOnHistorical() error {
 		return err
 	}
 	defer plan.delete()
-	retrieveResults, _, _, err := retrieveHistorical(q.QS.metaReplica, plan, q.CollectionID, nil, q.req.SegmentIDs, q.QS.vectorChunkManager)
+	retrieveResults, _, _, err := retrieveHistorical(ctx, q.QS.metaReplica, plan, q.CollectionID, nil, q.req.SegmentIDs, q.QS.vectorChunkManager)
 	if err != nil {
 		return err
 	}
-	mergedResult, err := mergeSegcoreRetrieveResults(retrieveResults)
+
+	mergedResult, err := mergeSegcoreRetrieveResults(ctx, retrieveResults, q.req.GetReq().GetLimit())
 	if err != nil {
 		return err
 	}
@@ -138,6 +143,7 @@ func (q *queryTask) queryOnHistorical() error {
 		Ids:        mergedResult.Ids,
 		FieldsData: mergedResult.FieldsData,
 	}
+
 	return nil
 }
 

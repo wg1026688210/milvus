@@ -17,27 +17,52 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
+	"github.com/milvus-io/milvus/internal/log"
+	"github.com/milvus-io/milvus/internal/util"
+	"github.com/milvus-io/milvus/internal/util/crypto"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
 
-const strongTS = 0
-const boundedTS = 2
+const (
+	strongTS  = 0
+	boundedTS = 2
 
-// enableMultipleVectorFields indicates whether to enable multiple vector fields.
-const enableMultipleVectorFields = false
+	// enableMultipleVectorFields indicates whether to enable multiple vector fields.
+	enableMultipleVectorFields = false
 
-// maximum length of variable-length strings
-const maxVarCharLengthKey = "max_length"
-const defaultMaxVarCharLength = 65535
+	// maximum length of variable-length strings
+	maxVarCharLengthKey = "max_length"
+
+	defaultMaxVarCharLength = 65535
+
+	// DefaultIndexType name of default index type for scalar field
+	DefaultIndexType = "STL_SORT"
+
+	// DefaultStringIndexType name of default index type for varChar/string field
+	DefaultStringIndexType = "Trie"
+
+	// Search limit, which applies on:
+	// maximum # of results to return (topK), and
+	// maximum # of search requests (nq).
+	// Check https://milvus.io/docs/limitations.md for more details.
+	searchCountLimit = 16384
+)
+
+var logger = log.L().WithOptions(zap.Fields(zap.String("role", typeutil.ProxyRole)))
 
 // isAlpha check if c is alpha.
 func isAlpha(c uint8) bool {
@@ -55,10 +80,10 @@ func isNumber(c uint8) bool {
 	return true
 }
 
-func validateTopK(topK int64) error {
+func validateLimit(limit int64) error {
 	// TODO make this configurable
-	if topK <= 0 || topK >= 16385 {
-		return fmt.Errorf("limit should be in range [1, 16385], but got %d", topK)
+	if limit <= 0 || limit > searchCountLimit {
+		return fmt.Errorf("should be in range [1, %d], but got %d", searchCountLimit, limit)
 	}
 	return nil
 }
@@ -85,8 +110,8 @@ func validateCollectionNameOrAlias(entity, entityType string) error {
 
 	for i := 1; i < len(entity); i++ {
 		c := entity[i]
-		if c != '_' && c != '$' && !isAlpha(c) && !isNumber(c) {
-			msg := invalidMsg + fmt.Sprintf("Collection %s can only contain numbers, letters, dollars and underscores.", entityType)
+		if c != '_' && !isAlpha(c) && !isNumber(c) {
+			msg := invalidMsg + fmt.Sprintf("Collection %s can only contain numbers, letters and underscores.", entityType)
 			return errors.New(msg)
 		}
 	}
@@ -112,7 +137,7 @@ func validatePartitionTag(partitionTag string, strictCheck bool) error {
 	}
 
 	if int64(len(partitionTag)) > Params.ProxyCfg.MaxNameLength {
-		msg := invalidMsg + "The length of a partition tag must be less than " +
+		msg := invalidMsg + "The length of a partition name must be less than " +
 			strconv.FormatInt(Params.ProxyCfg.MaxNameLength, 10) + " characters."
 		return errors.New(msg)
 	}
@@ -120,15 +145,15 @@ func validatePartitionTag(partitionTag string, strictCheck bool) error {
 	if strictCheck {
 		firstChar := partitionTag[0]
 		if firstChar != '_' && !isAlpha(firstChar) && !isNumber(firstChar) {
-			msg := invalidMsg + "The first character of a partition tag must be an underscore or letter."
+			msg := invalidMsg + "The first character of a partition name must be an underscore or letter."
 			return errors.New(msg)
 		}
 
 		tagSize := len(partitionTag)
 		for i := 1; i < tagSize; i++ {
 			c := partitionTag[i]
-			if c != '_' && c != '$' && !isAlpha(c) && !isNumber(c) {
-				msg := invalidMsg + "Partition tag can only contain numbers, letters, dollars and underscores."
+			if c != '_' && !isAlpha(c) && !isNumber(c) {
+				msg := invalidMsg + "Partition name can only contain numbers, letters and underscores."
 				return errors.New(msg)
 			}
 		}
@@ -255,7 +280,7 @@ func validateFieldType(schema *schemapb.CollectionSchema) error {
 	return nil
 }
 
-//ValidateFieldAutoID call after validatePrimaryKey
+// ValidateFieldAutoID call after validatePrimaryKey
 func ValidateFieldAutoID(coll *schemapb.CollectionSchema) error {
 	var idx = -1
 	for i, field := range coll.Fields {
@@ -573,8 +598,10 @@ func ValidatePassword(password string) error {
 func validateTravelTimestamp(travelTs, tMax typeutil.Timestamp) error {
 	durationSeconds := tsoutil.CalculateDuration(tMax, travelTs) / 1000
 	if durationSeconds > Params.CommonCfg.RetentionDuration {
-		duration := time.Second * time.Duration(durationSeconds)
-		return fmt.Errorf("only support to travel back to %s so far", duration.String())
+
+		durationIn := time.Second * time.Duration(durationSeconds)
+		durationSupport := time.Second * time.Duration(Params.CommonCfg.RetentionDuration)
+		return fmt.Errorf("only support to travel back to %v so far, but got %v", durationSupport, durationIn)
 	}
 	return nil
 }
@@ -592,4 +619,186 @@ func parseGuaranteeTs(ts, tMax typeutil.Timestamp) typeutil.Timestamp {
 		ts = tsoutil.AddPhysicalDurationOnTs(tMax, ratio*time.Millisecond)
 	}
 	return ts
+}
+
+func validateName(entity string, nameType string) error {
+	entity = strings.TrimSpace(entity)
+
+	if entity == "" {
+		return fmt.Errorf("%s should not be empty", nameType)
+	}
+
+	invalidMsg := fmt.Sprintf("invalid %s: %s. ", nameType, entity)
+	if int64(len(entity)) > Params.ProxyCfg.MaxNameLength {
+		msg := invalidMsg + fmt.Sprintf("the length of %s must be less than ", nameType) +
+			strconv.FormatInt(Params.ProxyCfg.MaxNameLength, 10) + " characters."
+		return errors.New(msg)
+	}
+
+	firstChar := entity[0]
+	if firstChar != '_' && !isAlpha(firstChar) {
+		msg := invalidMsg + fmt.Sprintf("the first character of %s must be an underscore or letter.", nameType)
+		return errors.New(msg)
+	}
+
+	for i := 1; i < len(entity); i++ {
+		c := entity[i]
+		if c != '_' && c != '$' && !isAlpha(c) && !isNumber(c) {
+			msg := invalidMsg + fmt.Sprintf("%s can only contain numbers, letters, dollars and underscores.", nameType)
+			return errors.New(msg)
+		}
+	}
+	return nil
+}
+
+func ValidateRoleName(entity string) error {
+	return validateName(entity, "role name")
+}
+
+func IsDefaultRole(roleName string) bool {
+	for _, defaultRole := range util.DefaultRoles {
+		if defaultRole == roleName {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidateObjectName(entity string) error {
+	if util.IsAnyWord(entity) {
+		return nil
+	}
+	return validateName(entity, "role name")
+}
+
+func ValidateObjectType(entity string) error {
+	return validateName(entity, "ObjectType")
+}
+
+func ValidatePrincipalName(entity string) error {
+	return validateName(entity, "PrincipalName")
+}
+
+func ValidatePrincipalType(entity string) error {
+	return validateName(entity, "PrincipalType")
+}
+
+func ValidatePrivilege(entity string) error {
+	if util.IsAnyWord(entity) {
+		return nil
+	}
+	return validateName(entity, "Privilege")
+}
+
+func GetCurUserFromContext(ctx context.Context) (string, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", fmt.Errorf("fail to get md from the context")
+	}
+	authorization := md[strings.ToLower(util.HeaderAuthorize)]
+	if len(authorization) < 1 {
+		return "", fmt.Errorf("fail to get authorization from the md, authorize:[%s]", util.HeaderAuthorize)
+	}
+	token := authorization[0]
+	rawToken, err := crypto.Base64Decode(token)
+	if err != nil {
+		return "", fmt.Errorf("fail to decode the token, token: %s", token)
+	}
+	secrets := strings.SplitN(rawToken, util.CredentialSeperator, 2)
+	if len(secrets) < 2 {
+		return "", fmt.Errorf("fail to get user info from the raw token, raw token: %s", rawToken)
+	}
+	username := secrets[0]
+	return username, nil
+}
+
+func GetRole(username string) ([]string, error) {
+	if globalMetaCache == nil {
+		return []string{}, ErrProxyNotReady()
+	}
+	return globalMetaCache.GetUserRole(username), nil
+}
+
+// PasswordVerify verify password
+func passwordVerify(ctx context.Context, username, rawPwd string, globalMetaCache Cache) bool {
+	// it represents the cache miss if Sha256Password is empty within credInfo, which shall be updated first connection.
+	// meanwhile, generating Sha256Password depends on raw password and encrypted password will not cache.
+	credInfo, err := globalMetaCache.GetCredentialInfo(ctx, username)
+	if err != nil {
+		log.Error("found no credential", zap.String("username", username), zap.Error(err))
+		return false
+	}
+
+	// hit cache
+	sha256Pwd := crypto.SHA256(rawPwd, credInfo.Username)
+	if credInfo.Sha256Password != "" {
+		return sha256Pwd == credInfo.Sha256Password
+	}
+
+	// miss cache, verify against encrypted password from etcd
+	if err := bcrypt.CompareHashAndPassword([]byte(credInfo.EncryptedPassword), []byte(rawPwd)); err != nil {
+		log.Error("Verify password failed", zap.Error(err))
+		return false
+	}
+
+	// update cache after miss cache
+	credInfo.Sha256Password = sha256Pwd
+	log.Debug("get credential miss cache, update cache with", zap.Any("credential", credInfo))
+	globalMetaCache.UpdateCredential(credInfo)
+	return true
+}
+
+// Support wildcard in output fields:
+//
+//	"*" - all scalar fields
+//	"%" - all vector fields
+//
+// For example, A and B are scalar fields, C and D are vector fields, duplicated fields will automatically be removed.
+//
+//	output_fields=["*"] 	 ==> [A,B]
+//	output_fields=["%"] 	 ==> [C,D]
+//	output_fields=["*","%"] ==> [A,B,C,D]
+//	output_fields=["*",A] 	 ==> [A,B]
+//	output_fields=["*",C]   ==> [A,B,C]
+func translateOutputFields(outputFields []string, schema *schemapb.CollectionSchema, addPrimary bool) ([]string, error) {
+	var primaryFieldName string
+	scalarFieldNameMap := make(map[string]bool)
+	vectorFieldNameMap := make(map[string]bool)
+	resultFieldNameMap := make(map[string]bool)
+	resultFieldNames := make([]string, 0)
+
+	for _, field := range schema.Fields {
+		if field.IsPrimaryKey {
+			primaryFieldName = field.Name
+		}
+		if field.DataType == schemapb.DataType_BinaryVector || field.DataType == schemapb.DataType_FloatVector {
+			vectorFieldNameMap[field.Name] = true
+		} else {
+			scalarFieldNameMap[field.Name] = true
+		}
+	}
+
+	for _, outputFieldName := range outputFields {
+		outputFieldName = strings.TrimSpace(outputFieldName)
+		if outputFieldName == "*" {
+			for fieldName := range scalarFieldNameMap {
+				resultFieldNameMap[fieldName] = true
+			}
+		} else if outputFieldName == "%" {
+			for fieldName := range vectorFieldNameMap {
+				resultFieldNameMap[fieldName] = true
+			}
+		} else {
+			resultFieldNameMap[outputFieldName] = true
+		}
+	}
+
+	if addPrimary {
+		resultFieldNameMap[primaryFieldName] = true
+	}
+
+	for fieldName := range resultFieldNameMap {
+		resultFieldNames = append(resultFieldNames, fieldName)
+	}
+	return resultFieldNames, nil
 }

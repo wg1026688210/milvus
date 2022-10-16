@@ -17,11 +17,11 @@
 package indexcoord
 
 const (
-	indexSizeFactor = 6
-	indexFilePrefix = "indexes"
-)
-
-const (
 	// IndexAddTaskName is the name of the operation to add index task.
-	IndexAddTaskName = "IndexAddTask"
+	IndexAddTaskName    = "IndexAddTask"
+	CreateIndexTaskName = "CreateIndexTask"
+
+	flatIndex    = "FLAT"
+	diskAnnIndex = "DISKANN"
+	invalidIndex = "invalid"
 )

@@ -16,11 +16,8 @@
 #include <boost/iterator/counting_iterator.hpp>
 
 #include "common/Consts.h"
-#include "knowhere/index/vector_index/adapter/VectorAdapter.h"
 #include "query/PlanNode.h"
 #include "query/SearchOnSealed.h"
-#include "query/generated/ExecPlanNodeVisitor.h"
-#include "segcore/Reduce.h"
 #include "segcore/SegmentGrowingImpl.h"
 #include "segcore/Utils.h"
 
@@ -176,8 +173,7 @@ SegmentGrowingImpl::num_chunk() const {
 }
 
 void
-SegmentGrowingImpl::vector_search(int64_t vec_count,
-                                  query::SearchInfo& search_info,
+SegmentGrowingImpl::vector_search(SearchInfo& search_info,
                                   const void* query_data,
                                   int64_t query_count,
                                   Timestamp timestamp,
@@ -185,10 +181,10 @@ SegmentGrowingImpl::vector_search(int64_t vec_count,
                                   SearchResult& output) const {
     auto& sealed_indexing = this->get_sealed_indexing_record();
     if (sealed_indexing.is_ready(search_info.field_id_)) {
-        query::SearchOnSealed(this->get_schema(), sealed_indexing, search_info, query_data, query_count, bitset, output,
-                              id_);
+        query::SearchOnSealedIndex(this->get_schema(), sealed_indexing, search_info, query_data, query_count, bitset,
+                                   output);
     } else {
-        SearchOnGrowing(*this, vec_count, search_info, query_data, query_count, bitset, output);
+        query::SearchOnGrowing(*this, search_info, query_data, query_count, timestamp, bitset, output);
     }
 }
 

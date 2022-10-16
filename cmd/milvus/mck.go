@@ -22,7 +22,7 @@ import (
 
 	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 
 	"github.com/golang/protobuf/proto"
@@ -47,7 +47,7 @@ const (
 )
 
 type mck struct {
-	params              paramtable.GrpcServerConfig
+	params              *paramtable.ComponentParam
 	taskKeyMap          map[int64]string
 	taskNameMap         map[int64]string
 	allTaskInfo         map[string]string
@@ -232,27 +232,12 @@ func (c *mck) connectEctd() {
 }
 
 func (c *mck) connectMinio() {
-	useSSL := c.params.MinioCfg.UseSSL
-	if c.minioUseSSL == "true" || c.minioUseSSL == "false" {
-		minioUseSSL, err := strconv.ParseBool(c.minioUseSSL)
-		if err != nil {
-			log.Panic("fail to parse the 'minioUseSSL' string to the bool value", zap.String("minioUseSSL", c.minioUseSSL), zap.Error(err))
-		}
-		useSSL = minioUseSSL
-	}
-	chunkManagerFactory := storage.NewChunkManagerFactory("local", "minio",
-		storage.RootPath(c.params.LocalStorageCfg.Path),
-		storage.Address(getConfigValue(c.minioAddress, c.params.MinioCfg.Address, "minio_address")),
-		storage.AccessKeyID(getConfigValue(c.minioUsername, c.params.MinioCfg.AccessKeyID, "minio_username")),
-		storage.SecretAccessKeyID(getConfigValue(c.minioPassword, c.params.MinioCfg.SecretAccessKey, "minio_password")),
-		storage.UseSSL(useSSL),
-		storage.BucketName(getConfigValue(c.minioBucketName, c.params.MinioCfg.BucketName, "minio_bucket_name")),
-		storage.CreateBucket(true))
+	chunkManagerFactory := storage.NewChunkManagerFactoryWithParam(c.params)
 
 	var err error
-	c.minioChunkManager, err = chunkManagerFactory.NewVectorStorageChunkManager(context.Background())
+	c.minioChunkManager, err = chunkManagerFactory.NewPersistentStorageChunkManager(context.Background())
 	if err != nil {
-		log.Fatal("failed to connect to etcd", zap.Error(err))
+		log.Fatal("failed to connect to minio", zap.Error(err))
 	}
 }
 
@@ -509,7 +494,7 @@ func (c *mck) extractVchannelInfo(taskID int64, infos []*datapb.VchannelInfo) ([
 func (c *mck) extractFieldBinlog(taskID int64, fieldBinlogList []*datapb.FieldBinlog) {
 	for _, fieldBinlog := range fieldBinlogList {
 		for _, binlog := range fieldBinlog.Binlogs {
-			ok, _ := c.minioChunkManager.Exist(binlog.LogPath)
+			ok, _ := c.minioChunkManager.Exist(context.Background(), binlog.LogPath)
 			if !ok {
 				c.taskIDToInvalidPath[taskID] = append(c.taskIDToInvalidPath[taskID], binlog.LogPath)
 			}
@@ -520,7 +505,7 @@ func (c *mck) extractFieldBinlog(taskID int64, fieldBinlogList []*datapb.FieldBi
 func (c *mck) extractVecFieldIndexInfo(taskID int64, infos []*querypb.FieldIndexInfo) {
 	for _, info := range infos {
 		for _, indexPath := range info.IndexFilePaths {
-			ok, _ := c.minioChunkManager.Exist(indexPath)
+			ok, _ := c.minioChunkManager.Exist(context.Background(), indexPath)
 			if !ok {
 				c.taskIDToInvalidPath[taskID] = append(c.taskIDToInvalidPath[taskID], indexPath)
 			}
@@ -624,21 +609,8 @@ func (c *mck) unmarshalTask(taskID int64, t string) (string, []int64, []int64, e
 		log.Info("WatchDmChannels", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
 		return "WatchDmChannels", removeRepeatElement(partitionIDs), removeRepeatElement(segmentIDs), nil
 	case commonpb.MsgType_WatchDeltaChannels:
-		loadReq := querypb.WatchDeltaChannelsRequest{}
-		err = proto.Unmarshal([]byte(t), &loadReq)
-		if err != nil {
-			return errReturn(taskID, "WatchDeltaChannelsRequest", err)
-		}
-		var partitionIDs []int64
-		var segmentIDs []int64
-		if loadReq.LoadMeta != nil {
-			partitionIDs = append(partitionIDs, loadReq.LoadMeta.PartitionIDs...)
-		}
-		pids, sids := c.extractVchannelInfo(taskID, loadReq.Infos)
-		partitionIDs = append(partitionIDs, pids...)
-		segmentIDs = append(segmentIDs, sids...)
-		log.Info("WatchDeltaChannels", zap.String("detail", fmt.Sprintf("+%v", loadReq)))
-		return "WatchDeltaChannels", removeRepeatElement(partitionIDs), removeRepeatElement(segmentIDs), nil
+		log.Warn("legacy WatchDeltaChannels type found, ignore")
+		return "WatchQueryChannels", emptyInt64(), emptyInt64(), nil
 	case commonpb.MsgType_WatchQueryChannels:
 		log.Warn("legacy WatchQueryChannels type found, ignore")
 		return "WatchQueryChannels", emptyInt64(), emptyInt64(), nil

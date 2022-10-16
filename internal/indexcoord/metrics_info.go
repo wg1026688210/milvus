@@ -21,13 +21,37 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/util/hardware"
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
 )
+
+//getComponentConfigurations returns the configurations of indexCoord matching req.Pattern
+func getComponentConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) *internalpb.ShowConfigurationsResponse {
+	prefix := "indexcoord."
+	matchedConfig := Params.IndexCoordCfg.Base.GetByPattern(prefix + req.Pattern)
+	configList := make([]*commonpb.KeyValuePair, 0, len(matchedConfig))
+	for key, value := range matchedConfig {
+		configList = append(configList,
+			&commonpb.KeyValuePair{
+				Key:   key,
+				Value: value,
+			})
+	}
+
+	return &internalpb.ShowConfigurationsResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_Success,
+			Reason:    "",
+		},
+		Configuations: configList,
+	}
+}
 
 // TODO(dragondriver): add more detailed metrics
 func getSystemInfoMetrics(
@@ -42,12 +66,12 @@ func getSystemInfoMetrics(
 				Name: metricsinfo.ConstructComponentName(typeutil.IndexCoordRole, coord.session.ServerID),
 				HardwareInfos: metricsinfo.HardwareMetrics{
 					IP:           coord.session.Address,
-					CPUCoreCount: metricsinfo.GetCPUCoreCount(false),
-					CPUCoreUsage: metricsinfo.GetCPUUsage(),
-					Memory:       metricsinfo.GetMemoryCount(),
-					MemoryUsage:  metricsinfo.GetUsedMemoryCount(),
-					Disk:         metricsinfo.GetDiskCount(),
-					DiskUsage:    metricsinfo.GetDiskUsage(),
+					CPUCoreCount: hardware.GetCPUNum(),
+					CPUCoreUsage: hardware.GetCPUUsage(),
+					Memory:       hardware.GetMemoryCount(),
+					MemoryUsage:  hardware.GetUsedMemoryCount(),
+					Disk:         hardware.GetDiskCount(),
+					DiskUsage:    hardware.GetDiskUsage(),
 				},
 				SystemInfo:  metricsinfo.DeployMetrics{},
 				CreatedTime: Params.IndexCoordCfg.CreatedTime.String(),

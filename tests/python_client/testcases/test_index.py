@@ -90,7 +90,6 @@ class TestIndexParams(TestcaseBase):
                                                 ct.err_msg: f"cannot create index on non-existed field: {f_name}"})
 
     @pytest.mark.tags(CaseLabel.L0)
-    # TODO (reason="pymilvus issue #677", raises=TypeError)
     @pytest.mark.parametrize("index_type", ct.get_invalid_strs)
     def test_index_type_invalid(self, index_type):
         """
@@ -139,9 +138,46 @@ class TestIndexParams(TestcaseBase):
                                    check_task=CheckTasks.err_res,
                                    check_items={ct.err_code: 1, ct.err_msg: ""})
 
-    # TODO: not supported
     @pytest.mark.tags(CaseLabel.L1)
-    @pytest.mark.skip(reason='not supported')
+    @pytest.mark.parametrize("index_name", ["_1ndeX", "In_t0"])
+    def test_index_naming_rules(self, index_name):
+        """
+        target: test index naming rules
+        method: 1. connect milvus
+                2. Create a collection
+                3. Create an index with an index_name which uses all the supported elements in the naming rules
+        expected: Index create successfully
+        """
+        self._connect()
+        collection_w = self.init_collection_wrap()
+        collection_w.create_index(default_field_name, default_index_params, index_name=index_name)
+        assert len(collection_w.indexes) == 1
+        assert collection_w.indexes[0].index_name == index_name
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("index_name", ["_1ndeX", "In_0"])
+    def test_index_same_index_name_two_fields(self, index_name):
+        """
+        target: test index naming rules
+        method: 1. connect milvus
+                2. Create a collection with more than 3 fields
+                3. Create two indexes on two fields with the same index name
+        expected: raise exception
+        """
+        self._connect()
+        collection_w = self.init_collection_wrap()
+        self.index_wrap.init_index(collection_w.collection, default_field_name, default_index_params,
+                                   index_name=index_name)
+        self.index_wrap.init_index(collection_w.collection, ct.default_int64_field_name, default_index_params,
+                                   index_name=index_name,
+                                   check_task=CheckTasks.err_res,
+                                   check_items={ct.err_code: 1,
+                                                ct.err_msg: "CreateIndex failed: index already exist, "
+                                                            "but parameters are inconsistent"})
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.xfail(reason="issue 19181")
+    @pytest.mark.parametrize("get_invalid_index_name", ["1nDex", "$in4t", "12 s", None, "(中文)"])
     def test_index_name_invalid(self, get_invalid_index_name):
         """
         target: test index with error index name
@@ -152,8 +188,7 @@ class TestIndexParams(TestcaseBase):
         index_name = get_invalid_index_name
         collection_w = self.init_collection_wrap(name=c_name)
         self.index_wrap.init_index(collection_w.collection, default_field_name, default_index_params,
-                                   check_task=CheckTasks.err_res,
-                                   check_items={ct.err_code: 1, ct.err_msg: ""})
+                                   index_name=get_invalid_index_name)
 
 
 class TestIndexOperation(TestcaseBase):
@@ -426,8 +461,7 @@ class TestNewIndexBase(TestcaseBase):
                                       index_name=ct.default_index_name)
             assert len(collection_w.indexes) == 1
 
-    @pytest.mark.skip(reason="https://github.com/milvus-io/milvus/issues/12598")
-    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.tags(CaseLabel.L1)
     def test_annoy_index(self):
         # The strange thing is that the indexnode crash is only reproduced when nb is 50000 and dim is 512
         nb = 50000
@@ -987,17 +1021,17 @@ class TestNewIndexBase(TestcaseBase):
         """
         collection_w = self.init_collection_wrap(cf.gen_unique_str(prefix))
         nums = 20
-        tmp_nb = 5000 
-        for i in range (nums) :
+        tmp_nb = 5000
+        for i in range(nums):
             df = cf.gen_default_dataframe_data(nb=tmp_nb, start=i * tmp_nb)
-            insert_res, _  = collection_w.insert(df)
-            assert collection_w.num_entities ==(i+1) * tmp_nb
+            insert_res, _ = collection_w.insert(df)
+            assert collection_w.num_entities == (i + 1) * tmp_nb
         collection_w.create_index(ct.default_float_vec_field_name, default_index_params)
         collection_w.load()
         vectors = [[random.random() for _ in range(default_dim)] for _ in range(default_nq)]
         search_res, _ = collection_w.search(vectors, default_search_field, default_search_params, default_limit)
         assert len(search_res[0]) == ct.default_limit
-            
+
 
 class TestNewIndexBinary(TestcaseBase):
 
@@ -1229,9 +1263,18 @@ class TestNewIndexAsync(TestcaseBase):
         collection_w.insert(data=data)
         res, _ = collection_w.create_index(ct.default_float_vec_field_name, default_index_params,
                                            index_name=ct.default_index_name, _async=_async)
+
+        # load and search
+        collection_w.load()
+        vectors_s = [[random.random() for _ in range(ct.default_dim)] for _ in range(ct.default_nq)]
+        search_res, _ = collection_w.search(vectors_s[:ct.default_nq], ct.default_float_vec_field_name,
+                                            ct.default_search_params, ct.default_limit)
+        assert len(search_res) == ct.default_nq
+        assert len(search_res[0]) == ct.default_limit
+
         if _async:
             res.done()
-            assert len(collection_w.indexes) == 1
+            assert collection_w.indexes[0].params == default_index_params
         collection_w.drop_index(index_name=ct.default_index_name)
         assert len(collection_w.indexes) == 0
 
@@ -1434,5 +1477,27 @@ class TestIndexString(TestcaseBase):
         data = cf.gen_default_list_data()
         collection_w.insert(data=data)
         collection_w.create_index(default_string_field_name, default_string_index_params, index_name=index_name2)
+        collection_w.drop_index(index_name=index_name2)
+        assert len(collection_w.indexes) == 0
+    
+    @pytest.mark.tags(CaseLabel.L1)
+    def test_index_with_string_field_empty(self):
+        """
+        target: test drop index with string field
+        method: 1.create collection and insert data
+                2.create index and uses collection.drop_index () drop index
+        expected: drop index successfully
+        """
+        c_name = cf.gen_unique_str(prefix)
+        collection_w = self.init_collection_wrap(name=c_name)
+
+        nb = 3000
+        data = cf.gen_default_list_data(nb)
+        data[2] = [""for _ in range(nb)] 
+        collection_w.insert(data=data)
+
+        collection_w.create_index(default_string_field_name, default_string_index_params, index_name=index_name2)
+        assert collection_w.has_index(index_name=index_name2)[0] == True
+
         collection_w.drop_index(index_name=index_name2)
         assert len(collection_w.indexes) == 0

@@ -9,14 +9,15 @@ package indexcgowrapper
 import "C"
 import (
 	"fmt"
+	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"path/filepath"
 	"runtime"
 	"unsafe"
 
 	"github.com/golang/protobuf/proto"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/proto/indexcgopb"
@@ -25,11 +26,18 @@ import (
 
 type Blob = storage.Blob
 
+type IndexFileInfo struct {
+	FileName string
+	FileSize int64
+}
+
 type CodecIndex interface {
 	Build(*Dataset) error
 	Serialize() ([]*Blob, error)
+	GetIndexFileInfo() ([]*IndexFileInfo, error)
 	Load([]*Blob) error
 	Delete() error
+	CleanLocalData() error
 }
 
 var (
@@ -42,7 +50,7 @@ type CgoIndex struct {
 }
 
 // TODO: use proto.Marshal instead of proto.MarshalTextString for better compatibility.
-func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]string) (*CgoIndex, error) {
+func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]string, config *indexpb.StorageConfig) (*CgoIndex, error) {
 	protoTypeParams := &indexcgopb.TypeParams{
 		Params: make([]*commonpb.KeyValuePair, 0),
 	}
@@ -64,9 +72,37 @@ func NewCgoIndex(dtype schemapb.DataType, typeParams, indexParams map[string]str
 	defer C.free(unsafe.Pointer(typeParamsPointer))
 	defer C.free(unsafe.Pointer(indexParamsPointer))
 
+	// TODO::xige-16 support embedded milvus
+	storageType := "minio"
+	cAddress := C.CString(config.Address)
+	cBucketName := C.CString(config.GetBucketName())
+	cAccessKey := C.CString(config.GetAccessKeyID())
+	cAccessValue := C.CString(config.GetSecretAccessKey())
+	cRootPath := C.CString(config.GetRootPath())
+	cStorageType := C.CString(storageType)
+	cIamEndPoint := C.CString(config.GetIAMEndpoint())
+	defer C.free(unsafe.Pointer(cAddress))
+	defer C.free(unsafe.Pointer(cBucketName))
+	defer C.free(unsafe.Pointer(cAccessKey))
+	defer C.free(unsafe.Pointer(cAccessValue))
+	defer C.free(unsafe.Pointer(cRootPath))
+	defer C.free(unsafe.Pointer(cStorageType))
+	defer C.free(unsafe.Pointer(cIamEndPoint))
+	storageConfig := C.CStorageConfig{
+		address:          cAddress,
+		bucket_name:      cBucketName,
+		access_key_id:    cAccessKey,
+		access_key_value: cAccessValue,
+		remote_root_path: cRootPath,
+		storage_type:     cStorageType,
+		iam_endpoint:     cIamEndPoint,
+		useSSL:           C.bool(config.GetUseSSL()),
+		useIAM:           C.bool(config.GetUseIAM()),
+	}
+
 	var indexPtr C.CIndex
 	cintDType := uint32(dtype)
-	status := C.CreateIndex(cintDType, typeParamsPointer, indexParamsPointer, &indexPtr)
+	status := C.CreateIndex(cintDType, typeParamsPointer, indexParamsPointer, &indexPtr, storageConfig)
 	if err := HandleCStatus(&status, "failed to create index"); err != nil {
 		return nil, err
 	}
@@ -216,11 +252,49 @@ func (index *CgoIndex) Serialize() ([]*Blob, error) {
 		if err != nil {
 			return nil, err
 		}
+		size, err := GetBinarySetSize(cBinarySet, key)
+		if err != nil {
+			return nil, err
+		}
 		blob := &Blob{
 			Key:   key,
 			Value: value,
+			Size:  size,
 		}
 		ret = append(ret, blob)
+	}
+
+	return ret, nil
+}
+
+func (index *CgoIndex) GetIndexFileInfo() ([]*IndexFileInfo, error) {
+	var cBinarySet C.CBinarySet
+
+	status := C.SerializeIndexToBinarySet(index.indexPtr, &cBinarySet)
+	defer func() {
+		if cBinarySet != nil {
+			C.DeleteBinarySet(cBinarySet)
+		}
+	}()
+	if err := HandleCStatus(&status, "failed to serialize index to binary set"); err != nil {
+		return nil, err
+	}
+
+	keys, err := GetBinarySetKeys(cBinarySet)
+	if err != nil {
+		return nil, err
+	}
+	ret := make([]*IndexFileInfo, 0)
+	for _, key := range keys {
+		size, err := GetBinarySetSize(cBinarySet, key)
+		if err != nil {
+			return nil, err
+		}
+		info := &IndexFileInfo{
+			FileName: key,
+			FileSize: size,
+		}
+		ret = append(ret, info)
 	}
 
 	return ret, nil
@@ -258,4 +332,9 @@ func (index *CgoIndex) Delete() error {
 	status := C.DeleteIndex(index.indexPtr)
 	index.close = true
 	return HandleCStatus(&status, "failed to delete index")
+}
+
+func (index *CgoIndex) CleanLocalData() error {
+	status := C.CleanLocalData(index.indexPtr)
+	return HandleCStatus(&status, "failed to clean cached data on disk")
 }

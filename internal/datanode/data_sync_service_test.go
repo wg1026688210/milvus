@@ -28,13 +28,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 )
@@ -139,15 +139,20 @@ func TestDataSyncService_newDataSyncService(te *testing.T) {
 			0, 0, "", 0,
 			0, 0, "", 0,
 			"replica nil"},
+		{true, false, &mockMsgStreamFactory{true, true},
+			1, "by-dev-rootcoord-dml-test_v1",
+			1, 1, "by-dev-rootcoord-dml-test_v1", 0,
+			1, 2, "by-dev-rootcoord-dml-test_v1", 0,
+			"add un-flushed and flushed segments"},
 	}
 	cm := storage.NewLocalChunkManager(storage.RootPath(dataSyncServiceTestDir))
-	defer cm.RemoveWithPrefix("")
+	defer cm.RemoveWithPrefix(ctx, "")
 
 	for _, test := range tests {
 		te.Run(test.description, func(t *testing.T) {
 			df := &DataCoordFactory{}
 
-			replica, err := newReplica(context.Background(), &RootCoordFactory{pkType: schemapb.DataType_Int64}, cm, test.collID)
+			replica, err := newReplica(context.Background(), &RootCoordFactory{pkType: schemapb.DataType_Int64}, cm, test.collID, nil)
 			assert.Nil(t, err)
 			if test.replicaNil {
 				replica = nil
@@ -204,8 +209,8 @@ func TestDataSyncService_Start(t *testing.T) {
 	flushChan := make(chan flushMsg, 100)
 	resendTTChan := make(chan resendTTMsg, 100)
 	cm := storage.NewLocalChunkManager(storage.RootPath(dataSyncServiceTestDir))
-	defer cm.RemoveWithPrefix("")
-	replica, err := newReplica(context.Background(), mockRootCoord, cm, collectionID)
+	defer cm.RemoveWithPrefix(ctx, "")
+	replica, err := newReplica(context.Background(), mockRootCoord, cm, collectionID, collMeta.GetSchema())
 	assert.Nil(t, err)
 
 	allocFactory := NewAllocatorFactory(1)
@@ -406,10 +411,12 @@ func TestGetSegmentInfos(t *testing.T) {
 }
 
 func TestClearGlobalFlushingCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	dataCoord := &DataCoordFactory{}
 	cm := storage.NewLocalChunkManager(storage.RootPath(dataSyncServiceTestDir))
-	defer cm.RemoveWithPrefix("")
-	replica, err := newReplica(context.Background(), &RootCoordFactory{pkType: schemapb.DataType_Int64}, cm, 1)
+	defer cm.RemoveWithPrefix(ctx, "")
+	replica, err := newReplica(context.Background(), &RootCoordFactory{pkType: schemapb.DataType_Int64}, cm, 1, nil)
 	require.NoError(t, err)
 
 	cache := newCache()
@@ -419,13 +426,42 @@ func TestClearGlobalFlushingCache(t *testing.T) {
 		flushingSegCache: cache,
 	}
 
-	err = replica.addNewSegment(1, 1, 1, "", &internalpb.MsgPosition{}, &internalpb.MsgPosition{})
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:     datapb.SegmentType_New,
+			segID:       1,
+			collID:      1,
+			partitionID: 1,
+			channelName: "",
+			startPos:    &internalpb.MsgPosition{},
+			endPos:      &internalpb.MsgPosition{}})
 	assert.NoError(t, err)
 
-	err = replica.addFlushedSegment(2, 1, 1, "", 0, nil, 0)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:      datapb.SegmentType_Flushed,
+			segID:        2,
+			collID:       1,
+			partitionID:  1,
+			channelName:  "",
+			numOfRows:    0,
+			statsBinLogs: nil,
+			recoverTs:    0,
+		})
 	assert.NoError(t, err)
 
-	err = replica.addNormalSegment(3, 1, 1, "", 0, nil, nil, 0)
+	err = replica.addSegment(
+		addSegmentReq{
+			segType:      datapb.SegmentType_Normal,
+			segID:        3,
+			collID:       1,
+			partitionID:  1,
+			channelName:  "",
+			numOfRows:    0,
+			statsBinLogs: nil,
+			cp:           nil,
+			recoverTs:    0,
+		})
 	assert.NoError(t, err)
 
 	cache.checkOrCache(1)
@@ -438,4 +474,29 @@ func TestClearGlobalFlushingCache(t *testing.T) {
 	assert.False(t, cache.checkIfCached(2))
 	assert.False(t, cache.checkIfCached(3))
 	assert.True(t, cache.checkIfCached(4))
+}
+
+func TestGetChannelLatestMsgID(t *testing.T) {
+	delay := time.Now().Add(ctxTimeInMillisecond * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), delay)
+	defer cancel()
+	factory := dependency.NewDefaultFactory(true)
+
+	dataCoord := &DataCoordFactory{}
+	dsService := &dataSyncService{
+		dataCoord: dataCoord,
+		msFactory: factory,
+	}
+
+	dmlChannelName := "fake-by-dev-rootcoord-dml-channel_12345v0"
+
+	insertStream, _ := factory.NewMsgStream(ctx)
+	insertStream.AsProducer([]string{dmlChannelName})
+
+	var insertMsgStream = insertStream
+	insertMsgStream.Start()
+
+	id, err := dsService.getChannelLatestMsgID(ctx, dmlChannelName, 0)
+	assert.NoError(t, err)
+	assert.NotNil(t, id)
 }

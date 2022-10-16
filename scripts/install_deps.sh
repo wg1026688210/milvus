@@ -21,14 +21,15 @@ function install_linux_deps() {
       # for Ubuntu 18.04
       sudo apt install -y g++ gcc make lcov libtool m4 autoconf automake ccache libssl-dev zlib1g-dev libboost-regex-dev \
           libboost-program-options-dev libboost-system-dev libboost-filesystem-dev \
-          libboost-serialization-dev python3-dev libboost-python-dev libcurl4-openssl-dev gfortran libtbb-dev
+          libboost-serialization-dev python3-dev libboost-python-dev libcurl4-openssl-dev gfortran libtbb-dev libzstd-dev libaio-dev \
+          uuid-dev libpulse-dev
   elif [[ -x "$(command -v yum)" ]]; then
       # for CentOS 7
       sudo yum install -y epel-release centos-release-scl-rh && \
-      sudo yum install -y git make lcov libtool m4 autoconf automake ccache openssl-devel zlib-devel \
+      sudo yum install -y git make lcov libtool m4 autoconf automake ccache openssl-devel zlib-devel libzstd-devel \
           libcurl-devel python3-devel \
           devtoolset-7-gcc devtoolset-7-gcc-c++ devtoolset-7-gcc-gfortran \
-          llvm-toolset-7.0-clang llvm-toolset-7.0-clang-tools-extra
+          llvm-toolset-7.0-clang llvm-toolset-7.0-clang-tools-extra libuuid-devel pulseaudio-libs-devel 
 
       echo "source scl_source enable devtoolset-7" | sudo tee -a /etc/profile.d/devtoolset-7.sh
       echo "source scl_source enable llvm-toolset-7.0" | sudo tee -a /etc/profile.d/llvm-toolset-7.sh
@@ -56,7 +57,7 @@ function install_linux_deps() {
 
 function install_mac_deps() {
   sudo xcode-select --install  > /dev/null 2>&1
-  brew install boost libomp ninja tbb cmake llvm ccache
+  brew install boost libomp ninja tbb cmake llvm ccache zstd
   brew uninstall grep
   brew install grep
   export PATH="/usr/local/opt/grep/libexec/gnubin:$PATH"

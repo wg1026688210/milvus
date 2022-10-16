@@ -1,4 +1,5 @@
 from pymilvus.client.types import CompactionPlans
+from pymilvus.orm.role import Role
 
 from utils.util_log import test_log as log
 from common import common_type as ct
@@ -74,6 +75,14 @@ class ResponseChecker:
 
         elif self.check_task == CheckTasks.check_merge_compact:
             result = self.check_merge_compact_plan(self.response, self.func_name, self.check_items)
+
+        elif self.check_task == CheckTasks.check_role_property:
+            # Collection interface response check
+            result = self.check_role_property(self.response, self.func_name, self.check_items)
+
+        elif self.check_task == CheckTasks.check_permission_deny:
+            # Collection interface response check
+            result = self.check_permission_deny(self.response, self.succ)
 
         # Add check_items here if something new need verify
 
@@ -373,3 +382,25 @@ class ResponseChecker:
         assert len(compaction_plans.plans[0].sources) == segment_num
         assert compaction_plans.plans[0].target not in compaction_plans.plans[0].sources
 
+    @staticmethod
+    def check_role_property(role, func_name, check_items):
+        exp_func_name = "create_role"
+        if func_name != exp_func_name:
+            log.warning("The function name is {} rather than {}".format(func_name, exp_func_name))
+        if not isinstance(role, Role):
+            raise Exception("The result to check isn't role type object")
+        if check_items is None:
+            raise Exception("No expect values found in the check task")
+        if check_items.get("name", None):
+            assert role.name == check_items["name"]
+        return True
+
+    @staticmethod
+    def check_permission_deny(res, actual=True):
+        assert actual is False
+        if isinstance(res, Error):
+            assert "permission deny" in res.message
+        else:
+            log.error("[CheckFunc] Response of API is not an error: %s" % str(res))
+            assert False
+        return True

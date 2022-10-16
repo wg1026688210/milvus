@@ -17,6 +17,7 @@
 #include "common/LoadInfo.h"
 #include "pb/segcore.pb.h"
 #include "segcore/SegmentInterface.h"
+#include "segcore/Types.h"
 
 namespace milvus::segcore {
 

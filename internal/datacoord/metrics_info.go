@@ -20,14 +20,46 @@ import (
 	"context"
 	"errors"
 
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/util/hardware"
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/milvus-io/milvus/internal/util/uniquegenerator"
-	"go.uber.org/zap"
 )
+
+// getQuotaMetrics returns DataCoordQuotaMetrics.
+func (s *Server) getQuotaMetrics() *metricsinfo.DataCoordQuotaMetrics {
+	return &metricsinfo.DataCoordQuotaMetrics{
+		TotalBinlogSize: s.meta.GetTotalBinlogSize(),
+	}
+}
+
+//getComponentConfigurations returns the configurations of dataNode matching req.Pattern
+func getComponentConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) *internalpb.ShowConfigurationsResponse {
+	prefix := "datacoord."
+	matchedConfig := Params.DataCoordCfg.Base.GetByPattern(prefix + req.Pattern)
+	configList := make([]*commonpb.KeyValuePair, 0, len(matchedConfig))
+	for key, value := range matchedConfig {
+		configList = append(configList,
+			&commonpb.KeyValuePair{
+				Key:   key,
+				Value: value,
+			})
+	}
+
+	return &internalpb.ShowConfigurationsResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_Success,
+			Reason:    "",
+		},
+		Configuations: configList,
+	}
+}
 
 // getSystemInfoMetrics composes data cluster metrics
 func (s *Server) getSystemInfoMetrics(
@@ -90,12 +122,12 @@ func (s *Server) getDataCoordMetrics() metricsinfo.DataCoordInfos {
 			Name: metricsinfo.ConstructComponentName(typeutil.DataCoordRole, Params.DataCoordCfg.GetNodeID()),
 			HardwareInfos: metricsinfo.HardwareMetrics{
 				IP:           s.session.Address,
-				CPUCoreCount: metricsinfo.GetCPUCoreCount(false),
-				CPUCoreUsage: metricsinfo.GetCPUUsage(),
-				Memory:       metricsinfo.GetMemoryCount(),
-				MemoryUsage:  metricsinfo.GetUsedMemoryCount(),
-				Disk:         metricsinfo.GetDiskCount(),
-				DiskUsage:    metricsinfo.GetDiskUsage(),
+				CPUCoreCount: hardware.GetCPUNum(),
+				CPUCoreUsage: hardware.GetCPUUsage(),
+				Memory:       hardware.GetMemoryCount(),
+				MemoryUsage:  hardware.GetUsedMemoryCount(),
+				Disk:         hardware.GetDiskCount(),
+				DiskUsage:    hardware.GetDiskUsage(),
 			},
 			SystemInfo:  metricsinfo.DeployMetrics{},
 			CreatedTime: Params.DataCoordCfg.CreatedTime.String(),
@@ -106,6 +138,7 @@ func (s *Server) getDataCoordMetrics() metricsinfo.DataCoordInfos {
 		SystemConfigurations: metricsinfo.DataCoordConfiguration{
 			SegmentMaxSize: Params.DataCoordCfg.SegmentMaxSize,
 		},
+		QuotaMetrics: s.getQuotaMetrics(),
 	}
 
 	metricsinfo.FillDeployMetricsWithEnv(&ret.BaseComponentInfos.SystemInfo)

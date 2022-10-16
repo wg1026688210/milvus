@@ -26,15 +26,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 )
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 type MockQueryNode struct {
-	states     *internalpb.ComponentStates
+	states     *milvuspb.ComponentStates
 	status     *commonpb.Status
 	err        error
 	initErr    error
@@ -44,9 +44,11 @@ type MockQueryNode struct {
 	strResp    *milvuspb.StringResponse
 	infoResp   *querypb.GetSegmentInfoResponse
 	metricResp *milvuspb.GetMetricsResponse
+	configResp *internalpb.ShowConfigurationsResponse
 	StatsResp  *internalpb.GetStatisticsResponse
 	searchResp *internalpb.SearchResults
 	queryResp  *internalpb.RetrieveResults
+	distResp   *querypb.GetDataDistributionResponse
 }
 
 func (m *MockQueryNode) Init() error {
@@ -65,7 +67,7 @@ func (m *MockQueryNode) Register() error {
 	return m.regErr
 }
 
-func (m *MockQueryNode) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
+func (m *MockQueryNode) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
 	return m.states, m.err
 }
 
@@ -78,10 +80,6 @@ func (m *MockQueryNode) GetTimeTickChannel(ctx context.Context) (*milvuspb.Strin
 }
 
 func (m *MockQueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDmChannelsRequest) (*commonpb.Status, error) {
-	return m.status, m.err
-}
-
-func (m *MockQueryNode) WatchDeltaChannels(ctx context.Context, req *querypb.WatchDeltaChannelsRequest) (*commonpb.Status, error) {
 	return m.status, m.err
 }
 
@@ -128,7 +126,7 @@ func (m *MockQueryNode) SyncReplicaSegments(ctx context.Context, req *querypb.Sy
 func (m *MockQueryNode) SetEtcdClient(client *clientv3.Client) {
 }
 
-func (m *MockQueryNode) UpdateStateCode(code internalpb.StateCode) {
+func (m *MockQueryNode) UpdateStateCode(code commonpb.StateCode) {
 }
 
 func (m *MockQueryNode) SetRootCoord(rc types.RootCoord) error {
@@ -139,7 +137,20 @@ func (m *MockQueryNode) SetIndexCoord(index types.IndexCoord) error {
 	return m.err
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+func (m *MockQueryNode) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return m.configResp, m.err
+}
+
+func (m *MockQueryNode) UnsubDmChannel(ctx context.Context, req *querypb.UnsubDmChannelRequest) (*commonpb.Status, error) {
+	return m.status, m.err
+}
+func (m *MockQueryNode) GetDataDistribution(context.Context, *querypb.GetDataDistributionRequest) (*querypb.GetDataDistributionResponse, error) {
+	return m.distResp, m.err
+}
+func (m *MockQueryNode) SyncDistribution(context.Context, *querypb.SyncDistributionRequest) (*commonpb.Status, error) {
+	return m.status, m.err
+}
+
 type MockRootCoord struct {
 	types.RootCoord
 	initErr  error
@@ -168,9 +179,9 @@ func (m *MockRootCoord) Register() error {
 func (m *MockRootCoord) SetEtcdClient(client *clientv3.Client) {
 }
 
-func (m *MockRootCoord) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
-	return &internalpb.ComponentStates{
-		State:  &internalpb.ComponentInfo{StateCode: internalpb.StateCode_Healthy},
+func (m *MockRootCoord) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+	return &milvuspb.ComponentStates{
+		State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
 		Status: &commonpb.Status{ErrorCode: m.stateErr},
 	}, nil
 }
@@ -204,9 +215,9 @@ func (m *MockIndexCoord) Register() error {
 func (m *MockIndexCoord) SetEtcdClient(client *clientv3.Client) {
 }
 
-func (m *MockIndexCoord) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
-	return &internalpb.ComponentStates{
-		State:  &internalpb.ComponentInfo{StateCode: internalpb.StateCode_Healthy},
+func (m *MockIndexCoord) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+	return &milvuspb.ComponentStates{
+		State:  &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy},
 		Status: &commonpb.Status{ErrorCode: m.stateErr},
 	}, nil
 }
@@ -219,12 +230,13 @@ func Test_NewServer(t *testing.T) {
 	assert.NotNil(t, server)
 
 	mqn := &MockQueryNode{
-		states:     &internalpb.ComponentStates{State: &internalpb.ComponentInfo{StateCode: internalpb.StateCode_Healthy}},
+		states:     &milvuspb.ComponentStates{State: &milvuspb.ComponentInfo{StateCode: commonpb.StateCode_Healthy}},
 		status:     &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
 		err:        nil,
 		strResp:    &milvuspb.StringResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}},
 		infoResp:   &querypb.GetSegmentInfoResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}},
 		metricResp: &milvuspb.GetMetricsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}},
+		configResp: &internalpb.ShowConfigurationsResponse{Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success}},
 	}
 	server.querynode = mqn
 
@@ -234,10 +246,10 @@ func Test_NewServer(t *testing.T) {
 	})
 
 	t.Run("GetComponentStates", func(t *testing.T) {
-		req := &internalpb.GetComponentStatesRequest{}
+		req := &milvuspb.GetComponentStatesRequest{}
 		states, err := server.GetComponentStates(ctx, req)
 		assert.Nil(t, err)
-		assert.Equal(t, internalpb.StateCode_Healthy, states.State.StateCode)
+		assert.Equal(t, commonpb.StateCode_Healthy, states.State.StateCode)
 	})
 
 	t.Run("GetStatisticsChannel", func(t *testing.T) {
@@ -324,6 +336,15 @@ func Test_NewServer(t *testing.T) {
 		resp, err := server.SyncReplicaSegments(ctx, req)
 		assert.NoError(t, err)
 		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetErrorCode())
+	})
+
+	t.Run("ShowConfigurtaions", func(t *testing.T) {
+		req := &internalpb.ShowConfigurationsRequest{
+			Pattern: "Cache",
+		}
+		resp, err := server.ShowConfigurations(ctx, req)
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
 	})
 
 	err = server.Stop()

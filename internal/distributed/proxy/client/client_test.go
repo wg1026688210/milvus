@@ -67,20 +67,16 @@ func Test_NewClient(t *testing.T) {
 		r3, err := client.InvalidateCollectionMetaCache(ctx, nil)
 		retCheck(retNotNil, r3, err)
 
-		r4, err := client.ReleaseDQLMessageStream(ctx, nil)
-		retCheck(retNotNil, r4, err)
-
-		r5, err := client.SendSearchResult(ctx, nil)
-		retCheck(retNotNil, r5, err)
-
-		r6, err := client.SendRetrieveResult(ctx, nil)
-		retCheck(retNotNil, r6, err)
-
 		r7, err := client.InvalidateCredentialCache(ctx, nil)
 		retCheck(retNotNil, r7, err)
 
 		r8, err := client.UpdateCredentialCache(ctx, nil)
 		retCheck(retNotNil, r8, err)
+
+		{
+			r, err := client.RefreshPolicyInfoCache(ctx, nil)
+			retCheck(retNotNil, r, err)
+		}
 	}
 
 	client.grpcClient = &mock.GRPCClientBase{
@@ -135,20 +131,16 @@ func Test_NewClient(t *testing.T) {
 	r3Timeout, err := client.InvalidateCollectionMetaCache(shortCtx, nil)
 	retCheck(r3Timeout, err)
 
-	r4Timeout, err := client.ReleaseDQLMessageStream(shortCtx, nil)
-	retCheck(r4Timeout, err)
-
-	r5Timeout, err := client.SendSearchResult(shortCtx, nil)
-	retCheck(r5Timeout, err)
-
-	r6Timeout, err := client.SendRetrieveResult(shortCtx, nil)
-	retCheck(r6Timeout, err)
-
 	r7Timeout, err := client.InvalidateCredentialCache(shortCtx, nil)
 	retCheck(r7Timeout, err)
 
 	r8Timeout, err := client.UpdateCredentialCache(shortCtx, nil)
 	retCheck(r8Timeout, err)
+
+	{
+		rTimeout, err := client.RefreshPolicyInfoCache(shortCtx, nil)
+		retCheck(rTimeout, err)
+	}
 
 	// cleanup
 	err = client.Stop()

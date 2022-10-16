@@ -39,11 +39,6 @@ func TestRmqRetention_Basic(t *testing.T) {
 		return
 	}
 	defer os.RemoveAll(retentionPath)
-	atomic.StoreInt64(&RocksmqRetentionSizeInMB, 0)
-	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 0)
-	atomic.StoreInt64(&RocksmqPageSize, 10)
-	atomic.StoreInt64(&TickerTimeInSeconds, 2)
-
 	rocksdbPath := retentionPath
 	defer os.RemoveAll(rocksdbPath)
 	metaPath := retentionPath + metaPathSuffix
@@ -51,10 +46,15 @@ func TestRmqRetention_Basic(t *testing.T) {
 
 	var params paramtable.BaseTable
 	params.Init()
+
+	checkTimeInterval := 2
+	atomic.StoreInt64(&RocksmqPageSize, 10)
+	atomic.StoreInt64(&TickerTimeInSeconds, int64(checkTimeInterval))
 	rmq, err := NewRocksMQ(params, rocksdbPath, nil)
-	defer rmq.Close()
 	assert.Nil(t, err)
-	defer rmq.stopRetention()
+	defer rmq.Close()
+	atomic.StoreInt64(&RocksmqRetentionSizeInMB, 0)
+	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 0)
 
 	topicName := "topic_a"
 	err = rmq.CreateTopic(topicName)
@@ -91,10 +91,10 @@ func TestRmqRetention_Basic(t *testing.T) {
 	}
 	assert.Equal(t, len(cMsgs), msgNum)
 
-	checkTimeInterval := 2
 	time.Sleep(time.Duration(checkTimeInterval+1) * time.Second)
+
 	// Seek to a previous consumed message, the message should be clean up
-	err = rmq.Seek(topicName, groupName, cMsgs[msgNum/2].MsgID)
+	err = rmq.ForceSeek(topicName, groupName, cMsgs[msgNum/2].MsgID)
 	assert.Nil(t, err)
 	newRes, err := rmq.Consume(topicName, groupName, 1)
 	assert.Nil(t, err)
@@ -133,10 +133,6 @@ func TestRmqRetention_NotConsumed(t *testing.T) {
 		return
 	}
 	defer os.RemoveAll(retentionPath)
-	atomic.StoreInt64(&RocksmqRetentionSizeInMB, 0)
-	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 0)
-	atomic.StoreInt64(&RocksmqPageSize, 10)
-	atomic.StoreInt64(&TickerTimeInSeconds, 2)
 
 	rocksdbPath := retentionPath
 	defer os.RemoveAll(rocksdbPath)
@@ -145,10 +141,14 @@ func TestRmqRetention_NotConsumed(t *testing.T) {
 
 	var params paramtable.BaseTable
 	params.Init()
+	atomic.StoreInt64(&RocksmqPageSize, 10)
+	atomic.StoreInt64(&TickerTimeInSeconds, 2)
 	rmq, err := NewRocksMQ(params, rocksdbPath, nil)
-	defer rmq.Close()
 	assert.Nil(t, err)
-	defer rmq.stopRetention()
+	defer rmq.Close()
+
+	atomic.StoreInt64(&RocksmqRetentionSizeInMB, 0)
+	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 0)
 
 	topicName := "topic_a"
 	err = rmq.CreateTopic(topicName)
@@ -195,8 +195,9 @@ func TestRmqRetention_NotConsumed(t *testing.T) {
 	// wait for retention
 	checkTimeInterval := 2
 	time.Sleep(time.Duration(checkTimeInterval+1) * time.Second)
+
 	// Seek to a previous consumed message, the message should be clean up
-	err = rmq.Seek(topicName, groupName, cMsgs[1].MsgID)
+	err = rmq.ForceSeek(topicName, groupName, cMsgs[1].MsgID)
 	assert.Nil(t, err)
 	newRes, err := rmq.Consume(topicName, groupName, 1)
 	assert.Nil(t, err)
@@ -238,12 +239,6 @@ func TestRmqRetention_MultipleTopic(t *testing.T) {
 		return
 	}
 	defer os.RemoveAll(retentionPath)
-	// no retention by size
-	atomic.StoreInt64(&RocksmqRetentionSizeInMB, -1)
-	// retention by secs
-	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 1)
-	atomic.StoreInt64(&RocksmqPageSize, 10)
-	atomic.StoreInt64(&TickerTimeInSeconds, 1)
 	kvPath := retentionPath + "kv_multi_topic"
 	os.RemoveAll(kvPath)
 	idAllocator := InitIDAllocator(kvPath)
@@ -253,10 +248,17 @@ func TestRmqRetention_MultipleTopic(t *testing.T) {
 	metaPath := retentionPath + "meta_multi_topic"
 	os.RemoveAll(metaPath)
 	var params paramtable.BaseTable
+	atomic.StoreInt64(&RocksmqPageSize, 10)
+	atomic.StoreInt64(&TickerTimeInSeconds, 1)
 	params.Init()
 	rmq, err := NewRocksMQ(params, rocksdbPath, idAllocator)
 	assert.Nil(t, err)
 	defer rmq.Close()
+
+	// no retention by size
+	atomic.StoreInt64(&RocksmqRetentionSizeInMB, -1)
+	// retention by secs
+	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 1)
 
 	topicName := "topic_a"
 	err = rmq.CreateTopic(topicName)
@@ -311,7 +313,7 @@ func TestRmqRetention_MultipleTopic(t *testing.T) {
 
 	time.Sleep(time.Duration(3) * time.Second)
 
-	err = rmq.Seek(topicName, groupName, ids1[10])
+	err = rmq.ForceSeek(topicName, groupName, ids1[10])
 	assert.Nil(t, err)
 	newRes, err := rmq.Consume(topicName, groupName, 1)
 	assert.Nil(t, err)
@@ -385,7 +387,7 @@ func TestRmqRetention_MultipleTopic(t *testing.T) {
 
 	time.Sleep(time.Duration(3) * time.Second)
 
-	err = rmq.Seek(topicName, groupName, ids2[10])
+	err = rmq.ForceSeek(topicName, groupName, ids2[10])
 	assert.Nil(t, err)
 	newRes, err = rmq.Consume(topicName, groupName, 1)
 	assert.Nil(t, err)
@@ -456,12 +458,7 @@ func TestRmqRetention_PageTimeExpire(t *testing.T) {
 		return
 	}
 	defer os.RemoveAll(retentionPath)
-	// no retention by size
-	atomic.StoreInt64(&RocksmqRetentionSizeInMB, -1)
-	// retention by secs
-	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 5)
-	atomic.StoreInt64(&RocksmqPageSize, 10)
-	atomic.StoreInt64(&TickerTimeInSeconds, 1)
+
 	kvPath := retentionPath + "kv_com1"
 	os.RemoveAll(kvPath)
 	idAllocator := InitIDAllocator(kvPath)
@@ -473,9 +470,16 @@ func TestRmqRetention_PageTimeExpire(t *testing.T) {
 
 	var params paramtable.BaseTable
 	params.Init()
+	atomic.StoreInt64(&RocksmqPageSize, 10)
+	atomic.StoreInt64(&TickerTimeInSeconds, 1)
 	rmq, err := NewRocksMQ(params, rocksdbPath, idAllocator)
 	assert.Nil(t, err)
 	defer rmq.Close()
+
+	// no retention by size
+	atomic.StoreInt64(&RocksmqRetentionSizeInMB, -1)
+	// retention by secs
+	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, 5)
 
 	topicName := "topic_a"
 	err = rmq.CreateTopic(topicName)
@@ -537,7 +541,7 @@ func TestRmqRetention_PageTimeExpire(t *testing.T) {
 
 	time.Sleep(time.Duration(3) * time.Second)
 
-	err = rmq.Seek(topicName, groupName, ids[10])
+	err = rmq.ForceSeek(topicName, groupName, ids[10])
 	assert.Nil(t, err)
 	newRes, err := rmq.Consume(topicName, groupName, 1)
 	assert.Nil(t, err)
@@ -579,10 +583,6 @@ func TestRmqRetention_PageSizeExpire(t *testing.T) {
 		return
 	}
 	defer os.RemoveAll(retentionPath)
-	atomic.StoreInt64(&RocksmqRetentionSizeInMB, 1)
-	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, -1)
-	atomic.StoreInt64(&RocksmqPageSize, 10)
-	atomic.StoreInt64(&TickerTimeInSeconds, 1)
 	kvPath := retentionPath + "kv_com2"
 	os.RemoveAll(kvPath)
 	idAllocator := InitIDAllocator(kvPath)
@@ -594,9 +594,15 @@ func TestRmqRetention_PageSizeExpire(t *testing.T) {
 
 	var params paramtable.BaseTable
 	params.Init()
+	atomic.StoreInt64(&RocksmqPageSize, 10)
+	atomic.StoreInt64(&TickerTimeInSeconds, 1)
 	rmq, err := NewRocksMQ(params, rocksdbPath, idAllocator)
 	assert.Nil(t, err)
 	defer rmq.Close()
+
+	// update some configrocksmq_retentions to make cleanup trigger faster
+	atomic.StoreInt64(&RocksmqRetentionSizeInMB, 1)
+	atomic.StoreInt64(&RocksmqRetentionTimeInSecs, -1)
 
 	topicName := "topic_a"
 	err = rmq.CreateTopic(topicName)
@@ -636,7 +642,7 @@ func TestRmqRetention_PageSizeExpire(t *testing.T) {
 	log.Debug("Already consumed, wait for message cleaned by retention")
 	// wait for enough time for page expiration
 	time.Sleep(time.Duration(2) * time.Second)
-	err = rmq.Seek(topicName, groupName, ids[0])
+	err = rmq.ForceSeek(topicName, groupName, ids[0])
 	assert.Nil(t, err)
 	newRes, err := rmq.Consume(topicName, groupName, 1)
 	assert.Nil(t, err)

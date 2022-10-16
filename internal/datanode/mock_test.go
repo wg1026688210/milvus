@@ -27,6 +27,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/milvus-io/milvus/internal/util/metautil"
+
 	"go.uber.org/zap"
 
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
@@ -38,19 +40,39 @@ import (
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/common"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/etcdpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 )
 
 const ctxTimeInMillisecond = 5000
 const debug = false
+
+// As used in data_sync_service_test.go
+var segID2SegInfo = map[int64]*datapb.SegmentInfo{
+	1: {
+		ID:            1,
+		CollectionID:  1,
+		PartitionID:   1,
+		InsertChannel: "by-dev-rootcoord-dml-test_v1",
+	},
+	2: {
+		ID:            2,
+		CollectionID:  1,
+		InsertChannel: "by-dev-rootcoord-dml-test_v1",
+	},
+	3: {
+		ID:            3,
+		CollectionID:  1,
+		InsertChannel: "by-dev-rootcoord-dml-test_v1",
+	},
+}
 
 var emptyFlushAndDropFunc flushAndDropFunc = func(_ []*segmentFlushPack) {}
 
@@ -159,6 +181,9 @@ type RootCoordFactory struct {
 	collectionName string
 	collectionID   UniqueID
 	pkType         schemapb.DataType
+
+	ReportImportErr        bool
+	ReportImportNotSuccess bool
 }
 
 type DataCoordFactory struct {
@@ -175,6 +200,9 @@ type DataCoordFactory struct {
 
 	GetSegmentInfosError      bool
 	GetSegmentInfosNotSuccess bool
+
+	AddSegmentError      bool
+	AddSegmentNotSuccess bool
 }
 
 func (ds *DataCoordFactory) AssignSegmentID(ctx context.Context, req *datapb.AssignSegmentIDRequest) (*datapb.AssignSegmentIDResponse, error) {
@@ -225,7 +253,25 @@ func (ds *DataCoordFactory) UpdateSegmentStatistics(ctx context.Context, req *da
 	}, nil
 }
 
-func (ds *DataCoordFactory) AddSegment(ctx context.Context, req *datapb.AddSegmentRequest) (*commonpb.Status, error) {
+func (ds *DataCoordFactory) SaveImportSegment(ctx context.Context, req *datapb.SaveImportSegmentRequest) (*commonpb.Status, error) {
+	return &commonpb.Status{
+		ErrorCode: commonpb.ErrorCode_Success,
+	}, nil
+}
+
+func (ds *DataCoordFactory) UnsetIsImportingState(context.Context, *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error) {
+	return &commonpb.Status{
+		ErrorCode: commonpb.ErrorCode_Success,
+	}, nil
+}
+
+func (ds *DataCoordFactory) MarkSegmentsDropped(context.Context, *datapb.MarkSegmentsDroppedRequest) (*commonpb.Status, error) {
+	return &commonpb.Status{
+		ErrorCode: commonpb.ErrorCode_Success,
+	}, nil
+}
+
+func (ds *DataCoordFactory) BroadcastAlteredCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
 	return &commonpb.Status{
 		ErrorCode: commonpb.ErrorCode_Success,
 	}, nil
@@ -233,7 +279,7 @@ func (ds *DataCoordFactory) AddSegment(ctx context.Context, req *datapb.AddSegme
 
 func (ds *DataCoordFactory) GetSegmentInfo(ctx context.Context, req *datapb.GetSegmentInfoRequest) (*datapb.GetSegmentInfoResponse, error) {
 	if ds.GetSegmentInfosError {
-		return nil, errors.New("mock error")
+		return nil, errors.New("mock get segment info error")
 	}
 	if ds.GetSegmentInfosNotSuccess {
 		return &datapb.GetSegmentInfoResponse{
@@ -245,9 +291,13 @@ func (ds *DataCoordFactory) GetSegmentInfo(ctx context.Context, req *datapb.GetS
 	}
 	var segmentInfos []*datapb.SegmentInfo
 	for _, segmentID := range req.SegmentIDs {
-		segmentInfos = append(segmentInfos, &datapb.SegmentInfo{
-			ID: segmentID,
-		})
+		if segInfo, ok := segID2SegInfo[segmentID]; ok {
+			segmentInfos = append(segmentInfos, segInfo)
+		} else {
+			segmentInfos = append(segmentInfos, &datapb.SegmentInfo{
+				ID: segmentID,
+			})
+		}
 	}
 	return &datapb.GetSegmentInfoResponse{
 		Status: &commonpb.Status{
@@ -864,7 +914,7 @@ func (alloc *AllocatorFactory) genKey(ids ...UniqueID) (string, error) {
 		return "", err
 	}
 	ids = append(ids, idx)
-	return JoinIDPath(ids...), nil
+	return metautil.JoinIDPath(ids...), nil
 }
 
 // If id == 0, AllocID will return not successful status
@@ -958,10 +1008,10 @@ func (m *RootCoordFactory) DescribeCollection(ctx context.Context, in *milvuspb.
 	return resp, nil
 }
 
-func (m *RootCoordFactory) GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error) {
-	return &internalpb.ComponentStates{
-		State:              &internalpb.ComponentInfo{},
-		SubcomponentStates: make([]*internalpb.ComponentInfo, 0),
+func (m *RootCoordFactory) GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error) {
+	return &milvuspb.ComponentStates{
+		State:              &milvuspb.ComponentInfo{},
+		SubcomponentStates: make([]*milvuspb.ComponentInfo, 0),
 		Status: &commonpb.Status{
 			ErrorCode: commonpb.ErrorCode_Success,
 		},
@@ -973,6 +1023,16 @@ func (m *RootCoordFactory) ReportImport(ctx context.Context, req *rootcoordpb.Im
 		if v := ctx.Value(ctxKey{}).(string); v == returnError {
 			return nil, fmt.Errorf("injected error")
 		}
+	}
+	if m.ReportImportErr {
+		return &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_Success,
+		}, fmt.Errorf("mock report import error")
+	}
+	if m.ReportImportNotSuccess {
+		return &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_UnexpectedError,
+		}, nil
 	}
 	return &commonpb.Status{
 		ErrorCode: commonpb.ErrorCode_Success,

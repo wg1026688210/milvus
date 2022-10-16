@@ -20,15 +20,19 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/milvus-io/milvus/internal/log"
+	"go.uber.org/zap"
+
 	"github.com/milvus-io/milvus/internal/common"
 
 	"github.com/milvus-io/milvus/internal/metastore/model"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/mq/msgstream"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
+
+var logger = log.L().WithOptions(zap.Fields(zap.String("role", typeutil.RootCoordRole)))
 
 // EqualKeyPairArray check whether 2 KeyValuePairs are equal
 func EqualKeyPairArray(p1 []*commonpb.KeyValuePair, p2 []*commonpb.KeyValuePair) bool {
@@ -59,45 +63,6 @@ func GetFieldSchemaByID(coll *model.Collection, fieldID typeutil.UniqueID) (*mod
 		}
 	}
 	return nil, fmt.Errorf("field id = %d not found", fieldID)
-}
-
-// GetFieldSchemaByIndexID return field schema by it's index id
-func GetFieldSchemaByIndexID(coll *model.Collection, idxID typeutil.UniqueID) (*model.Field, error) {
-	var fieldID typeutil.UniqueID
-	exist := false
-	for _, t := range coll.FieldIDToIndexID {
-		if t.Value == idxID {
-			fieldID = t.Key
-			exist = true
-			break
-		}
-	}
-	if !exist {
-		return nil, fmt.Errorf("index id = %d is not attach to any field", idxID)
-	}
-	return GetFieldSchemaByID(coll, fieldID)
-}
-
-// EncodeDdOperation serialize DdOperation into string
-func EncodeDdOperation(m proto.Message, ddType string) (string, error) {
-	mByte, err := proto.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	ddOp := DdOperation{
-		Body: mByte,
-		Type: ddType,
-	}
-	ddOpByte, err := json.Marshal(ddOp)
-	if err != nil {
-		return "", err
-	}
-	return string(ddOpByte), nil
-}
-
-// DecodeDdOperation deserialize string to DdOperation
-func DecodeDdOperation(str string, ddOp *DdOperation) error {
-	return json.Unmarshal([]byte(str), ddOp)
 }
 
 // EncodeMsgPositions serialize []*MsgPosition into string
@@ -134,4 +99,37 @@ func Int64TupleMapToSlice(s map[int]common.Int64Tuple) []common.Int64Tuple {
 		ret = append(ret, e)
 	}
 	return ret
+}
+
+func CheckMsgType(got, expect commonpb.MsgType) error {
+	if got != expect {
+		return fmt.Errorf("invalid msg type, expect %s, but got %s", expect, got)
+	}
+	return nil
+}
+
+func failStatus(code commonpb.ErrorCode, reason string) *commonpb.Status {
+	return &commonpb.Status{
+		ErrorCode: code,
+		Reason:    reason,
+	}
+}
+
+func succStatus() *commonpb.Status {
+	return &commonpb.Status{
+		ErrorCode: commonpb.ErrorCode_Success,
+		Reason:    "",
+	}
+}
+
+type TimeTravelRequest interface {
+	GetBase() *commonpb.MsgBase
+	GetTimeStamp() Timestamp
+}
+
+func getTravelTs(req TimeTravelRequest) Timestamp {
+	if req.GetTimeStamp() == 0 {
+		return typeutil.MaxTimestamp
+	}
+	return req.GetTimeStamp()
 }

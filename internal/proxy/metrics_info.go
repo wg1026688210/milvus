@@ -20,16 +20,98 @@ import (
 	"context"
 	"sync"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
+	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus/internal/util/hardware"
 	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
+	"github.com/milvus-io/milvus/internal/util/ratelimitutil"
+	"github.com/milvus-io/milvus/internal/util/typeutil"
 )
 
 type getMetricsFuncType func(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+type showConfigurationsFuncType func(ctx context.Context, request *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
+
+// getQuotaMetrics returns ProxyQuotaMetrics.
+func getQuotaMetrics() (*metricsinfo.ProxyQuotaMetrics, error) {
+	var err error
+	rms := make([]metricsinfo.RateMetric, 0)
+	getRateMetric := func(label string) {
+		rate, err2 := rateCol.Rate(label, ratelimitutil.DefaultAvgDuration)
+		if err2 != nil {
+			err = err2
+			return
+		}
+		rms = append(rms, metricsinfo.RateMetric{
+			Label: label,
+			Rate:  rate,
+		})
+	}
+	getRateMetric(internalpb.RateType_DMLInsert.String())
+	getRateMetric(internalpb.RateType_DMLDelete.String())
+	getRateMetric(internalpb.RateType_DQLSearch.String())
+	getRateMetric(internalpb.RateType_DQLQuery.String())
+	getRateMetric(metricsinfo.ReadResultThroughput)
+	if err != nil {
+		return nil, err
+	}
+	return &metricsinfo.ProxyQuotaMetrics{
+		Hms: metricsinfo.HardwareMetrics{},
+		Rms: rms,
+	}, nil
+}
+
+// getProxyMetrics get metrics of Proxy, not including the topological metrics of Query cluster and Data cluster.
+func getProxyMetrics(ctx context.Context, request *milvuspb.GetMetricsRequest, node *Proxy) (*milvuspb.GetMetricsResponse, error) {
+	totalMem := hardware.GetMemoryCount()
+	usedMem := hardware.GetUsedMemoryCount()
+	quotaMetrics, err := getQuotaMetrics()
+	if err != nil {
+		return nil, err
+	}
+	hardwareMetrics := metricsinfo.HardwareMetrics{
+		IP:           node.session.Address,
+		CPUCoreCount: hardware.GetCPUNum(),
+		CPUCoreUsage: hardware.GetCPUUsage(),
+		Memory:       totalMem,
+		MemoryUsage:  usedMem,
+		Disk:         hardware.GetDiskCount(),
+		DiskUsage:    hardware.GetDiskUsage(),
+	}
+	quotaMetrics.Hms = hardwareMetrics
+
+	proxyRoleName := metricsinfo.ConstructComponentName(typeutil.ProxyRole, Params.ProxyCfg.GetNodeID())
+	proxyMetricInfo := metricsinfo.ProxyInfos{
+		BaseComponentInfos: metricsinfo.BaseComponentInfos{
+			HasError:      false,
+			Name:          proxyRoleName,
+			HardwareInfos: hardwareMetrics,
+			SystemInfo:    metricsinfo.DeployMetrics{},
+			CreatedTime:   Params.ProxyCfg.CreatedTime.String(),
+			UpdatedTime:   Params.ProxyCfg.UpdatedTime.String(),
+			Type:          typeutil.ProxyRole,
+			ID:            node.session.ServerID,
+		},
+		SystemConfigurations: metricsinfo.ProxyConfiguration{
+			DefaultPartitionName: Params.CommonCfg.DefaultPartitionName,
+			DefaultIndexName:     Params.CommonCfg.DefaultIndexName,
+		},
+		QuotaMetrics: quotaMetrics,
+	}
+
+	resp, err := metricsinfo.MarshalComponentInfos(proxyMetricInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	return &milvuspb.GetMetricsResponse{
+		Status: &commonpb.Status{
+			ErrorCode: commonpb.ErrorCode_Success,
+		},
+		Response:      resp,
+		ComponentName: metricsinfo.ConstructComponentName(typeutil.ProxyRole, Params.ProxyCfg.GetNodeID()),
+	}, nil
+}
 
 // getSystemInfoMetrics returns the system information metrics.
 func getSystemInfoMetrics(
@@ -37,9 +119,7 @@ func getSystemInfoMetrics(
 	request *milvuspb.GetMetricsRequest,
 	node *Proxy,
 ) (*milvuspb.GetMetricsResponse, error) {
-
 	var err error
-
 	systemTopology := metricsinfo.SystemTopology{
 		NodesInfo: make([]metricsinfo.SystemTopologyNode, 0),
 	}
@@ -59,12 +139,12 @@ func getSystemInfoMetrics(
 				Name:        proxyRoleName,
 				HardwareInfos: metricsinfo.HardwareMetrics{
 					IP:           node.session.Address,
-					CPUCoreCount: metricsinfo.GetCPUCoreCount(false),
-					CPUCoreUsage: metricsinfo.GetCPUUsage(),
-					Memory:       metricsinfo.GetMemoryCount(),
-					MemoryUsage:  metricsinfo.GetUsedMemoryCount(),
-					Disk:         metricsinfo.GetDiskCount(),
-					DiskUsage:    metricsinfo.GetDiskUsage(),
+					CPUCoreCount: hardware.GetCPUNum(),
+					CPUCoreUsage: hardware.GetCPUUsage(),
+					Memory:       hardware.GetMemoryCount(),
+					MemoryUsage:  hardware.GetUsedMemoryCount(),
+					Disk:         hardware.GetDiskCount(),
+					DiskUsage:    hardware.GetDiskUsage(),
 				},
 				SystemInfo:  metricsinfo.DeployMetrics{},
 				CreatedTime: Params.ProxyCfg.CreatedTime.String(),
@@ -107,7 +187,7 @@ func getSystemInfoMetrics(
 		defer wg.Done()
 
 		queryCoordResp, queryCoordErr = node.queryCoord.GetMetrics(ctx, request)
-		queryCoordRoleName = queryCoordResp.ComponentName
+		queryCoordRoleName = queryCoordResp.GetComponentName()
 		queryCoordErr = metricsinfo.UnmarshalTopology(queryCoordResp.Response, &queryCoordTopology)
 	}()
 
@@ -116,7 +196,7 @@ func getSystemInfoMetrics(
 		defer wg.Done()
 
 		dataCoordResp, dataCoordErr = node.dataCoord.GetMetrics(ctx, request)
-		dataCoordRoleName = dataCoordResp.ComponentName
+		dataCoordRoleName = dataCoordResp.GetComponentName()
 		dataCoordErr = metricsinfo.UnmarshalTopology(dataCoordResp.Response, &dataCoordTopology)
 	}()
 
@@ -125,7 +205,7 @@ func getSystemInfoMetrics(
 		defer wg.Done()
 
 		indexCoordResp, indexCoordErr = node.indexCoord.GetMetrics(ctx, request)
-		indexCoordRoleName = indexCoordResp.ComponentName
+		indexCoordRoleName = indexCoordResp.GetComponentName()
 		indexCoordErr = metricsinfo.UnmarshalTopology(indexCoordResp.Response, &indexCoordTopology)
 	}()
 
@@ -134,7 +214,7 @@ func getSystemInfoMetrics(
 		defer wg.Done()
 
 		rootCoordResp, rootCoordErr = node.rootCoord.GetMetrics(ctx, request)
-		rootCoordRoleName = rootCoordResp.ComponentName
+		rootCoordRoleName = rootCoordResp.GetComponentName()
 		rootCoordErr = metricsinfo.UnmarshalTopology(rootCoordResp.Response, &rootCoordTopology)
 	}()
 

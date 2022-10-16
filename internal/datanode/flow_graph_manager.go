@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/metrics"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
@@ -35,19 +36,13 @@ func newFlowgraphManager() *flowgraphManager {
 	return &flowgraphManager{}
 }
 
-func (fm *flowgraphManager) addAndStart(dn *DataNode, vchan *datapb.VchannelInfo) error {
-	log.Info("received Vchannel Info",
-		zap.String("vChannelName", vchan.GetChannelName()),
-		zap.Int("Unflushed Segment Number", len(vchan.GetUnflushedSegmentIds())),
-		zap.Int("Flushed Segment Number", len(vchan.GetFlushedSegmentIds())),
-	)
-
+func (fm *flowgraphManager) addAndStart(dn *DataNode, vchan *datapb.VchannelInfo, schema *schemapb.CollectionSchema) error {
 	if _, ok := fm.flowgraphs.Load(vchan.GetChannelName()); ok {
 		log.Warn("try to add an existed DataSyncService", zap.String("vChannelName", vchan.GetChannelName()))
 		return nil
 	}
 
-	replica, err := newReplica(dn.ctx, dn.rootCoord, dn.chunkManager, vchan.GetCollectionID())
+	replica, err := newReplica(dn.ctx, dn.rootCoord, dn.chunkManager, vchan.GetCollectionID(), schema)
 	if err != nil {
 		log.Warn("new replica failed", zap.String("vChannelName", vchan.GetChannelName()), zap.Error(err))
 		return err
@@ -61,11 +56,7 @@ func (fm *flowgraphManager) addAndStart(dn *DataNode, vchan *datapb.VchannelInfo
 		log.Warn("new data sync service fail", zap.String("vChannelName", vchan.GetChannelName()), zap.Error(err))
 		return err
 	}
-	log.Info("successfully created dataSyncService", zap.String("vChannelName", vchan.GetChannelName()))
-
 	dataSyncService.start()
-	log.Info("successfully started dataSyncService", zap.String("vChannelName", vchan.GetChannelName()))
-
 	fm.flowgraphs.Store(vchan.GetChannelName(), dataSyncService)
 
 	metrics.DataNodeNumFlowGraphs.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID())).Inc()
@@ -73,19 +64,15 @@ func (fm *flowgraphManager) addAndStart(dn *DataNode, vchan *datapb.VchannelInfo
 }
 
 func (fm *flowgraphManager) release(vchanName string) {
-	log.Info("release flowgraph resources begin", zap.String("vChannelName", vchanName))
-
 	if fg, loaded := fm.flowgraphs.LoadAndDelete(vchanName); loaded {
 		fg.(*dataSyncService).close()
 		metrics.DataNodeNumFlowGraphs.WithLabelValues(fmt.Sprint(Params.DataNodeCfg.GetNodeID())).Dec()
 	}
-	log.Info("release flowgraph resources end", zap.String("Vchannel", vchanName))
+	rateCol.removeFlowGraphChannel(vchanName)
 }
 
 func (fm *flowgraphManager) getFlushCh(segID UniqueID) (chan<- flushMsg, error) {
-	var (
-		flushCh chan flushMsg
-	)
+	var flushCh chan flushMsg
 
 	fm.flowgraphs.Range(func(key, value interface{}) bool {
 		fg := value.(*dataSyncService)
@@ -98,6 +85,28 @@ func (fm *flowgraphManager) getFlushCh(segID UniqueID) (chan<- flushMsg, error) 
 
 	if flushCh != nil {
 		return flushCh, nil
+	}
+
+	return nil, fmt.Errorf("cannot find segment %d in all flowgraphs", segID)
+}
+
+func (fm *flowgraphManager) getReplica(segID UniqueID) (Replica, error) {
+	var (
+		rep    Replica
+		exists = false
+	)
+	fm.flowgraphs.Range(func(key, value interface{}) bool {
+		fg := value.(*dataSyncService)
+		if fg.replica.hasSegment(segID, true) {
+			exists = true
+			rep = fg.replica
+			return false
+		}
+		return true
+	})
+
+	if exists {
+		return rep, nil
 	}
 
 	return nil, fmt.Errorf("cannot find segment %d in all flowgraphs", segID)
@@ -135,6 +144,16 @@ func (fm *flowgraphManager) getFlowgraphService(vchan string) (*dataSyncService,
 func (fm *flowgraphManager) exist(vchan string) bool {
 	_, exist := fm.getFlowgraphService(vchan)
 	return exist
+}
+
+// getFlowGraphNum returns number of flow graphs.
+func (fm *flowgraphManager) getFlowGraphNum() int {
+	length := 0
+	fm.flowgraphs.Range(func(_, _ interface{}) bool {
+		length++
+		return true
+	})
+	return length
 }
 
 func (fm *flowgraphManager) dropAll() {

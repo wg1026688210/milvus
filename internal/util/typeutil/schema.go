@@ -19,10 +19,11 @@ package typeutil
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 
+	"github.com/milvus-io/milvus/api/schemapb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/schemapb"
 	"go.uber.org/zap"
 )
 
@@ -644,4 +645,76 @@ func AppendPKs(pks *schemapb.IDs, pk interface{}) {
 	default:
 		log.Warn("got unexpected data type of pk when append pks", zap.Any("pk", pk))
 	}
+}
+
+// SwapPK swaps i-th PK with j-th PK
+func SwapPK(data *schemapb.IDs, i, j int) {
+	switch f := data.GetIdField().(type) {
+	case *schemapb.IDs_IntId:
+		f.IntId.Data[i], f.IntId.Data[j] = f.IntId.Data[j], f.IntId.Data[i]
+	case *schemapb.IDs_StrId:
+		f.StrId.Data[i], f.StrId.Data[j] = f.StrId.Data[j], f.StrId.Data[i]
+	}
+}
+
+// ComparePKInSlice returns if i-th PK < j-th PK
+func ComparePKInSlice(data *schemapb.IDs, i, j int) bool {
+	switch f := data.GetIdField().(type) {
+	case *schemapb.IDs_IntId:
+		return f.IntId.Data[i] < f.IntId.Data[j]
+	case *schemapb.IDs_StrId:
+		return f.StrId.Data[i] < f.StrId.Data[j]
+	}
+	return false
+}
+
+// ComparePK returns if i-th PK of dataA > j-th PK of dataB
+func ComparePK(pkA, pkB interface{}) bool {
+	switch pkA.(type) {
+	case int64:
+		return pkA.(int64) < pkB.(int64)
+	case string:
+		return pkA.(string) < pkB.(string)
+	}
+	return false
+}
+
+type ResultWithID interface {
+	GetIds() *schemapb.IDs
+}
+
+// SelectMinPK select the index of the minPK in results T of the cursors.
+func SelectMinPK[T ResultWithID](results []T, cursors []int64) int {
+	var (
+		sel            = -1
+		minIntPK int64 = math.MaxInt64
+
+		firstStr = true
+		minStrPK string
+	)
+
+	for i, cursor := range cursors {
+		if int(cursor) >= GetSizeOfIDs(results[i].GetIds()) {
+			continue
+		}
+
+		pkInterface := GetPK(results[i].GetIds(), cursor)
+		switch pk := pkInterface.(type) {
+		case string:
+			if firstStr || pk < minStrPK {
+				firstStr = false
+				minStrPK = pk
+				sel = i
+			}
+		case int64:
+			if pk < minIntPK {
+				minIntPK = pk
+				sel = i
+			}
+		default:
+			continue
+		}
+	}
+
+	return sel
 }

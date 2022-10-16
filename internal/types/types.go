@@ -21,15 +21,14 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/indexpb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
 )
 
 // TimeTickProvider is the interface all services implement
@@ -37,12 +36,19 @@ type TimeTickProvider interface {
 	GetTimeTickChannel(ctx context.Context) (*milvuspb.StringResponse, error)
 }
 
+// Limiter defines the interface to perform request rate limiting.
+// If Limit function return true, the request will be rejected.
+// Otherwise, the request will pass. Limit also returns limit of limiter.
+type Limiter interface {
+	Limit(rt internalpb.RateType, n int) (bool, float64)
+}
+
 // Component is the interface all services implement
 type Component interface {
 	Init() error
 	Start() error
 	Stop() error
-	GetComponentStates(ctx context.Context) (*internalpb.ComponentStates, error)
+	GetComponentStates(ctx context.Context) (*milvuspb.ComponentStates, error)
 	GetStatisticsChannel(ctx context.Context) (*milvuspb.StringResponse, error)
 	Register() error
 }
@@ -64,10 +70,17 @@ type DataNode interface {
 	//     Log an info log if a segment is under flushing
 	FlushSegments(ctx context.Context, req *datapb.FlushSegmentsRequest) (*commonpb.Status, error)
 
+	// ShowConfigurations gets specified configurations param of DataNode
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	// GetMetrics gets the metrics about DataNode.
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+
 	// Compaction will add a compaction task according to the request plan
 	Compaction(ctx context.Context, req *datapb.CompactionPlan) (*commonpb.Status, error)
+	// GetCompactionState get states of all compation tasks
+	GetCompactionState(ctx context.Context, req *datapb.CompactionStateRequest) (*datapb.CompactionStateResponse, error)
+	// SyncSegments is called by DataCoord, to sync the segments meta when complete compaction
+	SyncSegments(ctx context.Context, req *datapb.SyncSegmentsRequest) (*commonpb.Status, error)
 
 	// Import data files(json, numpy, etc.) on MinIO/S3 storage, read and parse them into sealed segments
 	//
@@ -82,8 +95,8 @@ type DataNode interface {
 	// It returns a list of segments to be sent.
 	ResendSegmentStats(ctx context.Context, req *datapb.ResendSegmentStatsRequest) (*datapb.ResendSegmentStatsResponse, error)
 
-	// AddSegment puts the given segment to current DataNode's flow graph.
-	AddSegment(ctx context.Context, req *datapb.AddSegmentRequest) (*commonpb.Status, error)
+	// AddImportSegment puts the given import segment to current DataNode's flow graph.
+	AddImportSegment(ctx context.Context, req *datapb.AddImportSegmentRequest) (*datapb.AddImportSegmentResponse, error)
 }
 
 // DataNodeComponent is used by grpc server of DataNode
@@ -92,10 +105,10 @@ type DataNodeComponent interface {
 
 	// UpdateStateCode updates state code for DataNode
 	//  `stateCode` is current statement of this data node, indicating whether it's healthy.
-	UpdateStateCode(stateCode internalpb.StateCode)
+	UpdateStateCode(stateCode commonpb.StateCode)
 
 	// GetStateCode return state code of this data node
-	GetStateCode() internalpb.StateCode
+	GetStateCode() commonpb.StateCode
 
 	// SetEtcdClient set etcd client for DataNode
 	SetEtcdClient(etcdClient *clientv3.Client)
@@ -128,8 +141,12 @@ type DataCoord interface {
 	// ctx is the context to control request deadline and cancellation
 	// req contains the request params, which are database name(not used for now) and collection id
 	//
-	// response struct `FlushResponse` contains related db & collection meta
-	// and the affected segment ids
+	// response struct `FlushResponse` contains
+	// 		1, related db id
+	// 		2, related collection id
+	// 		3, affected segment ids
+	// 		4, already flush/flushing segment ids of related collection before this request
+	// 		5, timeOfSeal, all data before timeOfSeal is guaranteed to be sealed or flushed
 	// error is returned only when some communication issue occurs
 	// if some error occurs in the process of `Flush`, it will be recorded and returned in `Status` field of response
 	//
@@ -233,20 +250,30 @@ type DataCoord interface {
 	//  if the constraint is broken, the checkpoint position will not be monotonically increasing and the integrity will be compromised
 	SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPathsRequest) (*commonpb.Status, error)
 
-	// GetFlushedSegments returns flushed segment list of requested collection/parition
+	// GetSegmentsByStates returns segment list of requested collection/partition in given states
+	//
+	// ctx is the context to control request deadline and cancellation
+	// req contains the collection/partition id and states to query
+	// when partition is lesser or equal to 0, all flushed segments of collection will be returned
+	//
+	// response struct `GetSegmentsByStatesResponse` contains segment id list
+	// error is returned only when some communication issue occurs
+	GetSegmentsByStates(ctx context.Context, req *datapb.GetSegmentsByStatesRequest) (*datapb.GetSegmentsByStatesResponse, error)
+
+	// GetFlushedSegments returns flushed segment list of requested collection/partition
 	//
 	// ctx is the context to control request deadline and cancellation
 	// req contains the collection/partition id to query
-	//  when partition is lesser or equal to 0, all flushed segments of collection will be returned
+	// when partition is lesser or equal to 0, all flushed segments of collection will be returned
 	//
 	// response struct `GetFlushedSegmentsResponse` contains flushed segment id list
 	// error is returned only when some communication issue occurs
 	GetFlushedSegments(ctx context.Context, req *datapb.GetFlushedSegmentsRequest) (*datapb.GetFlushedSegmentsResponse, error)
 
+	// ShowConfigurations gets specified configurations para of DataCoord
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	// GetMetrics gets the metrics about DataCoord.
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
-	// CompleteCompaction completes a compaction with the result
-	CompleteCompaction(ctx context.Context, req *datapb.CompactionResult) (*commonpb.Status, error)
 	// ManualCompaction triggers a compaction for a collection
 	ManualCompaction(ctx context.Context, req *milvuspb.ManualCompactionRequest) (*milvuspb.ManualCompactionResponse, error)
 	// GetCompactionState gets the state of a compaction
@@ -288,9 +315,17 @@ type DataCoord interface {
 	AcquireSegmentLock(ctx context.Context, req *datapb.AcquireSegmentLockRequest) (*commonpb.Status, error)
 	ReleaseSegmentLock(ctx context.Context, req *datapb.ReleaseSegmentLockRequest) (*commonpb.Status, error)
 
-	// AddSegment looks for the right DataNode given channel name, and triggers AddSegment call on that DataNode to
-	// add the segment into this DataNode.
-	AddSegment(ctx context.Context, req *datapb.AddSegmentRequest) (*commonpb.Status, error)
+	// SaveImportSegment saves the import segment binlog paths data and then looks for the right DataNode to add the
+	// segment to that DataNode.
+	SaveImportSegment(ctx context.Context, req *datapb.SaveImportSegmentRequest) (*commonpb.Status, error)
+
+	// UnsetIsImportingState unsets the `isImport` state of the given segments so that they can get compacted normally.
+	UnsetIsImportingState(ctx context.Context, req *datapb.UnsetIsImportingStateRequest) (*commonpb.Status, error)
+
+	// MarkSegmentsDropped marks the given segments as `dropped` state.
+	MarkSegmentsDropped(ctx context.Context, req *datapb.MarkSegmentsDroppedRequest) (*commonpb.Status, error)
+
+	BroadcastAlteredCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) (*commonpb.Status, error)
 }
 
 // DataCoordComponent defines the interface of DataCoord component.
@@ -300,18 +335,35 @@ type DataCoordComponent interface {
 	// SetEtcdClient set EtcdClient for DataCoord
 	// `etcdClient` is a client of etcd
 	SetEtcdClient(etcdClient *clientv3.Client)
+
+	SetIndexCoord(indexCoord IndexCoord)
 }
 
 // IndexNode is the interface `indexnode` package implements
 type IndexNode interface {
 	Component
-	TimeTickProvider
+	//TimeTickProvider
 
-	// CreateIndex receives request from IndexCoordinator to build an index.
+	// BuildIndex receives request from IndexCoordinator to build an index.
 	// Index building is asynchronous, so when an index building request comes, IndexNode records the task and returns.
-	CreateIndex(ctx context.Context, req *indexpb.CreateIndexRequest) (*commonpb.Status, error)
-	GetTaskSlots(ctx context.Context, req *indexpb.GetTaskSlotsRequest) (*indexpb.GetTaskSlotsResponse, error)
+	//BuildIndex(ctx context.Context, req *indexpb.BuildIndexRequest) (*commonpb.Status, error)
+	//GetTaskSlots(ctx context.Context, req *indexpb.GetTaskSlotsRequest) (*indexpb.GetTaskSlotsResponse, error)
+	//
+	//// GetMetrics gets the metrics about IndexNode.
+	//GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
 
+	// CreateJob receive index building job from indexcoord. Notes that index building is asynchronous, task is recorded
+	// in indexnode and then request is finished.
+	CreateJob(context.Context, *indexpb.CreateJobRequest) (*commonpb.Status, error)
+	// QueryJobs returns states of index building jobs specified by BuildIDs. There are four states of index building task
+	// Unissued, InProgress, Finished, Failed
+	QueryJobs(context.Context, *indexpb.QueryJobsRequest) (*indexpb.QueryJobsResponse, error)
+	// DropJobs cancel index building jobs specified by BuildIDs. Notes that dropping task may have finished.
+	DropJobs(context.Context, *indexpb.DropJobsRequest) (*commonpb.Status, error)
+	// GetJobStats returns metrics of indexnode, including available job queue info, available task slots and finished job infos.
+	GetJobStats(context.Context, *indexpb.GetJobStatsRequest) (*indexpb.GetJobStatsResponse, error)
+
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	// GetMetrics gets the metrics about IndexNode.
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
 }
@@ -325,36 +377,53 @@ type IndexNodeComponent interface {
 
 	// UpdateStateCode updates state code for IndexNodeComponent
 	//  `stateCode` is current statement of this QueryCoord, indicating whether it's healthy.
-	UpdateStateCode(stateCode internalpb.StateCode)
+	UpdateStateCode(stateCode commonpb.StateCode)
 }
 
 // IndexCoord is the interface `indexcoord` package implements
 type IndexCoord interface {
 	Component
-	TimeTickProvider
+	//TimeTickProvider
 
-	// BuildIndex receives request from RootCoordinator to build an index.
-	// Index building is asynchronous, so when an index building request comes, an IndexBuildID is assigned to the task and
-	// the task is recorded in Meta. The background process assignTaskLoop will find this task and assign it to IndexNode for
-	// execution.
-	BuildIndex(ctx context.Context, req *indexpb.BuildIndexRequest) (*indexpb.BuildIndexResponse, error)
+	// CreateIndex create an index on collection.
+	// Index building is asynchronous, so when an index building request comes, an IndexID is assigned to the task and
+	// will get all flushed segments from DataCoord and record tasks with these segments. The background process
+	// indexBuilder will find this task and assign it to IndexNode for execution.
+	CreateIndex(ctx context.Context, req *indexpb.CreateIndexRequest) (*commonpb.Status, error)
+
+	// GetIndexState gets the index state of the index name in the request from Proxy.
+	// Deprecated: use DescribeIndex instead
+	GetIndexState(ctx context.Context, req *indexpb.GetIndexStateRequest) (*indexpb.GetIndexStateResponse, error)
+
+	// GetSegmentIndexState gets the index state of the segments in the request from RootCoord.
+	GetSegmentIndexState(ctx context.Context, req *indexpb.GetSegmentIndexStateRequest) (*indexpb.GetSegmentIndexStateResponse, error)
+
+	// GetIndexInfos gets the index files of the IndexBuildIDs in the request from RootCoordinator.
+	GetIndexInfos(ctx context.Context, req *indexpb.GetIndexInfoRequest) (*indexpb.GetIndexInfoResponse, error)
+
+	// DescribeIndex describe the index info of the collection.
+	DescribeIndex(ctx context.Context, req *indexpb.DescribeIndexRequest) (*indexpb.DescribeIndexResponse, error)
+
+	// GetIndexBuildProgress get the index building progress by num rows.
+	// Deprecated: use DescribeIndex instead
+	GetIndexBuildProgress(ctx context.Context, req *indexpb.GetIndexBuildProgressRequest) (*indexpb.GetIndexBuildProgressResponse, error)
 
 	// DropIndex deletes indexes based on IndexID. One IndexID corresponds to the index of an entire column. A column is
 	// divided into many segments, and each segment corresponds to an IndexBuildID. IndexCoord uses IndexBuildID to record
 	// index tasks. Therefore, when DropIndex is called, delete all tasks corresponding to IndexBuildID corresponding to IndexID.
 	DropIndex(ctx context.Context, req *indexpb.DropIndexRequest) (*commonpb.Status, error)
 
-	// GetIndexStates gets the index states of the IndexBuildIDs in the request from RootCoordinator.
-	GetIndexStates(ctx context.Context, req *indexpb.GetIndexStatesRequest) (*indexpb.GetIndexStatesResponse, error)
+	//// GetIndexStates gets the index states of the IndexBuildIDs in the request from RootCoordinator.
+	//GetIndexStates(ctx context.Context, req *indexpb.GetIndexStatesRequest) (*indexpb.GetIndexStatesResponse, error)
+	//
+	//// GetIndexFilePaths gets the index files of the IndexBuildIDs in the request from RootCoordinator.
+	//GetIndexFilePaths(ctx context.Context, req *indexpb.GetIndexFilePathsRequest) (*indexpb.GetIndexFilePathsResponse, error)
 
-	// GetIndexFilePaths gets the index files of the IndexBuildIDs in the request from RootCoordinator.
-	GetIndexFilePaths(ctx context.Context, req *indexpb.GetIndexFilePathsRequest) (*indexpb.GetIndexFilePathsResponse, error)
+	// ShowConfigurations gets specified configurations para of IndexCoord
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 
 	// GetMetrics gets the metrics about IndexCoord.
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
-
-	// RemoveIndex removes the index on specify segments.
-	RemoveIndex(ctx context.Context, req *indexpb.RemoveIndexRequest) (*commonpb.Status, error)
 }
 
 // IndexCoordComponent is used by grpc server of IndexCoord
@@ -364,11 +433,12 @@ type IndexCoordComponent interface {
 	// SetEtcdClient set etcd client for IndexCoordComponent
 	SetEtcdClient(etcdClient *clientv3.Client)
 
-	SetDataCoord(dataCoor DataCoord) error
+	SetDataCoord(dataCoord DataCoord) error
+	SetRootCoord(rootCoord RootCoord) error
 
 	// UpdateStateCode updates state code for IndexCoordComponent
 	//  `stateCode` is current statement of this IndexCoordComponent, indicating whether it's healthy.
-	UpdateStateCode(stateCode internalpb.StateCode)
+	UpdateStateCode(stateCode commonpb.StateCode)
 }
 
 // RootCoord is the interface `rootcoord` package implements
@@ -434,6 +504,16 @@ type RootCoord interface {
 	// error is always nil
 	ShowCollections(ctx context.Context, req *milvuspb.ShowCollectionsRequest) (*milvuspb.ShowCollectionsResponse, error)
 
+	// AlterCollection notifies Proxy to create a collection
+	//
+	// ctx is the context to control request deadline and cancellation
+	// req contains the request params, including database name(reserved), collection name and collection properties
+	//
+	// The `ErrorCode` of `Status` is `Success` if create collection successfully;
+	// otherwise, the `ErrorCode` of `Status` will be `Error`, and the `Reason` of `Status` will record the fail cause.
+	// error is always nil
+	AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error)
+
 	// CreatePartition notifies RootCoord to create a partition
 	//
 	// ctx is the context to control request deadline and cancellation
@@ -487,7 +567,7 @@ type RootCoord interface {
 	// error is always nil
 	//
 	// RootCoord forwards this request to IndexCoord to create index
-	CreateIndex(ctx context.Context, req *milvuspb.CreateIndexRequest) (*commonpb.Status, error)
+	//CreateIndex(ctx context.Context, req *milvuspb.CreateIndexRequest) (*commonpb.Status, error)
 
 	// DescribeIndex notifies RootCoord to get specified index information for specified field
 	//
@@ -497,9 +577,9 @@ type RootCoord interface {
 	// The `Status` in response struct `DescribeIndexResponse` indicates if this operation is processed successfully or fail cause;
 	// index information is filled in `IndexDescriptions`
 	// error is always nil
-	DescribeIndex(ctx context.Context, req *milvuspb.DescribeIndexRequest) (*milvuspb.DescribeIndexResponse, error)
+	//DescribeIndex(ctx context.Context, req *milvuspb.DescribeIndexRequest) (*milvuspb.DescribeIndexResponse, error)
 
-	GetIndexState(ctx context.Context, req *milvuspb.GetIndexStateRequest) (*indexpb.GetIndexStatesResponse, error)
+	//GetIndexState(ctx context.Context, req *milvuspb.GetIndexStateRequest) (*milvuspb.GetIndexStateResponse, error)
 
 	// DropIndex notifies RootCoord to drop the specified index for the specified field
 	//
@@ -511,7 +591,7 @@ type RootCoord interface {
 	// error is always nil
 	//
 	// RootCoord forwards this request to IndexCoord to drop index
-	DropIndex(ctx context.Context, req *milvuspb.DropIndexRequest) (*commonpb.Status, error)
+	//DropIndex(ctx context.Context, req *milvuspb.DropIndexRequest) (*commonpb.Status, error)
 
 	// CreateAlias notifies RootCoord to create an alias for the collection
 	//
@@ -581,7 +661,7 @@ type RootCoord interface {
 	// The `Status` in response struct `DescribeSegmentResponse` indicates if this operation is processed successfully or fail cause;
 	// segment index information is filled in `IndexID`, `BuildID` and `EnableIndex`.
 	// error is always nil
-	DescribeSegment(ctx context.Context, req *milvuspb.DescribeSegmentRequest) (*milvuspb.DescribeSegmentResponse, error)
+	//DescribeSegment(ctx context.Context, req *milvuspb.DescribeSegmentRequest) (*milvuspb.DescribeSegmentResponse, error)
 
 	// ShowSegments notifies RootCoord to list all segment ids in the collection or partition
 	//
@@ -592,20 +672,6 @@ type RootCoord interface {
 	// `SegmentIDs` in `ShowSegmentsResponse` records all segment ids.
 	// error is always nil
 	ShowSegments(ctx context.Context, req *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error)
-
-	DescribeSegments(ctx context.Context, in *rootcoordpb.DescribeSegmentsRequest) (*rootcoordpb.DescribeSegmentsResponse, error)
-
-	// ReleaseDQLMessageStream notifies RootCoord to release and close the search message stream of specific collection.
-	//
-	// ctx is the request to control request deadline and cancellation.
-	// request contains the request params, which are database id(not used) and collection id.
-	//
-	// The `ErrorCode` of `Status` is `Success` if drop index successfully;
-	// otherwise, the `ErrorCode` of `Status` will be `Error`, and the `Reason` of `Status` will record the fail cause.
-	// error is always nil
-	//
-	// RootCoord just forwards this request to Proxy client
-	ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error)
 
 	// InvalidateCollectionMetaCache notifies RootCoord to clear the meta cache of specific collection in Proxies.
 	// If `CollectionID` is specified in request, all the collection meta cache with the specified collectionID will be
@@ -633,8 +699,10 @@ type RootCoord interface {
 	//
 	// This interface is only used by DataCoord, when RootCoord receives this request, RootCoord will notify IndexCoord
 	// to build index for this segment.
-	SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg) (*commonpb.Status, error)
+	//SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg) (*commonpb.Status, error)
 
+	// ShowConfigurations gets specified configurations para of RootCoord
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	// GetMetrics notifies RootCoord to collect metrics for specified component
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
 
@@ -686,6 +754,15 @@ type RootCoord interface {
 	ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersRequest) (*milvuspb.ListCredUsersResponse, error)
 	// GetCredential get credential by username
 	GetCredential(ctx context.Context, req *rootcoordpb.GetCredentialRequest) (*rootcoordpb.GetCredentialResponse, error)
+
+	CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error)
+	DropRole(ctx context.Context, req *milvuspb.DropRoleRequest) (*commonpb.Status, error)
+	OperateUserRole(ctx context.Context, req *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error)
+	SelectRole(ctx context.Context, req *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error)
+	SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error)
+	OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error)
+	SelectGrant(ctx context.Context, req *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error)
+	ListPolicy(ctx context.Context, in *internalpb.ListPolicyRequest) (*internalpb.ListPolicyResponse, error)
 }
 
 // RootCoordComponent is used by grpc server of RootCoord
@@ -698,7 +775,7 @@ type RootCoordComponent interface {
 
 	// UpdateStateCode updates state code for RootCoord
 	// State includes: Initializing, Healthy and Abnormal
-	UpdateStateCode(internalpb.StateCode)
+	UpdateStateCode(commonpb.StateCode)
 
 	// SetDataCoord set DataCoord for RootCoord
 	// `dataCoord` is a client of data coordinator.
@@ -718,9 +795,6 @@ type RootCoordComponent interface {
 	//
 	// Always return nil.
 	SetQueryCoord(queryCoord QueryCoord) error
-
-	// SetNewProxyClient set Proxy client creator func for RootCoord
-	SetNewProxyClient(func(sess *sessionutil.Session) (Proxy, error))
 
 	// GetMetrics notifies RootCoordComponent to collect metrics for specified component
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
@@ -760,21 +834,13 @@ type Proxy interface {
 
 	UpdateCredentialCache(ctx context.Context, request *proxypb.UpdateCredCacheRequest) (*commonpb.Status, error)
 
-	// ReleaseDQLMessageStream notifies Proxy to release and close the search message stream of specific collection.
-	//
-	// ReleaseDQLMessageStream should be called when the specific collection was released.
-	//
-	// ctx is the request to control request deadline and cancellation.
-	// request contains the request params, which are database id(not used now) and collection id.
-	//
-	// ReleaseDQLMessageStream should always succeed even though the specific collection doesn't exist in Proxy.
-	// So the code of response `Status` should be always `Success`.
-	//
-	// error is returned only when some communication issue occurs.
-	ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error)
+	// SetRates notifies Proxy to limit rates of requests.
+	SetRates(ctx context.Context, req *proxypb.SetRatesRequest) (*commonpb.Status, error)
 
-	SendSearchResult(ctx context.Context, req *internalpb.SearchResults) (*commonpb.Status, error)
-	SendRetrieveResult(ctx context.Context, req *internalpb.RetrieveResults) (*commonpb.Status, error)
+	// GetProxyMetrics gets the metrics of proxy, it's an internal interface which is different from GetMetrics interface,
+	// because it only obtains the metrics of Proxy, not including the topological metrics of Query cluster and Data cluster.
+	GetProxyMetrics(ctx context.Context, request *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+	RefreshPolicyInfoCache(ctx context.Context, req *proxypb.RefreshPolicyInfoCacheRequest) (*commonpb.Status, error)
 }
 
 // ProxyComponent defines the interface of proxy component.
@@ -801,9 +867,12 @@ type ProxyComponent interface {
 	//  `queryCoord` is a client of query coordinator.
 	SetQueryCoordClient(queryCoord QueryCoord)
 
+	// GetRateLimiter returns the rateLimiter in Proxy
+	GetRateLimiter() (Limiter, error)
+
 	// UpdateStateCode updates state code for Proxy
 	//  `stateCode` is current statement of this proxy node, indicating whether it's healthy.
-	UpdateStateCode(stateCode internalpb.StateCode)
+	UpdateStateCode(stateCode commonpb.StateCode)
 
 	// CreateCollection notifies Proxy to create a collection
 	//
@@ -814,7 +883,6 @@ type ProxyComponent interface {
 	// otherwise, the `ErrorCode` of `Status` will be `Error`, and the `Reason` of `Status` will record the fail cause.
 	// error is always nil
 	CreateCollection(ctx context.Context, request *milvuspb.CreateCollectionRequest) (*commonpb.Status, error)
-
 	// DropCollection notifies Proxy to drop a collection
 	//
 	// ctx is the context to control request deadline and cancellation
@@ -886,6 +954,16 @@ type ProxyComponent interface {
 	// the `CollectionIds` in `ShowCollectionsResponse` return collection ids list.
 	// error is always nil
 	ShowCollections(ctx context.Context, request *milvuspb.ShowCollectionsRequest) (*milvuspb.ShowCollectionsResponse, error)
+
+	// AlterCollection notifies Proxy to create a collection
+	//
+	// ctx is the context to control request deadline and cancellation
+	// req contains the request params, including database name(reserved), collection name and collection properties
+	//
+	// The `ErrorCode` of `Status` is `Success` if create collection successfully;
+	// otherwise, the `ErrorCode` of `Status` will be `Error`, and the `Reason` of `Status` will record the fail cause.
+	// error is always nil
+	AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error)
 
 	// CreatePartition notifies Proxy to create a partition
 	//
@@ -960,6 +1038,9 @@ type ProxyComponent interface {
 	// error is always nil
 	ShowPartitions(ctx context.Context, request *milvuspb.ShowPartitionsRequest) (*milvuspb.ShowPartitionsResponse, error)
 
+	// GetLoadingProgress get the collection or partitions loading progress
+	GetLoadingProgress(ctx context.Context, request *milvuspb.GetLoadingProgressRequest) (*milvuspb.GetLoadingProgressResponse, error)
+
 	// CreateIndex notifies Proxy to create index of a field
 	//
 	// ctx is the context to control request deadline and cancellation
@@ -999,6 +1080,7 @@ type ProxyComponent interface {
 	// the `IndexdRows` in `GetIndexBuildProgressResponse` return the num of indexed rows.
 	// the `TotalRows` in `GetIndexBuildProgressResponse` return the total number of segment rows.
 	// error is always nil
+	// Deprecated: use DescribeIndex instead
 	GetIndexBuildProgress(ctx context.Context, request *milvuspb.GetIndexBuildProgressRequest) (*milvuspb.GetIndexBuildProgressResponse, error)
 
 	// GetIndexState notifies Proxy to return index state
@@ -1009,6 +1091,7 @@ type ProxyComponent interface {
 	// The `Status` in response struct `GetIndexStateResponse` indicates if this operation is processed successfully or fail cause;
 	// the `State` in `GetIndexStateResponse` return the state of index: Unissued/InProgress/Finished/Failed.
 	// error is always nil
+	// Deprecated: use DescribeIndex instead
 	GetIndexState(ctx context.Context, request *milvuspb.GetIndexStateRequest) (*milvuspb.GetIndexStateResponse, error)
 
 	// Insert notifies Proxy to insert rows
@@ -1196,6 +1279,14 @@ type ProxyComponent interface {
 	DeleteCredential(ctx context.Context, req *milvuspb.DeleteCredentialRequest) (*commonpb.Status, error)
 	// ListCredUsers list all usernames
 	ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersRequest) (*milvuspb.ListCredUsersResponse, error)
+
+	CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error)
+	DropRole(ctx context.Context, req *milvuspb.DropRoleRequest) (*commonpb.Status, error)
+	OperateUserRole(ctx context.Context, req *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error)
+	SelectRole(ctx context.Context, req *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error)
+	SelectUser(ctx context.Context, req *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error)
+	OperatePrivilege(ctx context.Context, req *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error)
+	SelectGrant(ctx context.Context, req *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error)
 }
 
 // QueryNode is the interface `querynode` package implements
@@ -1204,7 +1295,7 @@ type QueryNode interface {
 	TimeTickProvider
 
 	WatchDmChannels(ctx context.Context, req *querypb.WatchDmChannelsRequest) (*commonpb.Status, error)
-	WatchDeltaChannels(ctx context.Context, req *querypb.WatchDeltaChannelsRequest) (*commonpb.Status, error)
+	UnsubDmChannel(ctx context.Context, req *querypb.UnsubDmChannelRequest) (*commonpb.Status, error)
 	// LoadSegments notifies QueryNode to load the sealed segments from storage. The load tasks are sync to this
 	// rpc, QueryNode will return after all the sealed segments are loaded.
 	//
@@ -1224,8 +1315,11 @@ type QueryNode interface {
 	Query(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error)
 	SyncReplicaSegments(ctx context.Context, req *querypb.SyncReplicaSegmentsRequest) (*commonpb.Status, error)
 
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	// GetMetrics gets the metrics about QueryNode.
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
+	GetDataDistribution(context.Context, *querypb.GetDataDistributionRequest) (*querypb.GetDataDistributionResponse, error)
+	SyncDistribution(context.Context, *querypb.SyncDistributionRequest) (*commonpb.Status, error)
 }
 
 // QueryNodeComponent is used by grpc server of QueryNode
@@ -1234,7 +1328,7 @@ type QueryNodeComponent interface {
 
 	// UpdateStateCode updates state code for QueryNode
 	//  `stateCode` is current statement of this query node, indicating whether it's healthy.
-	UpdateStateCode(stateCode internalpb.StateCode)
+	UpdateStateCode(stateCode commonpb.StateCode)
 
 	// SetEtcdClient set etcd client for QueryNode
 	SetEtcdClient(etcdClient *clientv3.Client)
@@ -1255,6 +1349,7 @@ type QueryCoord interface {
 	GetSegmentInfo(ctx context.Context, req *querypb.GetSegmentInfoRequest) (*querypb.GetSegmentInfoResponse, error)
 	LoadBalance(ctx context.Context, req *querypb.LoadBalanceRequest) (*commonpb.Status, error)
 
+	ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error)
 	GetMetrics(ctx context.Context, req *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error)
 
 	GetReplicas(ctx context.Context, req *milvuspb.GetReplicasRequest) (*milvuspb.GetReplicasResponse, error)
@@ -1270,7 +1365,7 @@ type QueryCoordComponent interface {
 
 	// UpdateStateCode updates state code for QueryCoord
 	//  `stateCode` is current statement of this QueryCoord, indicating whether it's healthy.
-	UpdateStateCode(stateCode internalpb.StateCode)
+	UpdateStateCode(stateCode commonpb.StateCode)
 
 	// SetDataCoord set DataCoord for QueryCoord
 	// `dataCoord` is a client of data coordinator.

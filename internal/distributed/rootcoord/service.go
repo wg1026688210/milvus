@@ -24,20 +24,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	ot "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
-	pnc "github.com/milvus-io/milvus/internal/distributed/proxy/client"
+	"github.com/milvus-io/milvus/api/commonpb"
+	"github.com/milvus-io/milvus/api/milvuspb"
 	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/milvuspb"
 	"github.com/milvus-io/milvus/internal/proto/proxypb"
 	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/internal/rootcoord"
@@ -45,8 +42,8 @@ import (
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/etcd"
 	"github.com/milvus-io/milvus/internal/util/funcutil"
+	"github.com/milvus-io/milvus/internal/util/logutil"
 	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/trace"
 	"github.com/milvus-io/milvus/internal/util/typeutil"
 
@@ -176,23 +173,8 @@ func (s *Server) init() error {
 	}
 	log.Debug("grpc init done ...")
 
-	s.rootCoord.UpdateStateCode(internalpb.StateCode_Initializing)
-	log.Debug("RootCoord", zap.Any("State", internalpb.StateCode_Initializing))
-	s.rootCoord.SetNewProxyClient(
-		func(se *sessionutil.Session) (types.Proxy, error) {
-			cli, err := pnc.NewClient(s.ctx, se.Address)
-			if err != nil {
-				return nil, err
-			}
-			if err := cli.Init(); err != nil {
-				return nil, err
-			}
-			if err := cli.Start(); err != nil {
-				return nil, err
-			}
-			return cli, nil
-		},
-	)
+	s.rootCoord.UpdateStateCode(commonpb.StateCode_Initializing)
+	log.Debug("RootCoord", zap.Any("State", commonpb.StateCode_Initializing))
 
 	if s.newDataCoordClient != nil {
 		log.Debug("RootCoord start to create DataCoord client")
@@ -258,8 +240,12 @@ func (s *Server) startGrpcLoop(port int) {
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(Params.ServerMaxRecvSize),
 		grpc.MaxSendMsgSize(Params.ServerMaxSendSize),
-		grpc.UnaryInterceptor(ot.UnaryServerInterceptor(opts...)),
-		grpc.StreamInterceptor(ot.StreamServerInterceptor(opts...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			ot.UnaryServerInterceptor(opts...),
+			logutil.UnaryTraceLoggerInterceptor)),
+		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+			ot.StreamServerInterceptor(opts...),
+			logutil.StreamTraceLoggerInterceptor)))
 	rootcoordpb.RegisterRootCoordServer(s.grpcServer, s)
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
@@ -323,7 +309,7 @@ func (s *Server) Stop() error {
 }
 
 // GetComponentStates gets the component states of RootCoord.
-func (s *Server) GetComponentStates(ctx context.Context, req *internalpb.GetComponentStatesRequest) (*internalpb.ComponentStates, error) {
+func (s *Server) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	return s.rootCoord.GetComponentStates(ctx)
 }
 
@@ -382,25 +368,6 @@ func (s *Server) ShowPartitions(ctx context.Context, in *milvuspb.ShowPartitions
 	return s.rootCoord.ShowPartitions(ctx, in)
 }
 
-// CreateIndex index builder service
-func (s *Server) CreateIndex(ctx context.Context, in *milvuspb.CreateIndexRequest) (*commonpb.Status, error) {
-	return s.rootCoord.CreateIndex(ctx, in)
-}
-
-// DropIndex drops the index.
-func (s *Server) DropIndex(ctx context.Context, in *milvuspb.DropIndexRequest) (*commonpb.Status, error) {
-	return s.rootCoord.DropIndex(ctx, in)
-}
-
-// DescribeIndex get the index information for the specified index name.
-func (s *Server) DescribeIndex(ctx context.Context, in *milvuspb.DescribeIndexRequest) (*milvuspb.DescribeIndexResponse, error) {
-	return s.rootCoord.DescribeIndex(ctx, in)
-}
-
-func (s *Server) GetIndexState(ctx context.Context, in *milvuspb.GetIndexStateRequest) (*indexpb.GetIndexStatesResponse, error) {
-	return s.rootCoord.GetIndexState(ctx, in)
-}
-
 // AllocTimestamp global timestamp allocator
 func (s *Server) AllocTimestamp(ctx context.Context, in *rootcoordpb.AllocTimestampRequest) (*rootcoordpb.AllocTimestampResponse, error) {
 	return s.rootCoord.AllocTimestamp(ctx, in)
@@ -416,23 +383,9 @@ func (s *Server) UpdateChannelTimeTick(ctx context.Context, in *internalpb.Chann
 	return s.rootCoord.UpdateChannelTimeTick(ctx, in)
 }
 
-// DescribeSegment gets meta info of the segment
-func (s *Server) DescribeSegment(ctx context.Context, in *milvuspb.DescribeSegmentRequest) (*milvuspb.DescribeSegmentResponse, error) {
-	return s.rootCoord.DescribeSegment(ctx, in)
-}
-
 // ShowSegments gets all segments
 func (s *Server) ShowSegments(ctx context.Context, in *milvuspb.ShowSegmentsRequest) (*milvuspb.ShowSegmentsResponse, error) {
 	return s.rootCoord.ShowSegments(ctx, in)
-}
-
-func (s *Server) DescribeSegments(ctx context.Context, in *rootcoordpb.DescribeSegmentsRequest) (*rootcoordpb.DescribeSegmentsResponse, error) {
-	return s.rootCoord.DescribeSegments(ctx, in)
-}
-
-// ReleaseDQLMessageStream notifies RootCoord to release and close the search message stream of specific collection.
-func (s *Server) ReleaseDQLMessageStream(ctx context.Context, in *proxypb.ReleaseDQLMessageStreamRequest) (*commonpb.Status, error) {
-	return s.rootCoord.ReleaseDQLMessageStream(ctx, in)
 }
 
 // InvalidateCollectionMetaCache notifies RootCoord to release the collection cache in Proxies.
@@ -440,9 +393,9 @@ func (s *Server) InvalidateCollectionMetaCache(ctx context.Context, in *proxypb.
 	return s.rootCoord.InvalidateCollectionMetaCache(ctx, in)
 }
 
-// SegmentFlushCompleted notifies RootCoord that specified segment has been flushed.
-func (s *Server) SegmentFlushCompleted(ctx context.Context, in *datapb.SegmentFlushCompletedMsg) (*commonpb.Status, error) {
-	return s.rootCoord.SegmentFlushCompleted(ctx, in)
+// ShowConfigurations gets specified configurations para of RootCoord
+func (s *Server) ShowConfigurations(ctx context.Context, req *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
+	return s.rootCoord.ShowConfigurations(ctx, req)
 }
 
 // GetMetrics gets the metrics of RootCoord.
@@ -491,46 +444,37 @@ func (s *Server) ListCredUsers(ctx context.Context, request *milvuspb.ListCredUs
 }
 
 func (s *Server) CreateRole(ctx context.Context, request *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.CreateRole(ctx, request)
 }
 
 func (s *Server) DropRole(ctx context.Context, request *milvuspb.DropRoleRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.DropRole(ctx, request)
 }
 
 func (s *Server) OperateUserRole(ctx context.Context, request *milvuspb.OperateUserRoleRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.OperateUserRole(ctx, request)
 }
 
 func (s *Server) SelectRole(ctx context.Context, request *milvuspb.SelectRoleRequest) (*milvuspb.SelectRoleResponse, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.SelectRole(ctx, request)
 }
 
 func (s *Server) SelectUser(ctx context.Context, request *milvuspb.SelectUserRequest) (*milvuspb.SelectUserResponse, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.SelectUser(ctx, request)
 }
 
-func (s *Server) SelectResource(ctx context.Context, request *milvuspb.SelectResourceRequest) (*milvuspb.SelectResourceResponse, error) {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (s *Server) OperatePrivilege(ctx context.Context, info *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
-	//TODO implement me
-	panic("implement me")
+func (s *Server) OperatePrivilege(ctx context.Context, request *milvuspb.OperatePrivilegeRequest) (*commonpb.Status, error) {
+	return s.rootCoord.OperatePrivilege(ctx, request)
 }
 
 func (s *Server) SelectGrant(ctx context.Context, request *milvuspb.SelectGrantRequest) (*milvuspb.SelectGrantResponse, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.SelectGrant(ctx, request)
 }
 
 func (s *Server) ListPolicy(ctx context.Context, request *internalpb.ListPolicyRequest) (*internalpb.ListPolicyResponse, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.rootCoord.ListPolicy(ctx, request)
+}
+
+func (s *Server) AlterCollection(ctx context.Context, request *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
+	return s.rootCoord.AlterCollection(ctx, request)
 }

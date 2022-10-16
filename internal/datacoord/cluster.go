@@ -19,9 +19,9 @@ package datacoord
 import (
 	"context"
 
+	"github.com/milvus-io/milvus/api/commonpb"
 	"github.com/milvus-io/milvus/internal/log"
 	"github.com/milvus-io/milvus/internal/metrics"
-	"github.com/milvus-io/milvus/internal/proto/commonpb"
 	"github.com/milvus-io/milvus/internal/proto/datapb"
 	"go.uber.org/zap"
 )
@@ -147,11 +147,6 @@ func (c *Cluster) Import(ctx context.Context, nodeID int64, it *datapb.ImportTas
 // ReCollectSegmentStats triggers a ReCollectSegmentStats call from session manager.
 func (c *Cluster) ReCollectSegmentStats(ctx context.Context, nodeID int64) {
 	c.sessionManager.ReCollectSegmentStats(ctx, nodeID)
-}
-
-// AddSegment triggers a AddSegment call from session manager.
-func (c *Cluster) AddSegment(ctx context.Context, nodeID int64, req *datapb.AddSegmentRequest) {
-	c.sessionManager.AddSegment(ctx, nodeID, req)
 }
 
 // GetSessions returns all sessions

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/milvus-io/milvus/internal/common"
 	"github.com/milvus-io/milvus/internal/proto/querypb"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/stretchr/testify/assert"
@@ -50,6 +51,7 @@ func TestShardClusterService_HandoffSegments(t *testing.T) {
 	assert.NotPanics(t, func() {
 		clusterService.HandoffSegments(defaultCollectionID, &querypb.SegmentChangeInfo{})
 	})
+	clusterService.releaseShardCluster(defaultDMLChannel)
 }
 
 func TestShardClusterService_SyncReplicaSegments(t *testing.T) {
@@ -75,6 +77,7 @@ func TestShardClusterService_SyncReplicaSegments(t *testing.T) {
 				PartitionId: defaultPartitionID,
 
 				SegmentIds: []int64{1},
+				Versions:   []int64{1},
 			},
 		})
 
@@ -84,7 +87,7 @@ func TestShardClusterService_SyncReplicaSegments(t *testing.T) {
 		require.True(t, ok)
 		segment, ok := cs.getSegment(1)
 		assert.True(t, ok)
-		assert.Equal(t, int64(1), segment.nodeID)
+		assert.Equal(t, common.InvalidNodeID, segment.nodeID)
 		assert.Equal(t, defaultPartitionID, segment.partitionID)
 		assert.Equal(t, segmentStateLoaded, segment.state)
 	})

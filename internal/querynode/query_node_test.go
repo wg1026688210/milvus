@@ -21,6 +21,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/server/v3/embed"
 
+	"github.com/milvus-io/milvus/internal/util/concurrency"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
@@ -64,7 +66,7 @@ func initTestMeta(t *testing.T, node *QueryNode, collectionID UniqueID, segmentI
 	err = node.metaReplica.addPartition(collection.ID(), defaultPartitionID)
 	assert.NoError(t, err)
 
-	err = node.metaReplica.addSegment(segmentID, defaultPartitionID, collectionID, "", segmentTypeSealed)
+	err = node.metaReplica.addSegment(segmentID, defaultPartitionID, collectionID, "", defaultSegmentVersion, segmentTypeSealed)
 	assert.NoError(t, err)
 }
 
@@ -92,18 +94,20 @@ func newQueryNodeMock() *QueryNode {
 	factory := newMessageStreamFactory()
 	svr := NewQueryNode(ctx, factory)
 	tsReplica := newTSafeReplica()
-	replica := newCollectionReplica()
+
+	pool, err := concurrency.NewPool(runtime.GOMAXPROCS(0))
+	if err != nil {
+		panic(err)
+	}
+
+	replica := newCollectionReplica(pool)
 	svr.metaReplica = replica
 	svr.dataSyncService = newDataSyncService(ctx, svr.metaReplica, tsReplica, factory)
-	svr.vectorStorage, err = factory.NewVectorStorageChunkManager(ctx)
+	svr.vectorStorage, err = factory.NewPersistentStorageChunkManager(ctx)
 	if err != nil {
 		panic(err)
 	}
-	svr.cacheStorage, err = factory.NewCacheStorageChunkManager(ctx)
-	if err != nil {
-		panic(err)
-	}
-	svr.loader = newSegmentLoader(svr.metaReplica, etcdKV, svr.vectorStorage, factory)
+	svr.loader = newSegmentLoader(svr.metaReplica, etcdKV, svr.vectorStorage, factory, pool)
 	svr.etcdKV = etcdKV
 
 	return svr
@@ -124,12 +128,12 @@ func startEmbedEtcdServer() (*embed.Etcd, error) {
 	config.Dir = os.TempDir()
 	config.LogLevel = "warn"
 	config.LogOutputs = []string{"default"}
-	u, err := url.Parse("http://localhost:2389")
+	u, err := url.Parse("http://localhost:8989")
 	if err != nil {
 		return nil, err
 	}
 	config.LCUrls = []url.URL{*u}
-	u, err = url.Parse("http://localhost:2390")
+	u, err = url.Parse("http://localhost:8990")
 	if err != nil {
 		return nil, err
 	}
@@ -140,8 +144,12 @@ func startEmbedEtcdServer() (*embed.Etcd, error) {
 
 func TestMain(m *testing.M) {
 	setup()
-	// init embed etcd
 	var err error
+	rateCol, err = newRateCollector()
+	if err != nil {
+		panic("init test failed, err = " + err.Error())
+	}
+	// init embed etcd
 	embedetcdServer, err = startEmbedEtcdServer()
 	if err != nil {
 		os.Exit(1)
