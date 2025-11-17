@@ -11,8 +11,9 @@
 
 #pragma once
 
+#include <limits>
 #include <string>
-#include "query/Expr.h"
+
 #include "common/Utils.h"
 
 namespace milvus::query {
@@ -20,7 +21,7 @@ namespace milvus::query {
 template <typename T, typename U>
 inline bool
 Match(const T& x, const U& y, OpType op) {
-    PanicInfo("not supported");
+    ThrowInfo(NotImplemented, "not supported");
 }
 
 template <>
@@ -31,8 +32,53 @@ Match<std::string>(const std::string& str, const std::string& val, OpType op) {
             return PrefixMatch(str, val);
         case OpType::PostfixMatch:
             return PostfixMatch(str, val);
+        case OpType::InnerMatch:
+            return InnerMatch(str, val);
         default:
-            PanicInfo("not supported");
+            ThrowInfo(OpTypeInvalid, "not supported");
     }
 }
+
+template <>
+inline bool
+Match<std::string_view>(const std::string_view& str,
+                        const std::string& val,
+                        OpType op) {
+    switch (op) {
+        case OpType::PrefixMatch:
+            return PrefixMatch(str, val);
+        case OpType::PostfixMatch:
+            return PostfixMatch(str, val);
+        case OpType::InnerMatch:
+            return InnerMatch(str, val);
+        default:
+            ThrowInfo(OpTypeInvalid, "not supported");
+    }
+}
+
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+inline bool
+gt_ub(int64_t t) {
+    return t > std::numeric_limits<T>::max();
+}
+
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+inline bool
+lt_lb(int64_t t) {
+    return t < std::numeric_limits<T>::min();
+}
+
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+inline bool
+out_of_range(int64_t t) {
+    return gt_ub<T>(t) || lt_lb<T>(t);
+}
+
+inline bool
+dis_closer(float dis1, float dis2, const MetricType& metric_type) {
+    if (PositivelyRelated(metric_type))
+        return dis1 > dis2;
+    return dis1 < dis2;
+}
+
 }  // namespace milvus::query

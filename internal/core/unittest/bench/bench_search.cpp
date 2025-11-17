@@ -12,9 +12,13 @@
 #include <cstdint>
 #include <benchmark/benchmark.h>
 #include <string>
+#include "common/type_c.h"
+#include "segcore/segment_c.h"
 #include "segcore/SegmentGrowing.h"
 #include "segcore/SegmentSealed.h"
+#include "test_utils/cachinglayer_test_utils.h"
 #include "test_utils/DataGen.h"
+#include "test_utils/storage_test_utils.h"
 
 using namespace milvus;
 using namespace milvus::query;
@@ -24,44 +28,39 @@ static int dim = 768;
 
 const auto schema = []() {
     auto schema = std::make_shared<Schema>();
-    schema->AddDebugField("fakevec", DataType::VECTOR_FLOAT, dim, knowhere::metric::L2);
+    schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, dim, knowhere::metric::L2);
     auto i64_fid = schema->AddDebugField("age", DataType::INT64);
     schema->set_primary_field_id(i64_fid);
     return schema;
 }();
 
-const auto plan = [] {
-    std::string dsl = R"({
-        "bool": {
-            "must": [
-            {
-                "vector": {
-                    "fakevec": {
-                        "metric_type": "L2",
-                        "params": {
-                            "nprobe": 10
-                        },
-                        "query": "$0",
-                        "topk": 5,
-                        "round_decimal": -1
-                    }
-                }
-            }
-            ]
-        }
-    })";
-    auto plan = CreatePlan(*schema, dsl);
+const auto search_plan = [] {
+    const char* raw_plan = R"(vector_anns: <
+                                field_id: 100
+                                query_info: <
+                                  topk: 5
+                                  round_decimal: -1
+                                  metric_type: "L2"
+                                  search_params: "{\"nprobe\": 10}"
+                                >
+                                placeholder_tag: "$0"
+        >)";
+    auto plan_str = translate_text_plan_to_binary_plan(raw_plan);
+    auto plan =
+        CreateSearchPlanByExpr(schema, plan_str.data(), plan_str.size());
     return plan;
 }();
 auto ph_group = [] {
     auto num_queries = 10;
     auto ph_group_raw = CreatePlaceholderGroup(num_queries, dim, 1024);
-    auto ph_group = ParsePlaceholderGroup(plan.get(), ph_group_raw.SerializeAsString());
+    auto ph_group = ParsePlaceholderGroup(search_plan.get(),
+                                          ph_group_raw.SerializeAsString());
     return ph_group;
 }();
 
 static void
-Search_SmallIndex(benchmark::State& state) {
+Search_GrowingIndex(benchmark::State& state) {
     // schema->AddDebugField("age", DataType::FLOAT);
 
     static int64_t N = 1024 * 32;
@@ -70,25 +69,41 @@ Search_SmallIndex(benchmark::State& state) {
         return dataset_;
     }();
 
-    auto is_small_index = state.range(0);
     auto chunk_rows = state.range(1) * 1024;
     auto segconf = SegcoreConfig::default_config();
     segconf.set_chunk_rows(chunk_rows);
-    auto segment = CreateGrowingSegment(schema, -1, segconf);
-    if (!is_small_index) {
-        segment->disable_small_index();
-    }
-    segment->PreInsert(N);
-    segment->Insert(0, N, dataset_.row_ids_.data(), dataset_.timestamps_.data(), dataset_.raw_);
 
-    Timestamp time = 10000000;
+    std::map<std::string, std::string> index_params = {
+        {"index_type", "IVF_FLAT"}, {"metric_type", "L2"}, {"nlist", "128"}};
+    std::map<std::string, std::string> type_params = {{"dim", "128"}};
+    FieldIndexMeta fieldIndexMeta(schema->get_field_id(FieldName("fakevec")),
+                                  std::move(index_params),
+                                  std::move(type_params));
+    segconf.set_enable_interim_segment_index(true);
+    std::map<FieldId, FieldIndexMeta> filedMap = {
+        {schema->get_field_id(FieldName("fakevec")), fieldIndexMeta}};
+    IndexMetaPtr metaPtr =
+        std::make_shared<CollectionIndexMeta>(226985, std::move(filedMap));
+
+    auto segment = CreateGrowingSegment(schema, metaPtr, -1, segconf);
+
+    segment->PreInsert(N);
+    segment->Insert(0,
+                    N,
+                    dataset_.row_ids_.data(),
+                    dataset_.timestamps_.data(),
+                    dataset_.raw_);
+
+    Timestamp ts = 10000000;
 
     for (auto _ : state) {
-        auto qr = segment->Search(plan.get(), ph_group.get(), time);
+        auto qr = segment->Search(search_plan.get(), ph_group.get(), ts, 0);
     }
 }
 
-BENCHMARK(Search_SmallIndex)->MinTime(5)->ArgsProduct({{true, false}, {8, 16, 32}});
+BENCHMARK(Search_GrowingIndex)
+    ->MinTime(5)
+    ->ArgsProduct({{true, false}, {8, 16, 32}});
 
 static void
 Search_Sealed(benchmark::State& state) {
@@ -98,26 +113,33 @@ Search_Sealed(benchmark::State& state) {
         auto dataset_ = DataGen(schema, N);
         return dataset_;
     }();
-    SealedLoadFieldData(dataset_, *segment);
+    auto storage_config = get_default_local_storage_config();
+    auto cm = storage::CreateChunkManager(storage_config);
+    auto load_info = PrepareInsertBinlog(1, 1, 1, dataset_, cm);
+    auto segment_ptr = segment.get();
+    auto status = LoadFieldData(segment_ptr, &load_info);
+    ASSERT_EQ(status.error_code, Success);
     auto choice = state.range(0);
     if (choice == 0) {
         // Brute Force
     } else if (choice == 1) {
-        // ivf
+        // hnsw
         auto vec = dataset_.get_col<float>(milvus::FieldId(100));
-        auto indexing = GenVecIndexing(N, dim, vec.data());
+        auto indexing =
+            GenVecIndexing(N, dim, vec.data(), knowhere::IndexEnum::INDEX_HNSW);
         segcore::LoadIndexInfo info;
-        info.index = std::move(indexing);
+        info.cache_index = CreateTestCacheIndex("test", std::move(indexing));
         info.field_id = (*schema)[FieldName("fakevec")].get_id().get();
-        info.index_params["index_type"] = "IVF";
-        info.index_params["index_mode"] = "CPU";
+        info.index_params["index_type"] = "HNSW";
         info.index_params["metric_type"] = knowhere::metric::L2;
         segment->DropFieldData(milvus::FieldId(100));
         segment->LoadIndex(info);
     }
-    Timestamp time = 10000000;
+
+    Timestamp ts = 10000000;
+
     for (auto _ : state) {
-        auto qr = segment->Search(plan.get(), ph_group.get(), time);
+        auto qr = segment->Search(search_plan.get(), ph_group.get(), ts, 0);
     }
 }
 

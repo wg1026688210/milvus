@@ -17,28 +17,28 @@
 package etcdkv_test
 
 import (
+	"context"
 	"os"
 	"testing"
 
-	"github.com/milvus-io/milvus/internal/util/metricsinfo"
-
-	embed_etcd_kv "github.com/milvus-io/milvus/internal/kv/etcd"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	embed_etcd_kv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
 func TestEtcdConfigLoad(te *testing.T) {
 	te.Setenv(metricsinfo.DeployModeEnvKey, metricsinfo.StandaloneDeployMode)
-	param := new(paramtable.ServiceParam)
+	param := new(paramtable.ComponentParam)
 
 	te.Setenv("etcd.use.embed", "true")
-	// TODO, not sure if the relative path works for ci environment
 	te.Setenv("etcd.config.path", "../../../configs/advanced/etcd.yaml")
 	te.Setenv("etcd.data.dir", "etcd.test.data.dir")
 
-	param.Init()
-	//clean up data
+	param.Init(paramtable.NewBaseTable())
+	// clean up data
 	defer func() {
 		os.RemoveAll("etcd.test.data.dir")
 	}()
@@ -50,7 +50,7 @@ func TestEtcdConfigLoad(te *testing.T) {
 		require.NoError(t, err)
 
 		defer metaKv.Close()
-		defer metaKv.RemoveWithPrefix("")
+		defer metaKv.RemoveWithPrefix(context.TODO(), "")
 
 		kv := metaKv.(*embed_etcd_kv.EmbedEtcdKV)
 		assert.Equal(t, kv.GetConfig().SnapshotCount, uint64(1000))

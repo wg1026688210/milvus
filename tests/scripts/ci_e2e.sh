@@ -40,7 +40,8 @@ PARALLEL_NUM="${PARALLEL_NUM:-6}"
 # Use service name instead of IP to test
 MILVUS_SERVICE_NAME=$(echo "${MILVUS_HELM_RELEASE_NAME}-milvus.${MILVUS_HELM_NAMESPACE}" | tr -d '\n')
 MILVUS_SERVICE_PORT="19530"
-
+# Minio service name
+MINIO_SERVICE_NAME=$(echo "${MILVUS_HELM_RELEASE_NAME}-minio.${MILVUS_HELM_NAMESPACE}" | tr -d '\n')
 
 
 # Shellcheck source=ci-util.sh
@@ -60,16 +61,19 @@ if [ ! -d "${CI_LOG_PATH}" ]; then
   mkdir -p ${CI_LOG_PATH}
 fi
 
-echo "prepare e2e test"  
-install_pytest_requirements  
+# skip pip install when DISABLE_PIP_INSTALL is set
+if [ "${DISABLE_PIP_INSTALL:-}" = "" ]; then
+    echo "prepare e2e test"  
+    install_pytest_requirements  
+fi
 
 
 # Pytest is not able to have both --timeout & --workers, so do not add --timeout or --workers in the shell script
 if [[ -n "${TEST_TIMEOUT:-}" ]]; then
   
-  timeout  "${TEST_TIMEOUT}" pytest --host ${MILVUS_SERVICE_NAME} --port ${MILVUS_SERVICE_PORT} \
+  timeout  "${TEST_TIMEOUT}" pytest --host ${MILVUS_SERVICE_NAME} --port ${MILVUS_SERVICE_PORT} --minio_host ${MINIO_SERVICE_NAME}\
                                      --html=${CI_LOG_PATH}/report.html  --self-contained-html ${@:-}
 else
-  pytest --host ${MILVUS_SERVICE_NAME} --port ${MILVUS_SERVICE_PORT} \
+  pytest --host ${MILVUS_SERVICE_NAME} --port ${MILVUS_SERVICE_PORT} --minio_host ${MINIO_SERVICE_NAME}\
                                      --html=${CI_LOG_PATH}/report.html --self-contained-html ${@:-}
 fi

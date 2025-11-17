@@ -10,31 +10,41 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "SearchOnIndex.h"
-#include "knowhere/index/vector_index/adapter/VectorAdapter.h"
+#include "exec/operator/Utils.h"
+#include "CachedSearchIterator.h"
 
 namespace milvus::query {
-SubSearchResult
+void
 SearchOnIndex(const dataset::SearchDataset& search_dataset,
               const index::VectorIndex& indexing,
               const SearchInfo& search_conf,
-              const BitsetView& bitset) {
+              const BitsetView& bitset,
+              milvus::OpContext* op_context,
+              SearchResult& search_result,
+              bool is_sparse) {
     auto num_queries = search_dataset.num_queries;
-    auto topK = search_dataset.topk;
     auto dim = search_dataset.dim;
     auto metric_type = search_dataset.metric_type;
-    auto round_decimal = search_dataset.round_decimal;
-    auto dataset = knowhere::GenDataset(num_queries, dim, search_dataset.query_data);
+    auto dataset =
+        knowhere::GenDataSet(num_queries, dim, search_dataset.query_data);
+    dataset->SetIsSparse(is_sparse);
+    if (milvus::exec::PrepareVectorIteratorsFromIndex(search_conf,
+                                                      num_queries,
+                                                      dataset,
+                                                      search_result,
+                                                      bitset,
+                                                      indexing)) {
+        return;
+    }
 
-    // NOTE: VecIndex Query API forget to add const qualifier
-    // NOTE: use const_cast as a workaround
-    auto& indexing_nonconst = const_cast<index::VectorIndex&>(indexing);
-    auto ans = indexing_nonconst.Query(dataset, search_conf, bitset);
+    if (search_conf.iterator_v2_info_.has_value()) {
+        auto iter =
+            CachedSearchIterator(indexing, dataset, search_conf, bitset);
+        iter.NextBatch(search_conf, search_result);
+        return;
+    }
 
-    SubSearchResult sub_qr(num_queries, topK, metric_type, round_decimal);
-    std::copy_n(ans->distances_.data(), num_queries * topK, sub_qr.get_distances());
-    std::copy_n(ans->seg_offsets_.data(), num_queries * topK, sub_qr.get_seg_offsets());
-    sub_qr.round_values();
-    return sub_qr;
+    indexing.Query(dataset, search_conf, bitset, op_context, search_result);
 }
 
 }  // namespace milvus::query

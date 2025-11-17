@@ -17,33 +17,51 @@
 
 #include "common/Types.h"
 #include "common/Utils.h"
+#include "knowhere/index/index_node.h"
 
 namespace milvus::query {
-
 class SubSearchResult {
  public:
-    SubSearchResult(int64_t num_queries, int64_t topk, const MetricType& metric_type, int64_t round_decimal)
+    SubSearchResult(int64_t num_queries,
+                    int64_t topk,
+                    const MetricType& metric_type,
+                    int64_t round_decimal,
+                    const std::vector<knowhere::IndexNode::IteratorPtr>& iters)
         : num_queries_(num_queries),
           topk_(topk),
           round_decimal_(round_decimal),
           metric_type_(metric_type),
-          seg_offsets_(num_queries * topk, -1),
-          distances_(num_queries * topk, init_value(metric_type)) {
+          seg_offsets_(num_queries * topk, INVALID_SEG_OFFSET),
+          distances_(num_queries * topk, init_value(metric_type)),
+          chunk_iterators_(std::move(iters)) {
     }
 
-    SubSearchResult(SubSearchResult&& other)
+    SubSearchResult(int64_t num_queries,
+                    int64_t topk,
+                    const MetricType& metric_type,
+                    int64_t round_decimal)
+        : SubSearchResult(num_queries,
+                          topk,
+                          metric_type,
+                          round_decimal,
+                          std::vector<knowhere::IndexNode::IteratorPtr>{}) {
+    }
+
+    SubSearchResult(SubSearchResult&& other) noexcept
         : num_queries_(other.num_queries_),
           topk_(other.topk_),
           round_decimal_(other.round_decimal_),
-          metric_type_(other.metric_type_),
+          metric_type_(std::move(other.metric_type_)),
           seg_offsets_(std::move(other.seg_offsets_)),
-          distances_(std::move(other.distances_)) {
+          distances_(std::move(other.distances_)),
+          chunk_iterators_(std::move(other.chunk_iterators_)) {
     }
 
  public:
     static float
     init_value(const MetricType& metric_type) {
-        return (PositivelyRelated(metric_type) ? -1 : 1) * std::numeric_limits<float>::max();
+        return (PositivelyRelated(metric_type) ? -1 : 1) *
+               std::numeric_limits<float>::max();
     }
 
  public:
@@ -91,7 +109,12 @@ class SubSearchResult {
     round_values();
 
     void
-    merge(const SubSearchResult& sub_result);
+    merge(const SubSearchResult& other);
+
+    const std::vector<knowhere::IndexNode::IteratorPtr>&
+    chunk_iterators() {
+        return this->chunk_iterators_;
+    }
 
  private:
     template <bool is_desc>
@@ -105,6 +128,7 @@ class SubSearchResult {
     knowhere::MetricType metric_type_;
     std::vector<int64_t> seg_offsets_;
     std::vector<float> distances_;
+    std::vector<knowhere::IndexNode::IteratorPtr> chunk_iterators_;
 };
 
 }  // namespace milvus::query

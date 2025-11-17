@@ -21,16 +21,57 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/milvus-io/milvus/api/commonpb"
-	"github.com/milvus-io/milvus/api/milvuspb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
 )
 
 var _ datapb.DataNodeClient = &GrpcDataNodeClient{}
 
 type GrpcDataNodeClient struct {
 	Err error
+}
+
+func (m *GrpcDataNodeClient) CreateTask(ctx context.Context, in *workerpb.CreateTaskRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) QueryTask(ctx context.Context, in *workerpb.QueryTaskRequest, opts ...grpc.CallOption) (*workerpb.QueryTaskResponse, error) {
+	return &workerpb.QueryTaskResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) DropTask(ctx context.Context, in *workerpb.DropTaskRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) CreateJob(ctx context.Context, in *workerpb.CreateJobRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) QueryJobs(ctx context.Context, in *workerpb.QueryJobsRequest, opts ...grpc.CallOption) (*workerpb.QueryJobsResponse, error) {
+	return &workerpb.QueryJobsResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) DropJobs(ctx context.Context, in *workerpb.DropJobsRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) GetJobStats(ctx context.Context, in *workerpb.GetJobStatsRequest, opts ...grpc.CallOption) (*workerpb.GetJobStatsResponse, error) {
+	return &workerpb.GetJobStatsResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) CreateJobV2(ctx context.Context, in *workerpb.CreateJobV2Request, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) QueryJobsV2(ctx context.Context, in *workerpb.QueryJobsV2Request, opts ...grpc.CallOption) (*workerpb.QueryJobsV2Response, error) {
+	return &workerpb.QueryJobsV2Response{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) DropJobsV2(ctx context.Context, in *workerpb.DropJobsV2Request, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
 }
 
 func (m *GrpcDataNodeClient) GetComponentStates(ctx context.Context, in *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error) {
@@ -57,7 +98,7 @@ func (m *GrpcDataNodeClient) GetMetrics(ctx context.Context, in *milvuspb.GetMet
 	return &milvuspb.GetMetricsResponse{}, m.Err
 }
 
-func (m *GrpcDataNodeClient) Compaction(ctx context.Context, req *datapb.CompactionPlan, opts ...grpc.CallOption) (*commonpb.Status, error) {
+func (m *GrpcDataNodeClient) CompactionV2(ctx context.Context, req *datapb.CompactionPlan, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }
 
@@ -65,18 +106,50 @@ func (m *GrpcDataNodeClient) GetCompactionState(ctx context.Context, in *datapb.
 	return &datapb.CompactionStateResponse{}, m.Err
 }
 
-func (m *GrpcDataNodeClient) Import(ctx context.Context, req *datapb.ImportTaskRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
-	return &commonpb.Status{}, m.Err
-}
-
 func (m *GrpcDataNodeClient) ResendSegmentStats(ctx context.Context, req *datapb.ResendSegmentStatsRequest, opts ...grpc.CallOption) (*datapb.ResendSegmentStatsResponse, error) {
 	return &datapb.ResendSegmentStatsResponse{}, m.Err
 }
 
-func (m *GrpcDataNodeClient) AddImportSegment(ctx context.Context, in *datapb.AddImportSegmentRequest, opts ...grpc.CallOption) (*datapb.AddImportSegmentResponse, error) {
-	return &datapb.AddImportSegmentResponse{}, m.Err
+func (m *GrpcDataNodeClient) SyncSegments(ctx context.Context, in *datapb.SyncSegmentsRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
 }
 
-func (m *GrpcDataNodeClient) SyncSegments(ctx context.Context, in *datapb.SyncSegmentsRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+func (m *GrpcDataNodeClient) FlushChannels(ctx context.Context, in *datapb.FlushChannelsRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) NotifyChannelOperation(ctx context.Context, in *datapb.ChannelOperationsRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) CheckChannelOperationProgress(ctx context.Context, req *datapb.ChannelWatchInfo, opts ...grpc.CallOption) (*datapb.ChannelOperationProgressResponse, error) {
+	return &datapb.ChannelOperationProgressResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) PreImport(ctx context.Context, req *datapb.PreImportRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) ImportV2(ctx context.Context, req *datapb.ImportRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) QueryPreImport(ctx context.Context, req *datapb.QueryPreImportRequest, opts ...grpc.CallOption) (*datapb.QueryPreImportResponse, error) {
+	return &datapb.QueryPreImportResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) QueryImport(ctx context.Context, req *datapb.QueryImportRequest, opts ...grpc.CallOption) (*datapb.QueryImportResponse, error) {
+	return &datapb.QueryImportResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) DropImport(ctx context.Context, req *datapb.DropImportRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	return &commonpb.Status{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) QuerySlot(ctx context.Context, req *datapb.QuerySlotRequest, opts ...grpc.CallOption) (*datapb.QuerySlotResponse, error) {
+	return &datapb.QuerySlotResponse{}, m.Err
+}
+
+func (m *GrpcDataNodeClient) DropCompactionPlan(ctx context.Context, req *datapb.DropCompactionPlanRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	return &commonpb.Status{}, m.Err
 }

@@ -17,20 +17,24 @@
 package flowgraph
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/util/timerecord"
-
-	"github.com/milvus-io/milvus/internal/log"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 )
 
 const (
 	// TODO: better to be configured
 	nodeCtxTtInterval = 2 * time.Minute
 	enableTtChecker   = true
+	// blockAll should wait no more than 10 seconds
+	blockAllWait = 10 * time.Second
 )
 
 // Node is the interface defines the behavior of flowgraph
@@ -38,10 +42,12 @@ type Node interface {
 	Name() string
 	MaxQueueLength() int32
 	MaxParallelism() int32
+	IsValidInMsg(in []Msg) bool
 	Operate(in []Msg) []Msg
 	IsInputNode() bool
 	Start()
 	Close()
+	Free()
 }
 
 // BaseNode defines some common node attributes and behavior
@@ -50,93 +56,156 @@ type BaseNode struct {
 	maxParallelism int32
 }
 
-// nodeCtx maintains the running context for a Node in flowgragh
-type nodeCtx struct {
-	node         Node
-	inputChannel chan []Msg
-	downstream   *nodeCtx
+// manage nodeCtx
+type nodeCtxManager struct {
+	inputNodeCtx *nodeCtx
+	closeWg      *sync.WaitGroup
+	closeOnce    sync.Once
+	closeCh      chan struct{} // notify nodes to exit
 
-	closeCh chan struct{} // notify work to exit
-	closeWg *sync.WaitGroup
+	lastAccessTime *atomic.Time
+}
+
+// NewNodeCtxManager init with the inputNode and fg.closeWg
+func NewNodeCtxManager(nodeCtx *nodeCtx, closeWg *sync.WaitGroup) *nodeCtxManager {
+	return &nodeCtxManager{
+		inputNodeCtx:   nodeCtx,
+		closeWg:        closeWg,
+		closeCh:        make(chan struct{}),
+		lastAccessTime: atomic.NewTime(time.Now()),
+	}
 }
 
 // Start invoke Node `Start` method and start a worker goroutine
-func (nodeCtx *nodeCtx) Start() {
-	nodeCtx.node.Start()
-
-	nodeCtx.closeWg.Add(1)
-	go nodeCtx.work()
-}
-
-func isCloseMsg(msgs []Msg) bool {
-	if len(msgs) == 1 {
-		msg, ok := msgs[0].(*MsgStreamMsg)
-		return ok && msg.isCloseMsg
-	}
-	return false
-}
-
-// work handles node work spinning
-// 1. collectMessage from upstream or just produce Msg from InputNode
-// 2. invoke node.Operate
-// 3. deliver the Operate result to downstream nodes
-func (nodeCtx *nodeCtx) work() {
-	name := fmt.Sprintf("nodeCtxTtChecker-%s", nodeCtx.node.Name())
-	var checker *timerecord.GroupChecker
+func (nodeCtxManager *nodeCtxManager) Start() {
+	// in dmInputNode, message from mq to channel, alloc goroutines
+	// limit the goroutines in other node to prevent huge goroutines numbers
+	nodeCtxManager.closeWg.Add(1)
+	curNode := nodeCtxManager.inputNodeCtx
+	// tt checker start
 	if enableTtChecker {
-		checker = timerecord.GetGroupChecker("fgNode", nodeCtxTtInterval, func(list []string) {
+		manager := timerecord.GetCheckerManger("data-fgNode", nodeCtxTtInterval, func(list []string) {
 			log.Warn("some node(s) haven't received input", zap.Strings("list", list), zap.Duration("duration ", nodeCtxTtInterval))
 		})
-		checker.Check(name)
-		defer checker.Remove(name)
+		for curNode != nil {
+			name := fmt.Sprintf("nodeCtxTtChecker-%s", curNode.node.Name())
+			curNode.checker = timerecord.NewChecker(name, manager)
+			curNode = curNode.downstream
+		}
 	}
+	go nodeCtxManager.workNodeStart()
+}
 
+func (nodeCtxManager *nodeCtxManager) workNodeStart() {
+	defer nodeCtxManager.closeWg.Done()
 	for {
 		select {
-		case <-nodeCtx.closeCh:
-			log.Debug("flow graph node closed", zap.String("nodeName", nodeCtx.node.Name()))
+		case <-nodeCtxManager.closeCh:
 			return
+		// handles node work spinning
+		// 1. collectMessage from upstream or just produce Msg from InputNode
+		// 2. invoke node.Operate
+		// 3. deliver the Operate result to downstream nodes
 		default:
-			// inputs from inputsMessages for Operate
-			var input, output []Msg
-			if !nodeCtx.node.IsInputNode() {
-				input = <-nodeCtx.inputChannel
-			}
-
-			// the input message decides whether the operate method is executed
-			if isCloseMsg(input) {
-				output = input
-			}
-			if len(output) == 0 {
-				n := nodeCtx.node
-				output = n.Operate(input)
-			}
-			// the output decide whether the node should be closed.
-			if isCloseMsg(output) {
-				close(nodeCtx.closeCh)
-				nodeCtx.closeWg.Done()
-				nodeCtx.node.Close()
-				if nodeCtx.inputChannel != nil {
-					close(nodeCtx.inputChannel)
+			inputNode := nodeCtxManager.inputNodeCtx
+			curNode := inputNode
+			for curNode != nil {
+				// inputs from inputsMessages for Operate
+				var input, output []Msg
+				if curNode != inputNode {
+					// inputNode.input not from nodeCtx.inputChannel
+					input = <-curNode.inputChannel
 				}
-			}
+				// the input message decides whether the operate method is executed
+				n := curNode.node
+				curNode.blockMutex.RLock()
+				if !n.IsValidInMsg(input) {
+					curNode.blockMutex.RUnlock()
+					curNode = inputNode
+					continue
+				}
 
-			if enableTtChecker {
-				checker.Check(name)
-			}
+				if nodeCtxManager.lastAccessTime != nil {
+					nodeCtxManager.lastAccessTime.Store(time.Now())
+				}
 
-			// deliver to all following flow graph node.
-			if nodeCtx.downstream != nil {
-				nodeCtx.downstream.inputChannel <- output
+				output = n.Operate(input)
+				curNode.blockMutex.RUnlock()
+				// the output decide whether the node should be closed.
+				if isCloseMsg(output) {
+					nodeCtxManager.closeOnce.Do(func() {
+						close(nodeCtxManager.closeCh)
+					})
+					if curNode.inputChannel != nil {
+						close(curNode.inputChannel)
+					}
+				}
+				// deliver to all following flow graph node.
+				if curNode.downstream != nil {
+					curNode.downstream.inputChannel <- output
+				}
+				if enableTtChecker && curNode.checker != nil {
+					curNode.checker.Check()
+				}
+				curNode = curNode.downstream
 			}
 		}
 	}
 }
 
 // Close handles cleanup logic and notify worker to quit
+func (nodeCtxManager *nodeCtxManager) Close() {
+	nodeCtx := nodeCtxManager.inputNodeCtx
+	nodeCtx.Close()
+}
+
+// nodeCtx maintains the running context for a Node in flowgragh
+type nodeCtx struct {
+	node         Node
+	inputChannel chan []Msg
+	downstream   *nodeCtx
+	checker      *timerecord.Checker
+
+	blockMutex sync.RWMutex
+}
+
+func (nodeCtx *nodeCtx) Block() {
+	// input node operate function will be blocking
+	if !nodeCtx.node.IsInputNode() {
+		startTs := time.Now()
+		nodeCtx.blockMutex.Lock()
+		if time.Since(startTs) >= blockAllWait {
+			log.Warn("flow graph wait for long time",
+				zap.String("name", nodeCtx.node.Name()),
+				zap.Duration("wait time", time.Since(startTs)))
+		}
+	}
+}
+
+func (nodeCtx *nodeCtx) Unblock() {
+	if !nodeCtx.node.IsInputNode() {
+		nodeCtx.blockMutex.Unlock()
+	}
+}
+
+func isCloseMsg(msgs []Msg) bool {
+	if len(msgs) == 1 {
+		return msgs[0].IsClose()
+	}
+	return false
+}
+
+// Close handles cleanup logic and notify worker to quit
 func (nodeCtx *nodeCtx) Close() {
 	if nodeCtx.node.IsInputNode() {
-		nodeCtx.node.Close()
+		for nodeCtx != nil {
+			nodeCtx.node.Close()
+			if nodeCtx.checker != nil {
+				nodeCtx.checker.Close()
+			}
+			log.Ctx(context.TODO()).Debug("flow graph node closed", zap.String("nodeName", nodeCtx.node.Name()))
+			nodeCtx = nodeCtx.downstream
+		}
 	}
 }
 
@@ -170,3 +239,32 @@ func (node *BaseNode) Start() {}
 
 // Close implementing Node, base node does nothing when stops
 func (node *BaseNode) Close() {}
+
+// Free resource after all node close
+func (node *BaseNode) Free() {}
+
+func (node *BaseNode) Name() string {
+	return "BaseNode"
+}
+
+func (node *BaseNode) Operate(in []Msg) []Msg {
+	return in
+}
+
+func (node *BaseNode) IsValidInMsg(in []Msg) bool {
+	if in == nil {
+		log.Info("type assertion failed because it's nil")
+		return false
+	}
+
+	if len(in) == 0 {
+		// avoid printing too many logs.
+		return false
+	}
+
+	if len(in) != 1 {
+		log.Warn("Invalid operate message input", zap.Int("input length", len(in)))
+		return false
+	}
+	return true
+}

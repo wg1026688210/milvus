@@ -17,17 +17,19 @@
 package storage
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 
+	"github.com/cockroachdb/errors"
+	"github.com/twpayne/go-geom/encoding/wkb"
+	"github.com/twpayne/go-geom/encoding/wkt"
 	"golang.org/x/exp/mmap"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/util/tsoutil"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
 )
 
 // PrintBinlogFiles call printBinlogFile in turn for the file list specified by parameter fileList.
@@ -41,8 +43,9 @@ func PrintBinlogFiles(fileList []string) error {
 	return nil
 }
 
+// nolint
 func printBinlogFile(filename string) error {
-	fd, err := os.OpenFile(filename, os.O_RDONLY, 0400)
+	fd, err := os.OpenFile(filename, os.O_RDONLY, 0o400)
 	if err != nil {
 		return err
 	}
@@ -206,7 +209,7 @@ func printBinlogFile(filename string) error {
 			physical, _ = tsoutil.ParseTS(evd.EndTimestamp)
 			fmt.Printf("\tEndTimestamp: %v\n", physical)
 			key := fmt.Sprintf("%v", extra["key"])
-			if err := printIndexFilePayloadValues(event.PayloadReaderInterface, key); err != nil {
+			if err := printIndexFilePayloadValues(event.PayloadReaderInterface, key, desc.PayloadDataType); err != nil {
 				return err
 			}
 		default:
@@ -218,11 +221,12 @@ func printBinlogFile(filename string) error {
 	return nil
 }
 
+// nolint
 func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface) error {
 	fmt.Println("\tpayload values:")
 	switch colType {
 	case schemapb.DataType_Bool:
-		val, err := reader.GetBoolFromPayload()
+		val, _, err := reader.GetBoolFromPayload()
 		if err != nil {
 			return err
 		}
@@ -230,7 +234,7 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			fmt.Printf("\t\t%d : %v\n", i, v)
 		}
 	case schemapb.DataType_Int8:
-		val, err := reader.GetInt8FromPayload()
+		val, _, err := reader.GetInt8FromPayload()
 		if err != nil {
 			return err
 		}
@@ -238,7 +242,7 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			fmt.Printf("\t\t%d : %d\n", i, v)
 		}
 	case schemapb.DataType_Int16:
-		val, err := reader.GetInt16FromPayload()
+		val, _, err := reader.GetInt16FromPayload()
 		if err != nil {
 			return err
 		}
@@ -246,7 +250,7 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			fmt.Printf("\t\t%d : %d\n", i, v)
 		}
 	case schemapb.DataType_Int32:
-		val, err := reader.GetInt32FromPayload()
+		val, _, err := reader.GetInt32FromPayload()
 		if err != nil {
 			return err
 		}
@@ -254,7 +258,7 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			fmt.Printf("\t\t%d : %d\n", i, v)
 		}
 	case schemapb.DataType_Int64:
-		val, err := reader.GetInt64FromPayload()
+		val, _, err := reader.GetInt64FromPayload()
 		if err != nil {
 			return err
 		}
@@ -262,7 +266,7 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			fmt.Printf("\t\t%d : %d\n", i, v)
 		}
 	case schemapb.DataType_Float:
-		val, err := reader.GetFloatFromPayload()
+		val, _, err := reader.GetFloatFromPayload()
 		if err != nil {
 			return err
 		}
@@ -270,12 +274,20 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			fmt.Printf("\t\t%d : %f\n", i, v)
 		}
 	case schemapb.DataType_Double:
-		val, err := reader.GetDoubleFromPayload()
+		val, _, err := reader.GetDoubleFromPayload()
 		if err != nil {
 			return err
 		}
 		for i, v := range val {
 			fmt.Printf("\t\t%d : %v\n", i, v)
+		}
+	case schemapb.DataType_Timestamptz:
+		val, _, err := reader.GetTimestamptzFromPayload()
+		if err != nil {
+			return err
+		}
+		for i, v := range val {
+			fmt.Printf("\t\t%d : %d\n", i, v)
 		}
 	case schemapb.DataType_String, schemapb.DataType_VarChar:
 		rows, err := reader.GetPayloadLengthFromReader()
@@ -283,7 +295,7 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			return err
 		}
 
-		val, err := reader.GetStringFromPayload()
+		val, _, err := reader.GetStringFromPayload()
 		if err != nil {
 			return err
 		}
@@ -305,6 +317,37 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			}
 			fmt.Println()
 		}
+	case schemapb.DataType_Float16Vector:
+		val, dim, err := reader.GetFloat16VectorFromPayload()
+		if err != nil {
+			return err
+		}
+		dim = dim * 2
+		length := len(val) / dim
+		for i := 0; i < length; i++ {
+			fmt.Printf("\t\t%d :", i)
+			for j := 0; j < dim; j++ {
+				idx := i*dim + j
+				fmt.Printf(" %02x", val[idx])
+			}
+			fmt.Println()
+		}
+	case schemapb.DataType_BFloat16Vector:
+		val, dim, err := reader.GetBFloat16VectorFromPayload()
+		if err != nil {
+			return err
+		}
+		dim = dim * 2
+		length := len(val) / dim
+		for i := 0; i < length; i++ {
+			fmt.Printf("\t\t%d :", i)
+			for j := 0; j < dim; j++ {
+				idx := i*dim + j
+				fmt.Printf(" %02x", val[idx])
+			}
+			fmt.Println()
+		}
+
 	case schemapb.DataType_FloatVector:
 		val, dim, err := reader.GetFloatVectorFromPayload()
 		if err != nil {
@@ -319,17 +362,64 @@ func printPayloadValues(colType schemapb.DataType, reader PayloadReaderInterface
 			}
 			fmt.Println()
 		}
+	case schemapb.DataType_JSON:
+
+		rows, err := reader.GetPayloadLengthFromReader()
+		if err != nil {
+			return err
+		}
+		val, valids, err := reader.GetJSONFromPayload()
+		if err != nil {
+			return err
+		}
+		for i := 0; i < rows; i++ {
+			fmt.Printf("\t\t%d : %s\n", i, val[i])
+		}
+		for i, v := range valids {
+			fmt.Printf("\t\t%d : %v\n", i, v)
+		}
+	// print the wkb bytes
+	case schemapb.DataType_Geometry:
+		rows, err := reader.GetPayloadLengthFromReader()
+		if err != nil {
+			return err
+		}
+		val, valids, err := reader.GetGeometryFromPayload()
+		if err != nil {
+			return err
+		}
+		for i := 0; i < rows; i++ {
+			geomT, _ := wkb.Unmarshal(val[i])
+			wktStr, _ := wkt.Marshal(geomT)
+			fmt.Printf("\t\t%d : %s\n", i, wktStr)
+		}
+		for i, v := range valids {
+			fmt.Printf("\t\t%d : %v\n", i, v)
+		}
+	case schemapb.DataType_SparseFloatVector:
+		sparseData, _, err := reader.GetSparseFloatVectorFromPayload()
+		if err != nil {
+			return err
+		}
+		fmt.Println("======= SparseFloatVectorFieldData =======")
+		fmt.Println("row num:", len(sparseData.Contents))
+		fmt.Println("dim:", sparseData.Dim)
+		for _, v := range sparseData.Contents {
+			fmt.Println(v)
+		}
+		fmt.Println("===== SparseFloatVectorFieldData end =====")
 	default:
 		return errors.New("undefined data type")
 	}
 	return nil
 }
 
+// nolint
 func printDDLPayloadValues(eventType EventTypeCode, colType schemapb.DataType, reader PayloadReaderInterface) error {
 	fmt.Println("\tpayload values:")
 	switch colType {
 	case schemapb.DataType_Int64:
-		val, err := reader.GetInt64FromPayload()
+		val, _, err := reader.GetInt64FromPayload()
 		if err != nil {
 			return err
 		}
@@ -343,7 +433,7 @@ func printDDLPayloadValues(eventType EventTypeCode, colType schemapb.DataType, r
 			return err
 		}
 
-		val, err := reader.GetStringFromPayload()
+		val, _, err := reader.GetStringFromPayload()
 		if err != nil {
 			return err
 		}
@@ -351,25 +441,25 @@ func printDDLPayloadValues(eventType EventTypeCode, colType schemapb.DataType, r
 			valBytes := []byte(val[i])
 			switch eventType {
 			case CreateCollectionEventType:
-				var req internalpb.CreateCollectionRequest
+				var req msgpb.CreateCollectionRequest
 				if err := proto.Unmarshal(valBytes, &req); err != nil {
 					return err
 				}
 				fmt.Printf("\t\t%d : create collection: %v\n", i, req)
 			case DropCollectionEventType:
-				var req internalpb.DropCollectionRequest
+				var req msgpb.DropCollectionRequest
 				if err := proto.Unmarshal(valBytes, &req); err != nil {
 					return err
 				}
 				fmt.Printf("\t\t%d : drop collection: %v\n", i, req)
 			case CreatePartitionEventType:
-				var req internalpb.CreatePartitionRequest
+				var req msgpb.CreatePartitionRequest
 				if err := proto.Unmarshal(valBytes, &req); err != nil {
 					return err
 				}
 				fmt.Printf("\t\t%d : create partition: %v\n", i, req)
 			case DropPartitionEventType:
-				var req internalpb.DropPartitionRequest
+				var req msgpb.DropPartitionRequest
 				if err := proto.Unmarshal(valBytes, &req); err != nil {
 					return err
 				}
@@ -384,31 +474,59 @@ func printDDLPayloadValues(eventType EventTypeCode, colType schemapb.DataType, r
 	return nil
 }
 
+// nolint
 // only print slice meta and index params
-func printIndexFilePayloadValues(reader PayloadReaderInterface, key string) error {
-	if key == IndexParamsKey {
-		content, err := reader.GetByteFromPayload()
-		if err != nil {
-			return err
+func printIndexFilePayloadValues(reader PayloadReaderInterface, key string, dataType schemapb.DataType) error {
+	if dataType == schemapb.DataType_Int8 {
+		if key == IndexParamsKey {
+			content, _, err := reader.GetByteFromPayload()
+			if err != nil {
+				return err
+			}
+			fmt.Print("index params: \n")
+			fmt.Println(content)
+
+			return nil
 		}
-		fmt.Print("index params: \n")
-		fmt.Println(content)
 
-		return nil
-	}
+		if key == "SLICE_META" {
+			content, _, err := reader.GetByteFromPayload()
+			if err != nil {
+				return err
+			}
+			// content is a json string serialized by milvus::json,
+			// it's better to use milvus::json to parse the content also,
+			// fortunately, the json string is readable enough.
+			fmt.Print("index slice meta: \n")
+			fmt.Println(content)
 
-	if key == "SLICE_META" {
-		content, err := reader.GetByteFromPayload()
-		if err != nil {
-			return err
+			return nil
 		}
-		// content is a json string serialized by milvus::json,
-		// it's better to use milvus::json to parse the content also,
-		// fortunately, the json string is readable enough.
-		fmt.Print("index slice meta: \n")
-		fmt.Println(content)
+	} else {
+		if key == IndexParamsKey {
+			content, _, err := reader.GetStringFromPayload()
+			if err != nil {
+				return err
+			}
+			fmt.Print("index params: \n")
+			fmt.Println(content[0])
 
-		return nil
+			return nil
+		}
+
+		if key == "SLICE_META" {
+			content, _, err := reader.GetStringFromPayload()
+			if err != nil {
+				return err
+			}
+			// content is a json string serialized by milvus::json,
+			// it's better to use milvus::json to parse the content also,
+			// fortunately, the json string is readable enough.
+			fmt.Print("index slice meta: \n")
+			fmt.Println(content[0])
+
+			return nil
+		}
 	}
 
 	return nil

@@ -18,28 +18,37 @@ package flowgraph
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"go.uber.org/atomic"
 )
 
 // Flow Graph is no longer a graph rather than a simple pipeline, this simplified our code and increase recovery speed - xiaofan.
 
 // TimeTickedFlowGraph flowgraph with input from tt msg stream
 type TimeTickedFlowGraph struct {
-	nodeCtx   map[NodeName]*nodeCtx
-	stopOnce  sync.Once
-	startOnce sync.Once
-	closeWg   *sync.WaitGroup
+	nodeCtx         map[NodeName]*nodeCtx
+	nodeSequence    []NodeName
+	nodeCtxManager  *nodeCtxManager
+	stopOnce        sync.Once
+	startOnce       sync.Once
+	closeWg         *sync.WaitGroup
+	closeGracefully *atomic.Bool
 }
 
-// AddNode add Node into flowgraph
+// AddNode add Node into flowgraph and fill nodeCtxManager
 func (fg *TimeTickedFlowGraph) AddNode(node Node) {
 	nodeCtx := nodeCtx{
-		node:    node,
-		closeCh: make(chan struct{}),
-		closeWg: fg.closeWg,
+		node: node,
 	}
 	fg.nodeCtx[node.Name()] = &nodeCtx
+	if node.IsInputNode() {
+		fg.nodeCtxManager = NewNodeCtxManager(&nodeCtx, fg.closeWg)
+	}
+	fg.nodeSequence = append(fg.nodeSequence, node.Name())
 }
 
 // SetEdges set directed edges from in nodes to out nodes
@@ -75,9 +84,32 @@ func (fg *TimeTickedFlowGraph) SetEdges(nodeName string, out []string) error {
 func (fg *TimeTickedFlowGraph) Start() {
 	fg.startOnce.Do(func() {
 		for _, v := range fg.nodeCtx {
-			v.Start()
+			v.node.Start()
 		}
+		fg.nodeCtxManager.Start()
 	})
+}
+
+func (fg *TimeTickedFlowGraph) Blockall() {
+	// Lock with determined order to avoid deadlock.
+	for _, nodeName := range fg.nodeSequence {
+		fg.nodeCtx[nodeName].Block()
+	}
+}
+
+func (fg *TimeTickedFlowGraph) Unblock() {
+	// Unlock with reverse order.
+	for i := len(fg.nodeSequence) - 1; i >= 0; i-- {
+		fg.nodeCtx[fg.nodeSequence[i]].Unblock()
+	}
+}
+
+func (fg *TimeTickedFlowGraph) SetCloseMethod(gracefully bool) {
+	for _, v := range fg.nodeCtx {
+		if v.node.IsInputNode() {
+			v.node.(*InputNode).SetCloseMethod(gracefully)
+		}
+	}
 }
 
 // Close closes all nodes in flowgraph
@@ -89,15 +121,51 @@ func (fg *TimeTickedFlowGraph) Close() {
 			}
 		}
 		fg.closeWg.Wait()
+
+		// free some source after all node close.
+		// such as function.
+		for _, v := range fg.nodeCtx {
+			v.node.Free()
+		}
 	})
+}
+
+// Status returns the status of the pipeline, it will return "Healthy" if the input node
+// has received any msg in the last nodeTtInterval
+func (fg *TimeTickedFlowGraph) Status() string {
+	diff := time.Since(fg.nodeCtxManager.lastAccessTime.Load())
+	if diff > nodeCtxTtInterval {
+		return fmt.Sprintf("input node hasn't received any msg in the last %s", diff.String())
+	}
+	return "Healthy"
 }
 
 // NewTimeTickedFlowGraph create timetick flowgraph
 func NewTimeTickedFlowGraph(ctx context.Context) *TimeTickedFlowGraph {
 	flowGraph := TimeTickedFlowGraph{
-		nodeCtx: make(map[string]*nodeCtx),
-		closeWg: &sync.WaitGroup{},
+		nodeCtx:         make(map[string]*nodeCtx),
+		nodeCtxManager:  &nodeCtxManager{lastAccessTime: atomic.NewTime(time.Now())},
+		closeWg:         &sync.WaitGroup{},
+		closeGracefully: atomic.NewBool(CloseImmediately),
 	}
 
 	return &flowGraph
+}
+
+func (fg *TimeTickedFlowGraph) AssembleNodes(orderedNodes ...Node) error {
+	for _, node := range orderedNodes {
+		fg.AddNode(node)
+	}
+
+	for i, node := range orderedNodes {
+		// Set edge to the next node
+		if i < len(orderedNodes)-1 {
+			err := fg.SetEdges(node.Name(), []string{orderedNodes[i+1].Name()})
+			if err != nil {
+				errMsg := fmt.Sprintf("set edges failed for flow graph, node=%s", node.Name())
+				return errors.New(errMsg)
+			}
+		}
+	}
+	return nil
 }

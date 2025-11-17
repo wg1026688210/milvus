@@ -18,13 +18,24 @@
 
 #include <memory>
 #include <boost/dynamic_bitset.hpp>
-
+#include "cachinglayer/CacheSlot.h"
+#include "common/FieldData.h"
+#include "common/EasyAssert.h"
+#include "common/File.h"
+#include "common/JsonCastType.h"
+#include "knowhere/comp/index_param.h"
+#include "knowhere/dataset.h"
+#include "knowhere/index/index_factory.h"
+#include "common/Tracer.h"
 #include "common/Types.h"
+#include "index/Meta.h"
+#include "index/IndexStats.h"
 
 namespace milvus::index {
 
 class IndexBase {
  public:
+    IndexBase() = default;
     virtual ~IndexBase() = default;
 
     virtual BinarySet
@@ -34,18 +45,68 @@ class IndexBase {
     Load(const BinarySet& binary_set, const Config& config = {}) = 0;
 
     virtual void
-    BuildWithRawData(size_t n, const void* values, const Config& config = {}) = 0;
+    Load(milvus::tracer::TraceContext ctx, const Config& config = {}) = 0;
+
+    virtual void
+    BuildWithRawDataForUT(size_t n,
+                          const void* values,
+                          const Config& config = {}) = 0;
 
     virtual void
     BuildWithDataset(const DatasetPtr& dataset, const Config& config = {}) = 0;
 
+    virtual void
+    Build(const Config& config = {}) = 0;
+
     virtual int64_t
     Count() = 0;
 
+    virtual IndexStatsPtr
+    Upload(const Config& config = {}) = 0;
+
+    virtual const bool
+    HasRawData() const = 0;
+
+    virtual bool
+    IsMmapSupported() const = 0;
+
+    const IndexType&
+    Type() const {
+        return index_type_;
+    }
+
+    virtual JsonCastType
+    GetCastType() const {
+        return JsonCastType::UNKNOWN;
+    }
+
+    // TODO: how to get the cell byte size?
+    virtual cachinglayer::ResourceUsage
+    CellByteSize() const {
+        return cell_size_;
+    }
+
+    virtual void
+    SetCellSize(cachinglayer::ResourceUsage cell_size) {
+        cell_size_ = cell_size;
+    }
+
  protected:
+    explicit IndexBase(IndexType index_type)
+        : index_type_(std::move(index_type)) {
+    }
+
     IndexType index_type_ = "";
-    IndexMode index_mode_ = IndexMode::MODE_CPU;
+    cachinglayer::ResourceUsage cell_size_ = {0, 0};
+
+    std::unique_ptr<MmapFileRAII> mmap_file_raii_;
 };
 
 using IndexBasePtr = std::unique_ptr<IndexBase>;
+
+template <typename T>
+using CacheIndexPtr = std::shared_ptr<milvus::cachinglayer::CacheSlot<T>>;
+
+using CacheIndexBasePtr = CacheIndexPtr<IndexBase>;
+
 }  // namespace milvus::index

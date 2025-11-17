@@ -2,19 +2,21 @@ package proxy
 
 import (
 	"context"
-	"errors"
 
-	"github.com/milvus-io/milvus/internal/mq/msgstream"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 )
 
 type mockMsgStream struct {
 	msgstream.MsgStream
-	asProducer func([]string)
-	setRepack  func(repackFunc msgstream.RepackFunc)
-	close      func()
+	asProducer         func([]string)
+	setRepack          func(repackFunc msgstream.RepackFunc)
+	close              func()
+	forceEnableProduce func(bool)
 }
 
-func (m *mockMsgStream) AsProducer(producers []string) {
+func (m *mockMsgStream) AsProducer(ctx context.Context, producers []string) {
 	if m.asProducer != nil {
 		m.asProducer(producers)
 	}
@@ -30,6 +32,15 @@ func (m *mockMsgStream) Close() {
 	if m.close != nil {
 		m.close()
 	}
+}
+
+func (m *mockMsgStream) ForceEnableProduce(enabled bool) {
+	if m.forceEnableProduce != nil {
+		m.forceEnableProduce(enabled)
+	}
+}
+
+func (m *mockMsgStream) SetReplicate(config *msgstream.ReplicateConfig) {
 }
 
 func newMockMsgStream() *mockMsgStream {
@@ -53,13 +64,6 @@ func (m *mockMsgStreamFactory) NewMsgStream(ctx context.Context) (msgstream.MsgS
 func (m *mockMsgStreamFactory) NewTtMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
 	if m.fTtStream != nil {
 		return m.fTtStream(ctx)
-	}
-	return nil, errors.New("mock")
-}
-
-func (m *mockMsgStreamFactory) NewQueryMsgStream(ctx context.Context) (msgstream.MsgStream, error) {
-	if m.fQStream != nil {
-		return m.fQStream(ctx)
 	}
 	return nil, errors.New("mock")
 }

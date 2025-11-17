@@ -15,113 +15,357 @@
 // limitations under the License.
 
 #include "index/VectorDiskIndex.h"
+
+#include "common/Tracer.h"
+#include "common/Types.h"
+#include "common/Utils.h"
+#include "config/ConfigKnowhere.h"
 #include "index/Meta.h"
 #include "index/Utils.h"
-
-#include "storage/LocalChunkManager.h"
-#include "config/ConfigKnowhere.h"
+#include "storage/LocalChunkManagerSingleton.h"
 #include "storage/Util.h"
-#include "common/Utils.h"
+#include "common/Consts.h"
+#include "common/RangeSearchHelper.h"
+#include "indexbuilder/types.h"
+#include "filemanager/FileManager.h"
 
 namespace milvus::index {
 
-#ifdef BUILD_DISK_ANN
+#define kSearchListMaxValue1 200    // used if tok <= 20
+#define kSearchListMaxValue2 65535  // used for topk > 20
+#define kPrepareDim 100
+#define kPrepareRows 1
 
 template <typename T>
-VectorDiskAnnIndex<T>::VectorDiskAnnIndex(const IndexType& index_type,
-                                          const MetricType& metric_type,
-                                          const IndexMode& index_mode,
-                                          storage::FileManagerImplPtr file_manager)
-    : VectorIndex(index_type, index_mode, metric_type) {
-    file_manager_ = std::dynamic_pointer_cast<storage::DiskFileManagerImpl>(file_manager);
-    auto& local_chunk_manager = storage::LocalChunkManager::GetInstance();
+VectorDiskAnnIndex<T>::VectorDiskAnnIndex(
+    DataType elem_type,
+    const IndexType& index_type,
+    const MetricType& metric_type,
+    const IndexVersion& version,
+    const storage::FileManagerContext& file_manager_context)
+    : VectorIndex(index_type, metric_type), elem_type_(elem_type) {
+    CheckMetricTypeSupport<T>(metric_type);
+    file_manager_ =
+        std::make_shared<storage::DiskFileManagerImpl>(file_manager_context);
+    AssertInfo(file_manager_ != nullptr, "create file manager failed!");
+    auto local_chunk_manager =
+        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
     auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
-    AssertInfo(!local_chunk_manager.Exist(local_index_path_prefix),
-               "local index path " + local_index_path_prefix + " has been exist");
-    local_chunk_manager.CreateDir(local_index_path_prefix);
-    index_ = std::make_unique<knowhere::IndexDiskANN<T>>(local_index_path_prefix, metric_type, file_manager);
+
+    // As we have guarded dup-load in QueryNode,
+    // this assertion failed only if the Milvus rebooted in the same pod,
+    // need to remove these files then re-load the segment
+    if (local_chunk_manager->Exist(local_index_path_prefix)) {
+        local_chunk_manager->RemoveDir(local_index_path_prefix);
+    }
+    CheckCompatible(version);
+    local_chunk_manager->CreateDir(local_index_path_prefix);
+    auto diskann_index_pack =
+        knowhere::Pack(std::shared_ptr<milvus::FileManager>(file_manager_));
+    auto get_index_obj = knowhere::IndexFactory::Instance().Create<T>(
+        GetIndexType(), version, diskann_index_pack);
+    if (get_index_obj.has_value()) {
+        index_ = get_index_obj.value();
+    } else {
+        auto err = get_index_obj.error();
+        if (err == knowhere::Status::invalid_index_error) {
+            ThrowInfo(ErrorCode::Unsupported, get_index_obj.what());
+        }
+        ThrowInfo(ErrorCode::KnowhereError, get_index_obj.what());
+    }
 }
 
 template <typename T>
 void
-VectorDiskAnnIndex<T>::Load(const BinarySet& binary_set /* not used */, const Config& config) {
-    auto prepare_config = parse_prepare_config(config);
-    knowhere::Config cfg;
-    knowhere::DiskANNPrepareConfig::Set(cfg, prepare_config);
-
-    auto index_files = GetValueFromConfig<std::vector<std::string>>(config, "index_files");
-    AssertInfo(index_files.has_value(), "index file paths is empty when load disk ann index data");
-    file_manager_->CacheIndexToDisk(index_files.value());
-    auto ok = index_->Prepare(cfg);
-    AssertInfo(ok, "load disk index failed");
-    SetDim(index_->Dim());
+VectorDiskAnnIndex<T>::Load(const BinarySet& binary_set /* not used */,
+                            const Config& config) {
+    Load(milvus::tracer::TraceContext{}, config);
 }
 
 template <typename T>
 void
-VectorDiskAnnIndex<T>::BuildWithDataset(const DatasetPtr& dataset, const Config& config) {
-    auto& local_chunk_manager = storage::LocalChunkManager::GetInstance();
-    auto build_config = parse_build_config(config);
-    auto segment_id = file_manager_->GetFileDataMeta().segment_id;
-    auto field_id = file_manager_->GetFileDataMeta().field_id;
-    auto local_data_path = storage::GenFieldRawDataPathPrefix(segment_id, field_id) + "raw_data";
-    build_config.data_path = local_data_path;
-    if (!local_chunk_manager.Exist(local_data_path)) {
-        local_chunk_manager.CreateFile(local_data_path);
+VectorDiskAnnIndex<T>::Load(milvus::tracer::TraceContext ctx,
+                            const Config& config) {
+    knowhere::Json load_config = update_load_json(config);
+
+    // start read file span with active scope
+    {
+        auto read_file_span =
+            milvus::tracer::StartSpan("SegCoreReadDiskIndexFile", &ctx);
+        auto read_scope =
+            milvus::tracer::GetTracer()->WithActiveSpan(read_file_span);
+        auto index_files =
+            GetValueFromConfig<std::vector<std::string>>(config, "index_files");
+        AssertInfo(index_files.has_value(),
+                   "index file paths is empty when load disk ann index data");
+        // If index is loaded with stream, we don't need to cache index to disk
+        if (!index_.LoadIndexWithStream()) {
+            auto load_priority =
+                GetValueFromConfig<milvus::proto::common::LoadPriority>(
+                    config, milvus::LOAD_PRIORITY)
+                    .value_or(milvus::proto::common::LoadPriority::HIGH);
+            file_manager_->CacheIndexToDisk(index_files.value(), load_priority);
+        }
+        read_file_span->End();
+    }
+
+    // start engine load index span
+    auto span_load_engine =
+        milvus::tracer::StartSpan("SegCoreEngineLoadDiskIndex", &ctx);
+    auto engine_scope =
+        milvus::tracer::GetTracer()->WithActiveSpan(span_load_engine);
+    auto stat = index_.Deserialize(knowhere::BinarySet(), load_config);
+    if (stat != knowhere::Status::success)
+        ThrowInfo(ErrorCode::UnexpectedError,
+                  "failed to Deserialize index, " + KnowhereStatusString(stat));
+    span_load_engine->End();
+
+    SetDim(index_.Dim());
+}
+
+template <typename T>
+IndexStatsPtr
+VectorDiskAnnIndex<T>::Upload(const Config& config) {
+    BinarySet ret;
+    auto stat = index_.Serialize(ret);
+    if (stat != knowhere::Status::success) {
+        ThrowInfo(ErrorCode::UnexpectedError,
+                  "failed to serialize index, " + KnowhereStatusString(stat));
+    }
+    auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
+    return IndexStats::NewFromSizeMap(file_manager_->GetAddedTotalFileSize(),
+                                      remote_paths_to_size);
+}
+
+template <typename T>
+void
+VectorDiskAnnIndex<T>::Build(const Config& config) {
+    auto local_chunk_manager =
+        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    knowhere::Json build_config;
+    build_config.update(config);
+
+    auto segment_id = file_manager_->GetFieldDataMeta().segment_id;
+    auto field_id = file_manager_->GetFieldDataMeta().field_id;
+
+    auto is_embedding_list = (elem_type_ != DataType::NONE);
+    Config config_with_emb_list = config;
+    config_with_emb_list[EMB_LIST] = is_embedding_list;
+
+    std::string offsets_path;
+    // Set offsets path in config for VECTOR_ARRAY
+    if (is_embedding_list) {
+        offsets_path = storage::GenFieldRawDataPathPrefix(
+                           local_chunk_manager, segment_id, field_id) +
+                       "offset";
+        config_with_emb_list[EMB_LIST_OFFSETS_PATH] = offsets_path;
+    }
+
+    auto local_data_path =
+        file_manager_->CacheRawDataToDisk<T>(config_with_emb_list);
+    build_config[DISK_ANN_RAW_DATA_PATH] = local_data_path;
+
+    // For VECTOR_ARRAY, verify offsets file exists and pass its path to build_config
+    if (is_embedding_list) {
+        if (!local_chunk_manager->Exist(offsets_path)) {
+            ThrowInfo(ErrorCode::UnexpectedError,
+                      fmt::format("Embedding list offsets file not found: {}",
+                                  offsets_path));
+        }
+        build_config[EMB_LIST_OFFSETS_PATH] = offsets_path;
+    }
+
+    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+    build_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
+
+    if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
+        auto num_threads = GetValueFromConfig<std::string>(
+            build_config, DISK_ANN_BUILD_THREAD_NUM);
+        AssertInfo(
+            num_threads.has_value(),
+            "param " + std::string(DISK_ANN_BUILD_THREAD_NUM) + "is empty");
+        build_config[DISK_ANN_THREADS_NUM] =
+            std::atoi(num_threads.value().c_str());
+    }
+
+    auto opt_fields = GetValueFromConfig<OptFieldT>(config, VEC_OPT_FIELDS);
+    auto is_partition_key_isolation =
+        GetValueFromConfig<bool>(build_config, "partition_key_isolation");
+    if (opt_fields.has_value() &&
+        index_.IsAdditionalScalarSupported(
+            is_partition_key_isolation.value_or(false))) {
+        build_config[VEC_OPT_FIELDS_PATH] =
+            file_manager_->CacheOptFieldToDisk(config);
+        // `partition_key_isolation` is already in the config, so it falls through
+        // into the index Build call directly
+    }
+
+    build_config.erase(INSERT_FILES_KEY);
+    build_config.erase(VEC_OPT_FIELDS);
+    auto stat = index_.Build({}, build_config);
+    if (stat != knowhere::Status::success)
+        ThrowInfo(ErrorCode::IndexBuildError,
+                  "failed to build disk index, " + KnowhereStatusString(stat));
+
+    local_chunk_manager->RemoveDir(
+        storage::GetSegmentRawDataPathPrefix(local_chunk_manager, segment_id));
+}
+
+template <typename T>
+void
+VectorDiskAnnIndex<T>::BuildWithDataset(const DatasetPtr& dataset,
+                                        const Config& config) {
+    auto local_chunk_manager =
+        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    knowhere::Json build_config;
+    build_config.update(config);
+    // set data path
+    auto segment_id = file_manager_->GetFieldDataMeta().segment_id;
+    auto field_id = file_manager_->GetFieldDataMeta().field_id;
+    auto local_data_path = storage::GenFieldRawDataPathPrefix(
+                               local_chunk_manager, segment_id, field_id) +
+                           "raw_data";
+    build_config[DISK_ANN_RAW_DATA_PATH] = local_data_path;
+
+    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+    build_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
+
+    if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
+        auto num_threads = GetValueFromConfig<std::string>(
+            build_config, DISK_ANN_BUILD_THREAD_NUM);
+        AssertInfo(
+            num_threads.has_value(),
+            "param " + std::string(DISK_ANN_BUILD_THREAD_NUM) + "is empty");
+        build_config[DISK_ANN_THREADS_NUM] =
+            std::atoi(num_threads.value().c_str());
+    }
+    if (!local_chunk_manager->Exist(local_data_path)) {
+        local_chunk_manager->CreateFile(local_data_path);
     }
 
     int64_t offset = 0;
     auto num = uint32_t(milvus::GetDatasetRows(dataset));
-    local_chunk_manager.Write(local_data_path, offset, &num, sizeof(num));
+    local_chunk_manager->Write(local_data_path, offset, &num, sizeof(num));
     offset += sizeof(num);
 
     auto dim = uint32_t(milvus::GetDatasetDim(dataset));
-    local_chunk_manager.Write(local_data_path, offset, &dim, sizeof(dim));
+    local_chunk_manager->Write(local_data_path, offset, &dim, sizeof(dim));
     offset += sizeof(dim);
 
-    auto data_size = num * dim * sizeof(float);
+    size_t data_size = static_cast<size_t>(num) * milvus::GetVecRowSize<T>(dim);
     auto raw_data = const_cast<void*>(milvus::GetDatasetTensor(dataset));
-    local_chunk_manager.Write(local_data_path, offset, raw_data, data_size);
+    local_chunk_manager->Write(local_data_path, offset, raw_data, data_size);
 
-    knowhere::Config cfg;
-    knowhere::DiskANNBuildConfig::Set(cfg, build_config);
+    // For VECTOR_ARRAY, write offsets to a separate file and pass the path to knowhere
+    if (elem_type_ != DataType::NONE) {
+        auto offsets =
+            dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET);
+        if (offsets == nullptr) {
+            ThrowInfo(ErrorCode::UnexpectedError,
+                      "Embedding list offsets is empty when build index");
+        }
 
-    index_->BuildAll(nullptr, cfg);
+        // Write offsets to disk file (use same path convention as Build method)
+        std::string offsets_path =
+            storage::GenFieldRawDataPathPrefix(
+                local_chunk_manager, segment_id, field_id) +
+            "offset";
+        local_chunk_manager->CreateFile(offsets_path);
 
-    local_chunk_manager.RemoveDir(storage::GetSegmentRawDataPathPrefix(segment_id));
+        // Calculate the number of offsets (num_rows + 1)
+        // We need to find the actual number by looking at the data
+        uint32_t num_rows =
+            static_cast<uint32_t>(milvus::GetDatasetRows(dataset));
+        uint32_t num_offsets = num_rows + 1;
+
+        // Write offsets to file
+        // Format: [num_offsets][offsets_data]
+        int64_t write_pos = 0;
+        local_chunk_manager->Write(
+            offsets_path, write_pos, &num_offsets, sizeof(uint32_t));
+        write_pos += sizeof(uint32_t);
+
+        local_chunk_manager->Write(
+            offsets_path,
+            write_pos,
+            const_cast<void*>(static_cast<const void*>(offsets)),
+            num_offsets * sizeof(size_t));
+
+        build_config[EMB_LIST_OFFSETS_PATH] = offsets_path;
+    }
+
+    auto stat = index_.Build({}, build_config);
+    if (stat != knowhere::Status::success)
+        ThrowInfo(ErrorCode::IndexBuildError,
+                  "failed to build index, " + KnowhereStatusString(stat));
+    local_chunk_manager->RemoveDir(
+        storage::GetSegmentRawDataPathPrefix(local_chunk_manager, segment_id));
+
     // TODO ::
     // SetDim(index_->Dim());
 }
 
 template <typename T>
-std::unique_ptr<SearchResult>
-VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset, const SearchInfo& search_info, const BitsetView& bitset) {
+void
+VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset,
+                             const SearchInfo& search_info,
+                             const BitsetView& bitset,
+                             milvus::OpContext* op_context,
+                             SearchResult& search_result) const {
     AssertInfo(GetMetricType() == search_info.metric_type_,
                "Metric type of field index isn't the same with search info");
-    auto num_queries = milvus::GetDatasetRows(dataset);
+    auto num_rows = dataset->GetRows();
     auto topk = search_info.topk_;
 
-    knowhere::DiskANNQueryConfig query_config;
-    query_config.k = topk;
+    knowhere::Json search_config = PrepareSearchParams(search_info);
 
-    // set search list
-    auto search_list_size = GetValueFromConfig<uint32_t>(search_info.search_params_, DISK_ANN_QUERY_LIST);
-    AssertInfo(search_list_size.has_value(), "param " + std::string(DISK_ANN_QUERY_LIST) + "is empty");
-    query_config.search_list_size = search_list_size.value();
+    if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
+        // set search list size
+        if (CheckKeyInConfig(search_info.search_params_, DISK_ANN_QUERY_LIST)) {
+            search_config[DISK_ANN_SEARCH_LIST_SIZE] =
+                search_info.search_params_[DISK_ANN_QUERY_LIST];
+        }
+        // set beamwidth
+        search_config[DISK_ANN_QUERY_BEAMWIDTH] = int(search_beamwidth_);
+        // set json reset field, will be removed later
+        search_config[DISK_ANN_PQ_CODE_BUDGET] = 0.0;
+    }
 
-    AssertInfo(query_config.search_list_size > topk, "search_list should be greater than topk");
-    AssertInfo(query_config.search_list_size < std::min(uint32_t(topk * 10), uint32_t(65535)),
-               "search_list should less than min(topk*10, 65535)");
+    // set index prefix, will be removed later
+    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+    search_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
 
-    // set beamwidth
-    query_config.beamwidth = search_beamwidth_;
+    auto final = [&] {
+        if (CheckAndUpdateKnowhereRangeSearchParam(
+                search_info, topk, GetMetricType(), search_config)) {
+            auto res =
+                index_.RangeSearch(dataset, search_config, bitset, op_context);
+            if (!res.has_value()) {
+                ThrowInfo(ErrorCode::UnexpectedError,
+                          fmt::format("failed to range search: {}: {}",
+                                      KnowhereStatusString(res.error()),
+                                      res.what()));
+            }
+            return ReGenRangeSearchResult(
+                res.value(), topk, num_rows, GetMetricType());
+        } else {
+            auto res =
+                index_.Search(dataset, search_config, bitset, op_context);
+            if (!res.has_value()) {
+                ThrowInfo(ErrorCode::UnexpectedError,
+                          fmt::format("failed to search: {}: {}",
+                                      KnowhereStatusString(res.error()),
+                                      res.what()));
+            }
+            return res.value();
+        }
+    }();
 
-    knowhere::Config cfg;
-    knowhere::DiskANNQueryConfig::Set(cfg, query_config);
-
-    auto final_result = index_->Query(dataset, cfg, bitset);
-    auto ids = milvus::GetDatasetIDs(final_result);
-    float* distances = (float*)milvus::GetDatasetDistance(final_result);
+    auto ids = final->GetIds();
+    // In embedding list query, final->GetRows() can be different from dataset->GetRows().
+    auto num_queries = final->GetRows();
+    float* distances = const_cast<float*>(final->GetDistance());
+    final->SetIsOwner(true);
 
     auto round_decimal = search_info.round_decimal_;
     auto total_num = num_queries * topk;
@@ -129,130 +373,117 @@ VectorDiskAnnIndex<T>::Query(const DatasetPtr dataset, const SearchInfo& search_
     if (round_decimal != -1) {
         const float multiplier = pow(10.0, round_decimal);
         for (int i = 0; i < total_num; i++) {
-            distances[i] = round(distances[i] * multiplier) / multiplier;
+            distances[i] = std::round(distances[i] * multiplier) / multiplier;
         }
     }
-    auto result = std::make_unique<SearchResult>();
-    result->seg_offsets_.resize(total_num);
-    result->distances_.resize(total_num);
-    result->total_nq_ = num_queries;
-    result->unity_topK_ = topk;
+    search_result.seg_offsets_.resize(total_num);
+    search_result.distances_.resize(total_num);
+    search_result.total_nq_ = num_queries;
+    search_result.unity_topK_ = topk;
+    std::copy_n(ids, total_num, search_result.seg_offsets_.data());
+    std::copy_n(distances, total_num, search_result.distances_.data());
+}
 
-    std::copy_n(ids, total_num, result->seg_offsets_.data());
-    std::copy_n(distances, total_num, result->distances_.data());
+template <typename T>
+knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+VectorDiskAnnIndex<T>::VectorIterators(const DatasetPtr dataset,
+                                       const knowhere::Json& conf,
+                                       const BitsetView& bitset) const {
+    return this->index_.AnnIterator(dataset, conf, bitset);
+}
 
-    return result;
+template <typename T>
+const bool
+VectorDiskAnnIndex<T>::HasRawData() const {
+    return index_.HasRawData(GetMetricType());
+}
+
+template <typename T>
+std::vector<uint8_t>
+VectorDiskAnnIndex<T>::GetVector(const DatasetPtr dataset) const {
+    auto index_type = GetIndexType();
+    if (IndexIsSparse(index_type)) {
+        ThrowInfo(ErrorCode::UnexpectedError,
+                  "failed to get vector, index is sparse");
+    }
+
+    // if dataset is empty, return empty vector
+    if (dataset->GetRows() == 0) {
+        return {};
+    }
+
+    auto res = index_.GetVectorByIds(dataset);
+    if (!res.has_value()) {
+        ThrowInfo(ErrorCode::UnexpectedError,
+                  fmt::format("failed to get vector: {}: {}",
+                              KnowhereStatusString(res.error()),
+                              res.what()));
+    }
+    auto tensor = res.value()->GetTensor();
+    auto row_num = res.value()->GetRows();
+    auto dim = res.value()->GetDim();
+    int64_t data_size = milvus::GetVecRowSize<T>(dim) * row_num;
+    std::vector<uint8_t> raw_data;
+    raw_data.resize(data_size);
+    memcpy(raw_data.data(), tensor, data_size);
+    return raw_data;
 }
 
 template <typename T>
 void
 VectorDiskAnnIndex<T>::CleanLocalData() {
-    auto& local_chunk_manager = storage::LocalChunkManager::GetInstance();
-    local_chunk_manager.RemoveDir(file_manager_->GetLocalIndexObjectPrefix());
-    local_chunk_manager.RemoveDir(file_manager_->GetLocalRawDataObjectPrefix());
+    auto local_chunk_manager =
+        storage::LocalChunkManagerSingleton::GetInstance().GetChunkManager();
+    local_chunk_manager->RemoveDir(file_manager_->GetLocalIndexObjectPrefix());
+    local_chunk_manager->RemoveDir(
+        file_manager_->GetLocalRawDataObjectPrefix());
 }
 
 template <typename T>
-knowhere::DiskANNBuildConfig
-VectorDiskAnnIndex<T>::parse_build_config(const Config& config) {
-    Config build_config = config;
-    parse_config(build_config);
+inline knowhere::Json
+VectorDiskAnnIndex<T>::update_load_json(const Config& config) {
+    knowhere::Json load_config;
+    load_config.update(config);
 
-    // set disk ann build config
-    knowhere::DiskANNBuildConfig build_disk_ann_config;
+    // set data path
+    auto local_index_path_prefix = file_manager_->GetLocalIndexObjectPrefix();
+    load_config[DISK_ANN_PREFIX_PATH] = local_index_path_prefix;
 
-    // set max degree
-    auto max_degree = GetValueFromConfig<uint32_t>(build_config, DISK_ANN_MAX_DEGREE);
-    AssertInfo(max_degree.has_value(), "param " + std::string(DISK_ANN_MAX_DEGREE) + "is empty");
-    build_disk_ann_config.max_degree = max_degree.value();
+    if (GetIndexType() == knowhere::IndexEnum::INDEX_DISKANN) {
+        // set base info
+        load_config[DISK_ANN_PREPARE_WARM_UP] = false;
+        load_config[DISK_ANN_PREPARE_USE_BFS_CACHE] = false;
 
-    // set build list
-    auto search_list_size = GetValueFromConfig<uint32_t>(build_config, DISK_ANN_SEARCH_LIST_SIZE);
-    AssertInfo(search_list_size.has_value(), "param " + std::string(DISK_ANN_SEARCH_LIST_SIZE) + "is empty");
-    build_disk_ann_config.search_list_size = search_list_size.value();
+        // set threads number
+        auto num_threads = GetValueFromConfig<std::string>(
+            load_config, DISK_ANN_LOAD_THREAD_NUM);
+        AssertInfo(
+            num_threads.has_value(),
+            "param " + std::string(DISK_ANN_LOAD_THREAD_NUM) + "is empty");
+        load_config[DISK_ANN_THREADS_NUM] =
+            std::atoi(num_threads.value().c_str());
 
-    // set search dram budget
-    auto search_dram_budget_gb = GetValueFromConfig<float>(build_config, DISK_ANN_PQ_CODE_BUDGET);
-    AssertInfo(search_dram_budget_gb.has_value(), "param " + std::string(DISK_ANN_PQ_CODE_BUDGET) + "is empty");
-    build_disk_ann_config.pq_code_budget_gb = search_dram_budget_gb.value();
-
-    // set build dram budget
-    auto build_dram_budget_gb = GetValueFromConfig<float>(build_config, DISK_ANN_BUILD_DRAM_BUDGET);
-    AssertInfo(build_dram_budget_gb.has_value(), "param " + std::string(DISK_ANN_BUILD_DRAM_BUDGET) + "is empty");
-    build_disk_ann_config.build_dram_budget_gb = build_dram_budget_gb.value();
-
-    // set num build thread
-    auto num_threads = GetValueFromConfig<uint32_t>(build_config, DISK_ANN_BUILD_THREAD_NUM);
-    AssertInfo(num_threads.has_value(), "param " + std::string(DISK_ANN_BUILD_THREAD_NUM) + "is empty");
-    build_disk_ann_config.num_threads = num_threads.value();
-
-    // set pq bytes
-    auto pq_disk_bytes = GetValueFromConfig<uint32_t>(build_config, DISK_ANN_PQ_DIMS);
-    AssertInfo(pq_disk_bytes.has_value(), "param " + std::string(DISK_ANN_PQ_DIMS) + "is empty");
-    build_disk_ann_config.disk_pq_dims = pq_disk_bytes.value();
-
-    return build_disk_ann_config;
-}
-
-template <typename T>
-knowhere::DiskANNPrepareConfig
-VectorDiskAnnIndex<T>::parse_prepare_config(const Config& config) {
-    Config prepare_config = config;
-    parse_config(prepare_config);
-
-    knowhere::DiskANNPrepareConfig prepare_disk_ann_config;
-    prepare_disk_ann_config.warm_up = false;
-    prepare_disk_ann_config.use_bfs_cache = false;
-
-    // set prepare thread num
-    auto num_threads = GetValueFromConfig<uint32_t>(prepare_config, DISK_ANN_LOAD_THREAD_NUM);
-    AssertInfo(num_threads.has_value(), "param " + std::string(DISK_ANN_LOAD_THREAD_NUM) + "is empty");
-    prepare_disk_ann_config.num_threads = num_threads.value();
-
-    // get search_cache_budget_gb
-    auto search_cache_budget_gb = GetValueFromConfig<float>(prepare_config, DISK_ANN_SEARCH_CACHE_BUDGET);
-    AssertInfo(search_cache_budget_gb.has_value(), "param " + std::string(DISK_ANN_SEARCH_CACHE_BUDGET) + "is empty");
-    prepare_disk_ann_config.search_cache_budget_gb = search_cache_budget_gb.value();
-
-    // update search_beamwidth
-    auto beamwidth = GetValueFromConfig<uint32_t>(prepare_config, DISK_ANN_QUERY_BEAMWIDTH);
-    if (beamwidth.has_value()) {
-        search_beamwidth_ = beamwidth.value();
+        // update search_beamwidth
+        auto beamwidth = GetValueFromConfig<std::string>(
+            load_config, DISK_ANN_QUERY_BEAMWIDTH);
+        if (beamwidth.has_value()) {
+            search_beamwidth_ = std::atoi(beamwidth.value().c_str());
+        }
     }
 
-    return prepare_disk_ann_config;
-}
+    if (config.contains(MMAP_FILE_PATH)) {
+        load_config.erase(MMAP_FILE_PATH);
+        load_config[ENABLE_MMAP] = true;
+    }
 
-template <typename T>
-void
-VectorDiskAnnIndex<T>::parse_config(Config& config) {
-    auto stoi_closure = [](const std::string& s) -> uint32_t { return std::stoi(s); };
-    auto stof_closure = [](const std::string& s) -> float { return std::stof(s); };
-
-    /***************************** meta *******************************/
-    CheckParameter<int>(config, knowhere::meta::SLICE_SIZE, stoi_closure,
-                        std::optional{config::KnowhereGetIndexSliceSize()});
-    CheckParameter<int>(config, knowhere::meta::DIM, stoi_closure, std::nullopt);
-    CheckParameter<int>(config, knowhere::meta::TOPK, stoi_closure, std::nullopt);
-
-    /************************** DiskAnn build Params ************************/
-    CheckParameter<int>(config, DISK_ANN_MAX_DEGREE, stoi_closure, std::nullopt);
-    CheckParameter<int>(config, DISK_ANN_SEARCH_LIST_SIZE, stoi_closure, std::nullopt);
-    CheckParameter<float>(config, DISK_ANN_PQ_CODE_BUDGET, stof_closure, std::nullopt);
-    CheckParameter<float>(config, DISK_ANN_BUILD_DRAM_BUDGET, stof_closure, std::nullopt);
-    CheckParameter<int>(config, DISK_ANN_BUILD_THREAD_NUM, stoi_closure, std::optional{8});
-    CheckParameter<int>(config, DISK_ANN_PQ_DIMS, stoi_closure, std::optional{0});
-
-    /************************** DiskAnn prepare Params ************************/
-    CheckParameter<int>(config, DISK_ANN_LOAD_THREAD_NUM, stoi_closure, std::optional{8});
-    CheckParameter<float>(config, DISK_ANN_SEARCH_CACHE_BUDGET, stof_closure, std::nullopt);
-
-    /************************** DiskAnn query Params ************************/
-    CheckParameter<int>(config, DISK_ANN_QUERY_BEAMWIDTH, stoi_closure, std::nullopt);
+    return load_config;
 }
 
 template class VectorDiskAnnIndex<float>;
-
-#endif
+template class VectorDiskAnnIndex<float16>;
+template class VectorDiskAnnIndex<bfloat16>;
+template class VectorDiskAnnIndex<bin1>;
+template class VectorDiskAnnIndex<sparse_u32_f32>;
+template class VectorDiskAnnIndex<int8>;
 
 }  // namespace milvus::index

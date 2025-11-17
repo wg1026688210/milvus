@@ -2,27 +2,46 @@ package meta
 
 import (
 	"github.com/blang/semver/v4"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
-	"github.com/milvus-io/milvus/internal/metastore/kv/indexcoord"
+	"github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
+	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 )
 
-type TtCollectionsMeta220 map[UniqueID]map[Timestamp]*model.Collection // coll_id -> ts -> coll
-type CollectionsMeta220 map[UniqueID]*model.Collection                 // coll_id -> coll
+type (
+	TtCollectionsMeta220 map[UniqueID]map[Timestamp]*model.Collection // coll_id -> ts -> coll
+	CollectionsMeta220   map[UniqueID]*model.Collection               // coll_id -> coll
+)
 
-type TtAliasesMeta220 map[string]map[Timestamp]*model.Alias // alias name -> ts -> coll
-type AliasesMeta220 map[string]*model.Alias                 // alias name -> coll
+type (
+	TtAliasesMeta220 map[string]map[Timestamp]*model.Alias // alias name -> ts -> coll
+	AliasesMeta220   map[string]*model.Alias               // alias name -> coll
+)
 
-type TtPartitionsMeta220 map[UniqueID]map[Timestamp][]*model.Partition // coll_id -> ts -> partitions
-type PartitionsMeta220 map[UniqueID][]*model.Partition                 // coll_id -> ts -> partitions
+type (
+	TtPartitionsMeta220 map[UniqueID]map[Timestamp][]*model.Partition // coll_id -> ts -> partitions
+	PartitionsMeta220   map[UniqueID][]*model.Partition               // coll_id -> ts -> partitions
+)
 
-type TtFieldsMeta220 map[UniqueID]map[Timestamp][]*model.Field // coll_id -> ts -> fields
-type FieldsMeta220 map[UniqueID][]*model.Field                 // coll_id -> ts -> fields
+type (
+	TtFieldsMeta220 map[UniqueID]map[Timestamp][]*model.Field // coll_id -> ts -> fields
+	FieldsMeta220   map[UniqueID][]*model.Field               // coll_id -> ts -> fields
+)
 
-type CollectionIndexesMeta220 map[UniqueID]map[UniqueID]*model.Index     // coll_id -> index_id -> index
-type SegmentIndexesMeta220 map[UniqueID]map[UniqueID]*model.SegmentIndex // seg_id -> index_id -> segment index
+type (
+	CollectionIndexesMeta220 map[UniqueID]map[UniqueID]*model.Index        // coll_id -> index_id -> index
+	SegmentIndexesMeta220    map[UniqueID]map[UniqueID]*model.SegmentIndex // seg_id -> index_id -> segment index
+)
+
+type (
+	CollectionLoadInfo220 map[UniqueID]*model.CollectionLoadInfo             // collectionID -> CollectionLoadInfo
+	PartitionLoadInfo220  map[UniqueID]map[UniqueID]*model.PartitionLoadInfo // collectionID, partitionID -> PartitionLoadInfo
+)
 
 func (meta *TtCollectionsMeta220) GenerateSaves(sourceVersion semver.Version) (map[string]string, error) {
 	saves := make(map[string]string)
@@ -31,11 +50,12 @@ func (meta *TtCollectionsMeta220) GenerateSaves(sourceVersion semver.Version) (m
 	if sourceVersion.LT(versions.Version220) {
 		opts = append(opts, model.WithFields())
 		opts = append(opts, model.WithPartitions())
+		opts = append(opts, model.WithStructArrayFields())
 	}
 
 	for collectionID := range *meta {
 		for ts := range (*meta)[collectionID] {
-			ckey := rootcoord.BuildCollectionKey(collectionID)
+			ckey := rootcoord.BuildCollectionKey(util.NonDBID, collectionID)
 			key := rootcoord.ComposeSnapshotKey(rootcoord.SnapshotPrefix, ckey, rootcoord.SnapshotsSep, ts)
 			collection := (*meta)[collectionID][ts]
 			var value string
@@ -79,10 +99,11 @@ func (meta *CollectionsMeta220) GenerateSaves(sourceVersion semver.Version) (map
 	if sourceVersion.LT(versions.Version220) {
 		opts = append(opts, model.WithFields())
 		opts = append(opts, model.WithPartitions())
+		opts = append(opts, model.WithStructArrayFields())
 	}
 
 	for collectionID := range *meta {
-		ckey := rootcoord.BuildCollectionKey(collectionID)
+		ckey := rootcoord.BuildCollectionKey(util.NonDBID, collectionID)
 		collection := (*meta)[collectionID]
 		var value string
 		if collection == nil {
@@ -183,7 +204,7 @@ func (meta *CollectionIndexesMeta220) GenerateSaves() (map[string]string, error)
 
 	for collectionID := range *meta {
 		for indexID := range (*meta)[collectionID] {
-			ckey := indexcoord.BuildIndexKey(collectionID, indexID)
+			ckey := datacoord.BuildIndexKey(collectionID, indexID)
 			index := (*meta)[collectionID][indexID]
 			var value string
 			indexPb := model.MarshalIndexModel(index)
@@ -205,7 +226,7 @@ func (meta *SegmentIndexesMeta220) GenerateSaves() (map[string]string, error) {
 	for segmentID := range *meta {
 		for indexID := range (*meta)[segmentID] {
 			index := (*meta)[segmentID][indexID]
-			ckey := indexcoord.BuildSegmentIndexKey(index.CollectionID, index.PartitionID, index.SegmentID, index.BuildID)
+			ckey := datacoord.BuildSegmentIndexKey(index.CollectionID, index.PartitionID, index.SegmentID, index.BuildID)
 			var value string
 			indexPb := model.MarshalSegmentIndexModel(index)
 			marshaledIndexPb, err := proto.Marshal(indexPb)
@@ -230,6 +251,46 @@ func (meta *SegmentIndexesMeta220) AddRecord(segID UniqueID, indexID UniqueID, r
 	}
 }
 
+func (meta *CollectionLoadInfo220) GenerateSaves() (map[string]string, error) {
+	saves := make(map[string]string)
+	for _, loadInfo := range *meta {
+		k := querycoord.EncodeCollectionLoadInfoKey(loadInfo.CollectionID)
+		v, err := proto.Marshal(&querypb.CollectionLoadInfo{
+			CollectionID:       loadInfo.CollectionID,
+			ReleasedPartitions: loadInfo.ReleasedPartitionIDs,
+			ReplicaNumber:      loadInfo.ReplicaNumber,
+			Status:             loadInfo.Status,
+			FieldIndexID:       loadInfo.FieldIndexID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		saves[k] = string(v)
+	}
+	return saves, nil
+}
+
+func (meta *PartitionLoadInfo220) GenerateSaves() (map[string]string, error) {
+	saves := make(map[string]string)
+	for _, partitions := range *meta {
+		for _, loadInfo := range partitions {
+			k := querycoord.EncodePartitionLoadInfoKey(loadInfo.CollectionID, loadInfo.PartitionID)
+			v, err := proto.Marshal(&querypb.PartitionLoadInfo{
+				CollectionID:  loadInfo.CollectionID,
+				PartitionID:   loadInfo.PartitionID,
+				ReplicaNumber: loadInfo.ReplicaNumber,
+				Status:        loadInfo.Status,
+				FieldIndexID:  loadInfo.FieldIndexID,
+			})
+			if err != nil {
+				return nil, err
+			}
+			saves[k] = string(v)
+		}
+	}
+	return saves, nil
+}
+
 type All220 struct {
 	TtCollections TtCollectionsMeta220
 	Collections   CollectionsMeta220
@@ -245,4 +306,8 @@ type All220 struct {
 
 	CollectionIndexes CollectionIndexesMeta220
 	SegmentIndexes    SegmentIndexesMeta220
+
+	// QueryCoord Meta
+	CollectionLoadInfos CollectionLoadInfo220
+	PartitionLoadInfos  PartitionLoadInfo220
 }

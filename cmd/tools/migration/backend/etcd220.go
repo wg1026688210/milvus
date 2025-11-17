@@ -1,14 +1,14 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/internal/util"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/meta"
+	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 )
 
 // etcd220 implements Backend.
@@ -37,7 +37,7 @@ func printSaves(saves map[string]string) {
 
 func (b etcd220) save(saves map[string]string) error {
 	for k, v := range saves {
-		if err := b.txn.Save(k, v); err != nil {
+		if err := b.txn.Save(context.TODO(), k, v); err != nil {
 			return err
 		}
 	}
@@ -99,6 +99,24 @@ func (b etcd220) Save(metas *meta.Meta) error {
 			return err
 		}
 	}
+	{
+		saves, err := metas.Meta220.CollectionLoadInfos.GenerateSaves()
+		if err != nil {
+			return err
+		}
+		if err := b.save(saves); err != nil {
+			return err
+		}
+	}
+	{
+		saves, err := metas.Meta220.PartitionLoadInfos.GenerateSaves()
+		if err != nil {
+			return err
+		}
+		if err := b.save(saves); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -110,8 +128,13 @@ func (b etcd220) Clean() error {
 		rootcoord.FieldMetaPrefix,
 		rootcoord.AliasMetaPrefix,
 
+		rootcoord.SnapshotPrefix,
+
 		util.FieldIndexPrefix,
 		util.SegmentIndexPrefix,
+
+		querycoord.CollectionLoadInfoPrefix,
+		querycoord.PartitionLoadInfoPrefix,
 	}
 	for _, prefix := range prefixes {
 		if err := b.CleanWithPrefix(prefix); err != nil {

@@ -19,9 +19,11 @@ package allocator
 import (
 	"context"
 
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
+	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
 )
 
 type remoteInterface interface {
-	AllocID(ctx context.Context, req *rootcoordpb.AllocIDRequest) (*rootcoordpb.AllocIDResponse, error)
+	AllocID(ctx context.Context, req *rootcoordpb.AllocIDRequest, opts ...grpc.CallOption) (*rootcoordpb.AllocIDResponse, error)
 }

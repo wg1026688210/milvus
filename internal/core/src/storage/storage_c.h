@@ -22,7 +22,38 @@ extern "C" {
 #include "common/type_c.h"
 
 CStatus
-GetLocalUsedSize(int64_t* size);
+GetLocalUsedSize(const char* c_path, int64_t* size);
+
+CStatus
+InitLocalChunkManagerSingleton(const char* path);
+
+CStatus
+InitRemoteChunkManagerSingleton(CStorageConfig c_storage_config);
+
+CStatus
+InitMmapManager(CMmapConfig c_mmap_config);
+
+void
+CleanRemoteChunkManagerSingleton();
+
+void
+ResizeTheadPool(int64_t priority, float ratio);
+
+CStatus
+InitDiskFileWriterConfig(CDiskWriteConfig c_disk_write_config);
+
+// Plugin related APIs
+CStatus
+InitPluginLoader(const char* plugin_path);
+
+void
+CleanPluginLoader();
+
+CStatus
+PutOrRefPluginContext(CPluginContext c_plugin_context);
+
+CStatus
+UnRefPluginContext(CPluginContext c_plugin_context);
 
 #ifdef __cplusplus
 };

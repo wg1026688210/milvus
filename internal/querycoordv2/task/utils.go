@@ -18,16 +18,36 @@ package task
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/milvus-io/milvus/api/commonpb"
-	"github.com/milvus-io/milvus/api/schemapb"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/internalpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/samber/lo"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
+
+// idSource helper type for using id as task source
+type idSource int64
+
+func (s idSource) String() string {
+	return fmt.Sprintf("ID-%d", s)
+}
+
+func WrapIDSource(id int64) Source {
+	return idSource(id)
+}
 
 func Wait(ctx context.Context, timeout time.Duration, tasks ...Task) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -49,140 +69,257 @@ func Wait(ctx context.Context, timeout time.Duration, tasks ...Task) error {
 	return err
 }
 
+func SetPriority(priority Priority, tasks ...Task) {
+	for i := range tasks {
+		tasks[i].SetPriority(priority)
+	}
+}
+
+func SetReason(reason string, tasks ...Task) {
+	for i := range tasks {
+		tasks[i].SetReason(reason)
+	}
+}
+
 // GetTaskType returns the task's type,
 // for now, only 3 types;
 // - only 1 grow action -> Grow
 // - only 1 reduce action -> Reduce
 // - 1 grow action, and ends with 1 reduce action -> Move
 func GetTaskType(task Task) Type {
-	if len(task.Actions()) > 1 {
+	switch {
+	case len(task.Actions()) > 1:
 		return TaskTypeMove
-	} else if task.Actions()[0].Type() == ActionTypeGrow {
+	case task.Actions()[0].Type() == ActionTypeGrow:
 		return TaskTypeGrow
-	} else {
+	case task.Actions()[0].Type() == ActionTypeReduce:
 		return TaskTypeReduce
+	case task.Actions()[0].Type() == ActionTypeUpdate:
+		return TaskTypeUpdate
+	case task.Actions()[0].Type() == ActionTypeStatsUpdate:
+		return TaskTypeStatsUpdate
+	case task.Actions()[0].Type() == ActionTypeDropIndex:
+		return TaskTypeDropIndex
 	}
+	return 0
+}
+
+func mergeCollectionProps(schemaProps []*commonpb.KeyValuePair, collectionProps []*commonpb.KeyValuePair) []*commonpb.KeyValuePair {
+	// Merge the collectionProps and schemaProps maps, giving priority to the values in schemaProps if there are duplicate keys.
+	props := make(map[string]string)
+	for _, p := range collectionProps {
+		props[p.GetKey()] = p.GetValue()
+	}
+	for _, p := range schemaProps {
+		props[p.GetKey()] = p.GetValue()
+	}
+	var ret []*commonpb.KeyValuePair
+	for k, v := range props {
+		ret = append(ret, &commonpb.KeyValuePair{
+			Key:   k,
+			Value: v,
+		})
+	}
+	return ret
 }
 
 func packLoadSegmentRequest(
 	task *SegmentTask,
 	action Action,
 	schema *schemapb.CollectionSchema,
+	collectionProperties []*commonpb.KeyValuePair,
 	loadMeta *querypb.LoadMetaInfo,
 	loadInfo *querypb.SegmentLoadInfo,
-	segment *datapb.SegmentInfo,
+	indexInfo []*indexpb.IndexInfo,
 ) *querypb.LoadSegmentsRequest {
-	deltaPosition := segment.GetDmlPosition()
-	if deltaPosition == nil {
-		deltaPosition = segment.GetStartPosition()
+	loadScope := querypb.LoadScope_Full
+	if action.Type() == ActionTypeUpdate {
+		loadScope = querypb.LoadScope_Index
 	}
 
+	if action.Type() == ActionTypeStatsUpdate {
+		loadScope = querypb.LoadScope_Stats
+	}
+
+	if task.Source() == utils.LeaderChecker {
+		loadScope = querypb.LoadScope_Delta
+	}
+
+	schema = applyCollectionMmapSetting(schema, collectionProperties)
+
 	return &querypb.LoadSegmentsRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_LoadSegments,
-			MsgID:   task.ID(),
-		},
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_LoadSegments),
+			commonpbutil.WithMsgID(task.ID()),
+		),
 		Infos:          []*querypb.SegmentLoadInfo{loadInfo},
-		Schema:         schema,
-		LoadMeta:       loadMeta,
+		Schema:         schema,   // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
+		LoadMeta:       loadMeta, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
 		CollectionID:   task.CollectionID(),
 		ReplicaID:      task.ReplicaID(),
-		DeltaPositions: []*internalpb.MsgPosition{deltaPosition},
+		DeltaPositions: []*msgpb.MsgPosition{loadInfo.GetDeltaPosition()}, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
 		DstNodeID:      action.Node(),
 		Version:        time.Now().UnixNano(),
 		NeedTransfer:   true,
+		IndexInfoList:  indexInfo,
+		LoadScope:      loadScope,
 	}
 }
 
 func packReleaseSegmentRequest(task *SegmentTask, action *SegmentAction) *querypb.ReleaseSegmentsRequest {
 	return &querypb.ReleaseSegmentsRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_ReleaseSegments,
-			MsgID:   task.ID(),
-		},
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_ReleaseSegments),
+			commonpbutil.WithMsgID(task.ID()),
+		),
 
 		NodeID:       action.Node(),
 		CollectionID: task.CollectionID(),
 		SegmentIDs:   []int64{task.SegmentID()},
-		Scope:        action.Scope(),
-		Shard:        action.Shard(),
+		Scope:        action.GetScope(),
+		Shard:        action.GetShard(),
 		NeedTransfer: false,
 	}
 }
 
-func packLoadMeta(loadType querypb.LoadType, collectionID int64, partitions ...int64) *querypb.LoadMetaInfo {
+func packLoadMeta(loadType querypb.LoadType, collectionInfo *milvuspb.DescribeCollectionResponse, resourceGroup string, loadFields []int64, partitions ...int64) *querypb.LoadMetaInfo {
 	return &querypb.LoadMetaInfo{
-		LoadType:     loadType,
-		CollectionID: collectionID,
-		PartitionIDs: partitions,
+		LoadType:      loadType,
+		CollectionID:  collectionInfo.GetCollectionID(),
+		PartitionIDs:  partitions,
+		DbName:        collectionInfo.GetDbName(),
+		ResourceGroup: resourceGroup,
+		LoadFields:    loadFields,
+		SchemaVersion: collectionInfo.GetUpdateTimestamp(),
 	}
 }
 
-func packSubDmChannelRequest(
+func packSubChannelRequest(
 	task *ChannelTask,
 	action Action,
 	schema *schemapb.CollectionSchema,
+	collectionProperties []*commonpb.KeyValuePair,
 	loadMeta *querypb.LoadMetaInfo,
 	channel *meta.DmChannel,
+	indexInfo []*indexpb.IndexInfo,
+	partitions []int64,
+	targetVersion int64,
 ) *querypb.WatchDmChannelsRequest {
+	schema = applyCollectionMmapSetting(schema, collectionProperties)
 	return &querypb.WatchDmChannelsRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_WatchDmChannels,
-			MsgID:   task.ID(),
-		},
-		NodeID:       action.Node(),
-		CollectionID: task.CollectionID(),
-		Infos:        []*datapb.VchannelInfo{channel.VchannelInfo},
-		Schema:       schema,
-		LoadMeta:     loadMeta,
-		ReplicaID:    task.ReplicaID(),
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_WatchDmChannels),
+			commonpbutil.WithMsgID(task.ID()),
+		),
+		NodeID:        action.Node(),
+		CollectionID:  task.CollectionID(),
+		PartitionIDs:  partitions,
+		Infos:         []*datapb.VchannelInfo{channel.VchannelInfo},
+		Schema:        schema,   // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
+		LoadMeta:      loadMeta, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
+		ReplicaID:     task.ReplicaID(),
+		Version:       time.Now().UnixNano(),
+		IndexInfoList: indexInfo,
+		TargetVersion: targetVersion,
 	}
 }
 
-func fillSubDmChannelRequest(
+func fillSubChannelRequest(
 	ctx context.Context,
 	req *querypb.WatchDmChannelsRequest,
 	broker meta.Broker,
+	includeFlushed bool,
 ) error {
 	segmentIDs := typeutil.NewUniqueSet()
 	for _, vchannel := range req.GetInfos() {
-		segmentIDs.Insert(vchannel.GetFlushedSegmentIds()...)
+		if includeFlushed {
+			segmentIDs.Insert(vchannel.GetFlushedSegmentIds()...)
+		}
 		segmentIDs.Insert(vchannel.GetUnflushedSegmentIds()...)
-		segmentIDs.Insert(vchannel.GetDroppedSegmentIds()...)
+		segmentIDs.Insert(vchannel.GetLevelZeroSegmentIds()...)
 	}
 
 	if segmentIDs.Len() == 0 {
 		return nil
 	}
 
-	resp, err := broker.GetSegmentInfo(ctx, segmentIDs.Collect()...)
+	segmentInfos, err := broker.GetSegmentInfo(ctx, segmentIDs.Collect()...)
 	if err != nil {
 		return err
 	}
-	segmentInfos := make(map[int64]*datapb.SegmentInfo)
-	for _, info := range resp {
-		segmentInfos[info.GetID()] = info
-	}
-	req.SegmentInfos = segmentInfos
+
+	req.SegmentInfos = lo.SliceToMap(segmentInfos, func(info *datapb.SegmentInfo) (int64, *datapb.SegmentInfo) {
+		return info.GetID(), info
+	})
+
 	return nil
 }
 
 func packUnsubDmChannelRequest(task *ChannelTask, action Action) *querypb.UnsubDmChannelRequest {
 	return &querypb.UnsubDmChannelRequest{
-		Base: &commonpb.MsgBase{
-			MsgType: commonpb.MsgType_UnsubDmChannel,
-			MsgID:   task.ID(),
-		},
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_UnsubDmChannel),
+			commonpbutil.WithMsgID(task.ID()),
+		),
 		NodeID:       action.Node(),
 		CollectionID: task.CollectionID(),
 		ChannelName:  task.Channel(),
 	}
 }
 
-func getShardLeader(replicaMgr *meta.ReplicaManager, distMgr *meta.DistributionManager, collectionID, nodeID int64, channel string) (int64, bool) {
-	replica := replicaMgr.GetByCollectionAndNode(collectionID, nodeID)
-	if replica == nil {
-		return 0, false
+func applyCollectionMmapSetting(schema *schemapb.CollectionSchema,
+	collectionProperties []*commonpb.KeyValuePair,
+) *schemapb.CollectionSchema {
+	schema = typeutil.Clone(schema)
+	schema.Properties = mergeCollectionProps(schema.Properties, collectionProperties)
+	// field mmap enabled if collection-level mmap enabled or the field mmap enabled
+	collectionMmapEnabled, exist := common.IsMmapDataEnabled(collectionProperties...)
+	for _, field := range schema.GetFields() {
+		if exist &&
+			// field-level mmap setting has higher priority than collection-level mmap setting, skip if field-level mmap enabled
+			!common.FieldHasMmapKey(schema, field.GetFieldID()) {
+			field.TypeParams = append(field.TypeParams, &commonpb.KeyValuePair{
+				Key:   common.MmapEnabledKey,
+				Value: strconv.FormatBool(collectionMmapEnabled),
+			})
+		}
 	}
-	return distMgr.GetShardLeader(replica, channel)
+	for _, structField := range schema.GetStructArrayFields() {
+		structTypeParams := structField.GetTypeParams()
+		structMmapEnabled, structExist := common.IsMmapDataEnabled(structTypeParams...)
+
+		// If struct field itself doesn't have mmap setting, inherit from collection
+		if !structExist && exist &&
+			!common.FieldHasMmapKey(schema, structField.GetFieldID()) {
+			structField.TypeParams = append(structField.TypeParams, &commonpb.KeyValuePair{
+				Key:   common.MmapEnabledKey,
+				Value: strconv.FormatBool(collectionMmapEnabled),
+			})
+			// Update struct's mmap state since we just set it
+			structMmapEnabled = collectionMmapEnabled
+			structExist = true
+		}
+
+		// Apply mmap setting to fields inside struct
+		for _, field := range structField.GetFields() {
+			// Skip if field already has mmap setting
+			if common.FieldHasMmapKey(schema, field.GetFieldID()) {
+				continue
+			}
+
+			// Priority: struct field setting > collection setting
+			if structExist {
+				field.TypeParams = append(field.TypeParams, &commonpb.KeyValuePair{
+					Key:   common.MmapEnabledKey,
+					Value: strconv.FormatBool(structMmapEnabled),
+				})
+			} else if exist {
+				field.TypeParams = append(field.TypeParams, &commonpb.KeyValuePair{
+					Key:   common.MmapEnabledKey,
+					Value: strconv.FormatBool(collectionMmapEnabled),
+				})
+			}
+		}
+	}
+	return schema
 }

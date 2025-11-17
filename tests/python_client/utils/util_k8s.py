@@ -1,13 +1,14 @@
 import json
 import os.path
 import time
-
+import pyetcd
 import requests
 from pymilvus import connections
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from common.milvus_sys import MilvusSys
 from utils.util_log import test_log as log
+from chaos import chaos_commons as cc
 from common.common_type import in_cluster_env
 
 
@@ -55,8 +56,8 @@ def wait_pods_ready(namespace, label_selector, expected_num=None, timeout=360):
     api_instance = client.CoreV1Api()
     try:
         all_pos_ready_flag = False
-        time_cnt = 0
-        while not all_pos_ready_flag and time_cnt < timeout:
+        t0 = time.time()
+        while not all_pos_ready_flag and time.time() - t0 < timeout:
             api_response = api_instance.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
             all_pos_ready_flag = True
             if expected_num is not None and len(api_response.items) < expected_num:
@@ -73,8 +74,7 @@ def wait_pods_ready(namespace, label_selector, expected_num=None, timeout=360):
                             break
             if not all_pos_ready_flag:
                 log.debug("all pods are not ready, please wait")
-                time.sleep(30)
-                time_cnt += 30
+                time.sleep(5)
         if all_pos_ready_flag:
             log.info(f"all pods in namespace {namespace} with label {label_selector} are ready")
         else:
@@ -187,7 +187,7 @@ def get_milvus_instance_name(namespace, host="127.0.0.1", port="19530", milvus_s
     query_node_ip = ms.query_nodes[0]["infos"]['hardware_infos']["ip"].split(":")[0]
     ip_name_pairs = get_pod_ip_name_pairs(namespace, "app.kubernetes.io/name=milvus")
     pod_name = ip_name_pairs[query_node_ip]
-    
+
     init_k8s_client_config()
     api_instance = client.CoreV1Api()
     try:
@@ -222,7 +222,7 @@ def get_milvus_deploy_tool(namespace, milvus_sys):
         log.error("Exception when calling CoreV1Api->list_namespaced_pod: %s\n" % e)
         raise Exception(str(e))
     if ("app.kubernetes.io/managed-by" in api_response.metadata.labels and
-        api_response.metadata.labels["app.kubernetes.io/managed-by"] == "milvus-operator"):
+            api_response.metadata.labels["app.kubernetes.io/managed-by"] == "milvus-operator"):
         deploy_tool = "milvus-operator"
     else:
         deploy_tool = "helm"
@@ -314,6 +314,144 @@ def get_metrics_querynode_sq_req_count():
         return milvus_querynode_sq_req_count
     else:
         raise Exception(-1, f"Failed to get metrics with status code {response.status_code}")
+
+
+def get_svc_ip(namespace, label_selector):
+    """ get svc ip from svc list """
+    init_k8s_client_config()
+    api_instance = client.CoreV1Api()
+    try:
+        api_response = api_instance.list_namespaced_service(namespace=namespace, label_selector=label_selector)
+    except ApiException as e:
+        log.error("Exception when calling CoreV1Api->list_namespaced_service: %s\n" % e)
+        raise Exception(str(e))
+    svc_ip = api_response.items[0].spec.cluster_ip
+    return svc_ip
+
+
+def parse_etcdctl_table_output(output):
+    """ parse etcdctl table output """
+    output = output.split("\n")
+    title = []
+    data = []
+    for line in output:
+        if "ENDPOINT" in line:
+            title = [x.strip(" ") for x in line.strip("|").split("|")]
+        if ":" in line:
+            data.append([x.strip(" ") for x in line.strip("|").split("|")])
+    return title, data
+
+
+def get_etcd_leader(release_name, deploy_tool="helm"):
+    """ get etcd leader by etcdctl """
+    pod_list = []
+    if deploy_tool == "helm":
+        label_selector = f"app.kubernetes.io/instance={release_name}-etcd, app.kubernetes.io/name=etcd"
+        pod_list = get_pod_list("chaos-testing", label_selector)
+        if len(pod_list) == 0:
+            label_selector = f"app.kubernetes.io/instance={release_name}, app.kubernetes.io/name=etcd"
+            pod_list = get_pod_list("chaos-testing", label_selector)
+    if deploy_tool == "operator":
+        label_selector = f"app.kubernetes.io/instance={release_name}, app.kubernetes.io/name=etcd"
+        pod_list = get_pod_list("chaos-testing", label_selector)
+    leader = None
+    for pod in pod_list:
+        endpoint = f"{pod.status.pod_ip}:2379"
+        cmd = f"etcdctl --endpoints={endpoint} endpoint status -w table"
+        output = os.popen(cmd).read()
+        log.info(f"etcdctl output: {output}")
+        title, data = parse_etcdctl_table_output(output)
+        idx = title.index("IS LEADER")
+        if data[0][idx] == "true":
+            leader = pod.metadata.name
+    log.info(f"etcd leader is {leader}")
+    return leader
+
+
+def get_etcd_followers(release_name, deploy_tool="helm"):
+    """ get etcd follower by etcdctl """
+    pod_list = []
+    if deploy_tool == "helm":
+        label_selector = f"app.kubernetes.io/instance={release_name}-etcd, app.kubernetes.io/name=etcd"
+        pod_list = get_pod_list("chaos-testing", label_selector)
+        if len(pod_list) == 0:
+            label_selector = f"app.kubernetes.io/instance={release_name}, app.kubernetes.io/name=etcd"
+            pod_list = get_pod_list("chaos-testing", label_selector)
+    if deploy_tool == "operator":
+        label_selector = f"app.kubernetes.io/instance={release_name}, app.kubernetes.io/name=etcd"
+        pod_list = get_pod_list("chaos-testing", label_selector)
+    followers = []
+    for pod in pod_list:
+        endpoint = f"{pod.status.pod_ip}:2379"
+        cmd = f"etcdctl --endpoints={endpoint} endpoint status -w table"
+        output = os.popen(cmd).read()
+        log.info(f"etcdctl output: {output}")
+        title, data = parse_etcdctl_table_output(output)
+        idx = title.index("IS LEADER")
+        if data[0][idx] == "false":
+            followers.append(pod.metadata.name)
+    log.info(f"etcd followers are {followers}")
+    return followers
+
+
+def find_activate_standby_coord_pod(namespace, release_name, coord_type):
+    init_k8s_client_config()
+    api_instance = client.CoreV1Api()
+    etcd_service_name = release_name + "-etcd"
+    service = api_instance.read_namespaced_service(name=etcd_service_name, namespace=namespace)
+    etcd_cluster_ip = service.spec.cluster_ip
+    etcd_port = service.spec.ports[0].port
+    etcd = pyetcd.client(host=etcd_cluster_ip, port=etcd_port)
+    v = etcd.get(f'by-dev/meta/session/{coord_type}')
+    log.info(f"coord_type: {coord_type}, etcd session value: {v}")
+    activated_pod_ip = json.loads(v[0])["Address"].split(":")[0]
+    label_selector = f'app.kubernetes.io/instance={release_name}, component={coord_type}'
+    items = get_pod_list(namespace, label_selector=label_selector)
+    all_pod_list = []
+    for item in items:
+        pod_name = item.metadata.name
+        all_pod_list.append(pod_name)
+    activate_pod_list = []
+    standby_pod_list = []
+    for item in items:
+        pod_name = item.metadata.name
+        ip = item.status.pod_ip
+        if ip == activated_pod_ip:
+            activate_pod_list.append(pod_name)
+    standby_pod_list = list(set(all_pod_list) - set(activate_pod_list))
+    return activate_pod_list, standby_pod_list
+
+
+def record_time_when_standby_activated(namespace, release_name, coord_type, timeout=360):
+    activate_pod_list_before, standby_pod_list_before = find_activate_standby_coord_pod(namespace, release_name,
+                                                                                        coord_type)
+    log.info(f"check standby switch: activate_pod_list_before {activate_pod_list_before}, "
+             f"standby_pod_list_before {standby_pod_list_before}")
+    standby_activated = False
+    activate_pod_list_after, standby_pod_list_after = find_activate_standby_coord_pod(namespace, release_name,
+                                                                                      coord_type)
+    start_time = time.time()
+    end_time = time.time()
+    while not standby_activated and end_time - start_time < timeout:
+        try:
+            activate_pod_list_after, standby_pod_list_after = find_activate_standby_coord_pod(namespace, release_name,
+                                                                                              coord_type)
+            if activate_pod_list_after[0] in standby_pod_list_before:
+                standby_activated = True
+                log.info(f"Standby {coord_type} pod {activate_pod_list_after[0]} activated")
+                log.info(f"check standby switch: activate_pod_list_after {activate_pod_list_after}, "
+                         f"standby_pod_list_after {standby_pod_list_after}")
+                break
+        except Exception as e:
+            log.error(f"Exception when check standby switch: {e}")
+        time.sleep(1)
+        end_time = time.time()
+    if standby_activated:
+        log.info(f"Standby {coord_type} pod {activate_pod_list_after[0]} activated")
+    else:
+        log.info(f"Standby {coord_type} pod does not switch standby mode")
+
+
 
 
 if __name__ == '__main__':

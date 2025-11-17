@@ -1,4 +1,4 @@
-name: Code Checker
+name: Mac Code Checker
 
 # This workflow is triggered on pushes or pull request to the repository.
 on:
@@ -10,8 +10,12 @@ on:
     paths:
       - 'scripts/**'
       - 'internal/**'
+      - 'pkg/**'
+      - 'client/**'
       - 'cmd/**'
       - 'build/**'
+      - 'tests/integration/**'
+      - 'tests/go_client/**'
       - '.github/workflows/mac.yaml'
       - '.env'
       - docker-compose.yml
@@ -21,59 +25,82 @@ on:
       # FIXME(wxyu): not need to run code check, update the ci-passed rules and remove these two lines
       - go.mod
       - go.sum
+  schedule:
+    # Runs at 17:00 UTC every day, for refreshing cache every day
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to run the workflow on'
+        required: true
+        default: 'master'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   mac:
-    name: Code Checker MacOS 12
-    runs-on: macos-12
-    timeout-minutes: 60
+    name: Code Checker MacOS 13
+    runs-on: macos-13
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v2
-      - name: Mac Cache Third Party
-        uses: actions/cache@v3
         with:
-          path: |
-            /tmp/thirdparty 
-            cmake_build/3rdparty_download/download
-          key: macos-thirdparty-${{ hashFiles('internal/core/thirdparty/**') }}
-          restore-keys: macos-thirdparty-
-      - name: Mac Cache CCache Volumes
-        uses: actions/cache@v3
+          ref: ${{ github.event.inputs.branch || github.ref }}
+      - name: Setup Python environment
+        uses: actions/setup-python@v4
         with:
-          path: /var/tmp/ccache
-          key: macos-ccache-${{ hashFiles('internal/core/**') }}
-          restore-keys: macos-ccache-
+          python-version: '<3.12'
+      - name: Install CMake 3.31.8
+        run: |
+          cmake --version
+          which cmake
+          brew uninstall cmake -f
+          curl -LO https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-macos-universal.tar.gz
+          tar -zxf cmake-3.31.8-macos-universal.tar.gz -C /tmp/
+          sudo mv /tmp/cmake-3.31.8-macos-universal/CMake.app /Applications/
+          echo -e "\n=== Creating symlinks for CMake ==="
+          sudo ln -s /Applications/CMake.app/Contents/bin/cmake /usr/local/bin/cmake
+          sudo ln -s /Applications/CMake.app/Contents/bin/cpack /usr/local/bin/cpack
+          sudo ln -s /Applications/CMake.app/Contents/bin/ctest /usr/local/bin/ctest
+          CMAKE_MODULE_DIR="/Applications/CMake.app/Contents/share/cmake-3.31"
+          sudo ln -s "$CMAKE_MODULE_DIR" /usr/local/share/cmake-3.31          
+          cmake --version
+          which cmake
       - name: Setup Go environment
-        uses: actions/setup-go@v2.2.0
+        uses: actions/setup-go@v4
         with:
-          go-version: '~1.18.1'
-      - name: Mac Cache Go Mod Volumes
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: macos-go-mod-${{ hashFiles('**/go.sum') }}
-          restore-keys: macos-go-mod-
+          go-version: '1.24.9'
+          cache: false
+      - name: Download Caches
+        uses: ./.github/actions/macos-cache-restore
       - name: Code Check
         env:
           CCACHE_DIR: /var/tmp/ccache
           CCACHE_COMPILERCHECK: content
           CCACHE_COMPRESS: 1
-          CCACHE_COMPRESSLEVEL: 5
-          CCACHE_MAXSIZE: 2G
-          CUSTOM_THIRDPARTY_PATH: /tmp/thirdparty
+          CCACHE_COMPRESSLEVEL: 9
+          CCACHE_MAXSIZE: 1G
         run: |
           if [[ ! -d "/var/tmp/ccache" ]];then
             mkdir -p /var/tmp/ccache
           fi
-          brew install boost libomp ninja tbb openblas ccache
+          ls -alh /var/tmp/ccache
+          brew install libomp ninja openblas ccache pkg-config
+          pip3 install conan==1.64.1
           if [[ ! -d "/usr/local/opt/llvm" ]]; then
             ln -s /usr/local/opt/llvm@14 /usr/local/opt/llvm
           fi
-          make milvus && sh scripts/collect_arrow_dep.sh -f /tmp/thirdparty
+          make milvus
       - name: Upload Cmake log
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: cmake-log
           path: cmake_build/CMakeFiles/*.log
+      - name: Save Caches
+        uses: ./.github/actions/macos-cache-save
+        if: github.event_name != 'pull_request'

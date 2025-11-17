@@ -18,44 +18,68 @@ package task
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"sync"
+	"time"
 
-	"github.com/milvus-io/milvus/api/commonpb"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/blang/semver/v4"
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"go.uber.org/zap"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/indexparams"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-type actionIndex struct {
-	Task int64
-	Step int
+// segmentsVersion is used for the flushed segments should not be included in the watch dm channel request
+var segmentsVersion = semver.Version{
+	Major: 2,
+	Minor: 3,
+	Patch: 4,
 }
 
 type Executor struct {
+	nodeID    int64
 	doneCh    chan struct{}
 	wg        sync.WaitGroup
 	meta      *meta.Meta
 	dist      *meta.DistributionManager
 	broker    meta.Broker
-	targetMgr *meta.TargetManager
+	targetMgr meta.TargetManagerInterface
 	cluster   session.Cluster
 	nodeMgr   *session.NodeManager
 
-	// Merge load segment requests
-	merger *Merger[segmentIndex, *querypb.LoadSegmentsRequest]
-
-	executingActions sync.Map
+	executingTasks   *typeutil.ConcurrentSet[string] // task index
+	executingTaskNum atomic.Int32
+	executedFlag     chan struct{}
 }
 
 func NewExecutor(meta *meta.Meta,
 	dist *meta.DistributionManager,
 	broker meta.Broker,
-	targetMgr *meta.TargetManager,
+	targetMgr meta.TargetManagerInterface,
 	cluster session.Cluster,
-	nodeMgr *session.NodeManager) *Executor {
+	nodeMgr *session.NodeManager,
+) *Executor {
 	return &Executor{
 		doneCh:    make(chan struct{}),
 		meta:      meta,
@@ -64,39 +88,50 @@ func NewExecutor(meta *meta.Meta,
 		targetMgr: targetMgr,
 		cluster:   cluster,
 		nodeMgr:   nodeMgr,
-		merger:    NewMerger[segmentIndex, *querypb.LoadSegmentsRequest](),
 
-		executingActions: sync.Map{},
+		executingTasks: typeutil.NewConcurrentSet[string](),
+		executedFlag:   make(chan struct{}, 1),
 	}
 }
 
 func (ex *Executor) Start(ctx context.Context) {
-	ex.merger.Start(ctx)
-	ex.scheduleRequests()
 }
 
 func (ex *Executor) Stop() {
-	ex.merger.Stop()
 	ex.wg.Wait()
+}
+
+func (ex *Executor) GetTaskExecutionCap() int32 {
+	nodeInfo := ex.nodeMgr.Get(ex.nodeID)
+	if nodeInfo == nil || nodeInfo.CPUNum() == 0 {
+		return Params.QueryCoordCfg.TaskExecutionCap.GetAsInt32()
+	}
+
+	ret := int32(math.Ceil(float64(nodeInfo.CPUNum()) * Params.QueryCoordCfg.QueryNodeTaskParallelismFactor.GetAsFloat()))
+
+	return ret
 }
 
 // Execute executes the given action,
 // does nothing and returns false if the action is already committed,
 // returns true otherwise.
 func (ex *Executor) Execute(task Task, step int) bool {
-	index := actionIndex{
-		Task: task.ID(),
-		Step: step,
-	}
-	_, exist := ex.executingActions.LoadOrStore(index, struct{}{})
+	exist := !ex.executingTasks.Insert(task.Index())
 	if exist {
+		return false
+	}
+	if ex.executingTaskNum.Inc() > ex.GetTaskExecutionCap() {
+		ex.executingTasks.Remove(task.Index())
+		ex.executingTaskNum.Dec()
 		return false
 	}
 
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int("step", step),
-		zap.Int64("source", task.SourceID()),
+		zap.String("source", task.Source().String()),
 	)
 
 	go func() {
@@ -107,95 +142,42 @@ func (ex *Executor) Execute(task Task, step int) bool {
 
 		case *ChannelAction:
 			ex.executeDmChannelAction(task.(*ChannelTask), step)
+
+		case *LeaderAction:
+			ex.executeLeaderAction(task.(*LeaderTask), step)
+
+		case *DropIndexAction:
+			ex.executeDropIndexAction(task.(*DropIndexTask), step)
 		}
 	}()
 
 	return true
 }
 
-func (ex *Executor) scheduleRequests() {
-	ex.wg.Add(1)
-	go func() {
-		defer ex.wg.Done()
-		for mergeTask := range ex.merger.Chan() {
-			task := mergeTask.(*LoadSegmentsTask)
-			log.Info("get merge task, process it",
-				zap.Int64("collectionID", task.req.GetCollectionID()),
-				zap.String("shard", task.req.GetInfos()[0].GetInsertChannel()),
-				zap.Int64("nodeID", task.req.GetDstNodeID()),
-				zap.Int("taskNum", len(task.tasks)),
-			)
-			go ex.processMergeTask(mergeTask.(*LoadSegmentsTask))
-		}
-	}()
+func (ex *Executor) GetExecutedFlag() <-chan struct{} {
+	return ex.executedFlag
 }
 
-func (ex *Executor) processMergeTask(mergeTask *LoadSegmentsTask) {
-	task := mergeTask.tasks[0]
-	action := task.Actions()[mergeTask.steps[0]]
-
-	defer func() {
-		for i := range mergeTask.tasks {
-			mergeTask.tasks[i].SetErr(task.Err())
-			ex.removeAction(mergeTask.tasks[i], mergeTask.steps[i])
-		}
-	}()
-
-	taskIDs := make([]int64, 0, len(mergeTask.tasks))
-	segments := make([]int64, 0, len(mergeTask.tasks))
-	for _, task := range mergeTask.tasks {
-		taskIDs = append(taskIDs, task.ID())
-		segments = append(segments, task.SegmentID())
-	}
-	log := log.With(
-		zap.Int64s("taskIDs", taskIDs),
-		zap.Int64("collectionID", task.CollectionID()),
-		zap.Int64s("segmentIDs", segments),
-		zap.Int64("nodeID", action.Node()),
-		zap.Int64("source", task.SourceID()),
-	)
-
-	// Get shard leader for the given replica and segment
-	channel := mergeTask.req.GetInfos()[0].GetInsertChannel()
-	leader, ok := getShardLeader(ex.meta.ReplicaManager, ex.dist, task.CollectionID(), action.Node(), channel)
-	if !ok {
-		msg := "no shard leader for the segment to execute loading"
-		task.SetErr(utils.WrapError(msg, ErrTaskStale))
-		log.Warn(msg, zap.String("shard", channel))
-		return
-	}
-
-	log.Info("load segments...")
-	status, err := ex.cluster.LoadSegments(task.Context(), leader, mergeTask.req)
-	if err != nil {
-		log.Warn("failed to load segment, it may be a false failure", zap.Error(err))
-		return
-	}
-	if status.ErrorCode != commonpb.ErrorCode_Success {
-		log.Warn("failed to load segment", zap.String("reason", status.GetReason()))
-		return
-	}
-	log.Info("load segments done")
-}
-
-func (ex *Executor) removeAction(task Task, step int) {
+func (ex *Executor) removeTask(task Task, step int) {
 	if task.Err() != nil {
-		log.Info("excute action done, remove it",
+		log.Info("execute action done, remove it",
 			zap.Int64("taskID", task.ID()),
 			zap.Int("step", step),
 			zap.Error(task.Err()))
+	} else {
+		select {
+		case ex.executedFlag <- struct{}{}:
+		default:
+		}
 	}
 
-	index := actionIndex{
-		Task: task.ID(),
-		Step: step,
-	}
-	ex.executingActions.Delete(index)
+	ex.executingTasks.Remove(task.Index())
+	ex.executingTaskNum.Dec()
 }
 
 func (ex *Executor) executeSegmentAction(task *SegmentTask, step int) {
 	switch task.Actions()[step].Type() {
-	case ActionTypeGrow:
+	case ActionTypeGrow, ActionTypeUpdate, ActionTypeStatsUpdate:
 		ex.loadSegment(task, step)
 
 	case ActionTypeReduce:
@@ -207,235 +189,685 @@ func (ex *Executor) executeSegmentAction(task *SegmentTask, step int) {
 // not really executes the request
 func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 	action := task.Actions()[step].(*SegmentAction)
-	log := log.With(
+	defer action.rpcReturned.Store(true)
+	ctx := task.Context()
+	log := log.Ctx(ctx).With(
 		zap.Int64("taskID", task.ID()),
 		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int64("segmentID", task.segmentID),
 		zap.Int64("node", action.Node()),
-		zap.Int64("source", task.SourceID()),
+		zap.String("source", task.Source().String()),
 	)
 
 	var err error
 	defer func() {
 		if err != nil {
-			task.SetErr(err)
-			task.Cancel()
-			ex.removeAction(task, step)
+			task.Fail(err)
 		}
+		ex.removeTask(task, step)
 	}()
 
-	ctx := task.Context()
-	schema, err := ex.broker.GetCollectionSchema(ctx, task.CollectionID())
+	collectionInfo, loadMeta, channel, err := ex.getMetaInfo(ctx, task)
 	if err != nil {
-		log.Warn("failed to get schema of collection", zap.Error(err))
-		task.SetErr(err)
 		return err
 	}
-	partitions, err := utils.GetPartitions(ex.meta.CollectionManager, ex.broker, task.CollectionID())
+
+	loadInfo, indexInfos, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID, channel, task.LoadPriority())
 	if err != nil {
-		log.Warn("failed to get partitions of collection", zap.Error(err))
 		return err
 	}
-	loadMeta := packLoadMeta(
-		ex.meta.GetLoadType(task.CollectionID()),
-		task.CollectionID(),
-		partitions...,
+	req := packLoadSegmentRequest(
+		task,
+		action,
+		collectionInfo.GetSchema(),
+		collectionInfo.GetProperties(),
+		loadMeta,
+		loadInfo,
+		indexInfos,
 	)
-	segments, err := ex.broker.GetSegmentInfo(ctx, task.SegmentID())
-	if err != nil || len(segments) == 0 {
-		log.Warn("failed to get segment info from DataCoord", zap.Error(err))
-		return err
-	}
-	segment := segments[0]
-	indexes, err := ex.broker.GetIndexInfo(ctx, task.CollectionID(), segment.GetID())
-	if err != nil {
-		log.Warn("failed to get index of segment", zap.Error(err))
-		return err
-	}
-	loadInfo := utils.PackSegmentLoadInfo(segment, indexes)
 
-	// Get shard leader for the given replica and segment
-	leader, ok := getShardLeader(ex.meta.ReplicaManager, ex.dist, task.CollectionID(), action.Node(), segment.GetInsertChannel())
-	if !ok {
+	// get segment's replica first, then get shard leader by replica
+	replica := ex.meta.ReplicaManager.GetByCollectionAndNode(ctx, task.CollectionID(), action.Node())
+	if replica == nil {
+		msg := "node doesn't belong to any replica"
+		err := merr.WrapErrNodeNotAvailable(action.Node())
+		log.Warn(msg, zap.Error(err))
+		return err
+	}
+	view := ex.dist.ChannelDistManager.GetShardLeader(task.Shard(), replica)
+	if view == nil {
 		msg := "no shard leader for the segment to execute loading"
-		err = utils.WrapError(msg, ErrTaskStale)
-		log.Warn(msg, zap.String("shard", segment.GetInsertChannel()))
+		err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
+		log.Warn(msg, zap.Error(err))
 		return err
 	}
-	log = log.With(zap.Int64("shardLeader", leader))
 
-	req := packLoadSegmentRequest(task, action, schema, loadMeta, loadInfo, segment)
-	loadTask := NewLoadSegmentsTask(task, step, req)
-	ex.merger.Add(loadTask)
-	log.Info("load segment task committed")
+	if err := ex.checkIfShardLeaderIsStreamingNode(view); err != nil {
+		log.Warn("shard leader is not a streamingnode, skip load segment", zap.Error(err))
+		return err
+	}
+
+	log = log.With(zap.Int64("shardLeader", view.Node))
+
+	// NOTE: for balance segment task, expected load and release execution on the same shard leader
+	if GetTaskType(task) == TaskTypeMove {
+		task.SetShardLeaderID(view.Node)
+	}
+
+	startTs := time.Now()
+	log.Info("load segments...")
+	status, err := ex.cluster.LoadSegments(task.Context(), view.Node, req)
+	err = merr.CheckRPCCall(status, err)
+	if err != nil {
+		log.Warn("failed to load segment", zap.Error(err))
+		return err
+	}
+
+	elapsed := time.Since(startTs)
+	log.Info("load segments done", zap.Duration("elapsed", elapsed))
+
+	return nil
+}
+
+// checkIfShardLeaderIsStreamingNode checks if the shard leader is a streamingnode.
+// Because the L0 management at 2.6 and 2.5 is different, so when upgrading mixcoord,
+// the new mixcoord will make a wrong plan when balancing a segment from one query node to another by 2.5 delegator.
+// We need to balance the 2.5 delegator to 2.6 delegator before balancing any segment by 2.6 mixcoord.
+func (ex *Executor) checkIfShardLeaderIsStreamingNode(view *meta.DmChannel) error {
+	if !streamingutil.IsStreamingServiceEnabled() {
+		return nil
+	}
+
+	node := ex.nodeMgr.Get(view.Node)
+	if node == nil {
+		return merr.WrapErrServiceInternal(fmt.Sprintf("node %d is not found", view.Node))
+	}
+	nodes := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs()
+	if !nodes.Contain(view.Node) {
+		return merr.WrapErrServiceInternal(fmt.Sprintf("channel %s at node %d is not working at streamingnode, skip load segment", view.GetChannelName(), view.Node))
+	}
 	return nil
 }
 
 func (ex *Executor) releaseSegment(task *SegmentTask, step int) {
-	defer ex.removeAction(task, step)
-
+	defer ex.removeTask(task, step)
+	startTs := time.Now()
 	action := task.Actions()[step].(*SegmentAction)
-	defer action.isReleaseCommitted.Store(true)
+	defer action.rpcReturned.Store(true)
 
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
 		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.Int64("segmentID", task.segmentID),
 		zap.Int64("node", action.Node()),
-		zap.Int64("source", task.SourceID()),
+		zap.String("source", task.Source().String()),
 	)
 
 	ctx := task.Context()
+	var err error
+	defer func() {
+		if err != nil {
+			task.Fail(err)
+		}
+	}()
 
 	dstNode := action.Node()
+
 	req := packReleaseSegmentRequest(task, action)
-	if action.Scope() == querypb.DataScope_Streaming {
+	channel := ex.targetMgr.GetDmChannel(ctx, task.CollectionID(), task.Shard(), meta.CurrentTarget)
+	if channel != nil {
+		// if channel exists in current target, set cp to ReleaseSegmentRequest, need to use it as growing segment's exclude ts
+		req.Checkpoint = channel.GetSeekPosition()
+	}
+
+	if action.Scope == querypb.DataScope_Streaming {
 		// Any modification to the segment distribution have to set NeedTransfer true,
 		// to protect the version, which serves search/query
 		req.NeedTransfer = true
 	} else {
-		var targetSegment *meta.Segment
-		segments := ex.dist.SegmentDistManager.GetByNode(action.Node())
-		for _, segment := range segments {
-			if segment.GetID() == task.SegmentID() {
-				targetSegment = segment
-				break
-			}
-		}
-		if targetSegment == nil {
-			log.Info("segment to release not found in distribution")
-			return
-		}
-		req.Shard = targetSegment.GetInsertChannel()
+		req.Shard = task.shard
 
-		if ex.meta.CollectionManager.Exist(task.CollectionID()) {
-			leader, ok := getShardLeader(ex.meta.ReplicaManager, ex.dist, task.CollectionID(), action.Node(), req.GetShard())
-			if !ok {
-				log.Warn("no shard leader for the segment to execute releasing", zap.String("shard", req.GetShard()))
-				return
+		if ex.meta.CollectionManager.Exist(ctx, task.CollectionID()) {
+			// get segment's replica first, then get shard leader by replica
+			replica := ex.meta.ReplicaManager.GetByCollectionAndNode(ctx, task.CollectionID(), action.Node())
+			if replica == nil {
+				msg := "node doesn't belong to any replica, try to send release to worker"
+				err := merr.WrapErrNodeNotAvailable(action.Node())
+				log.Warn(msg, zap.Error(err))
+				dstNode = action.Node()
+				req.NeedTransfer = false
+			} else {
+				view := ex.dist.ChannelDistManager.GetShardLeader(task.Shard(), replica)
+				if view == nil {
+					msg := "no shard leader for the segment to execute releasing"
+					err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
+					log.Warn(msg, zap.Error(err))
+					return
+				}
+				// NOTE: for balance segment task, expected load and release execution on the same shard leader
+				if GetTaskType(task) == TaskTypeMove && task.ShardLeaderID() != view.Node {
+					msg := "shard leader changed, skip release"
+					err = merr.WrapErrServiceInternal(fmt.Sprintf("shard leader changed from %d to %d", task.ShardLeaderID(), view.Node))
+					log.Warn(msg, zap.Error(err))
+					return
+				}
+				dstNode = view.Node
+				log = log.With(zap.Int64("shardLeader", view.Node))
+				req.NeedTransfer = true
 			}
-			dstNode = leader
-			log = log.With(zap.Int64("shardLeader", leader))
-			req.NeedTransfer = true
 		}
 	}
 
 	log.Info("release segment...")
 	status, err := ex.cluster.ReleaseSegments(ctx, dstNode, req)
+	err = merr.CheckRPCCall(status, err)
 	if err != nil {
-		log.Warn("failed to release segment, it may be a false failure", zap.Error(err))
+		log.Warn("failed to release segment", zap.Error(err))
 		return
 	}
-	if status.ErrorCode != commonpb.ErrorCode_Success {
-		log.Warn("failed to release segment", zap.String("reason", status.GetReason()))
-		return
-	}
-	log.Info("release segment done")
+	elapsed := time.Since(startTs)
+	log.Info("release segment done", zap.Int64("taskID", task.ID()), zap.Duration("time taken", elapsed))
 }
 
 func (ex *Executor) executeDmChannelAction(task *ChannelTask, step int) {
 	switch task.Actions()[step].Type() {
 	case ActionTypeGrow:
-		ex.subDmChannel(task, step)
+		ex.subscribeChannel(task, step)
 
 	case ActionTypeReduce:
-		ex.unsubDmChannel(task, step)
+		ex.unsubscribeChannel(task, step)
 	}
 }
 
-func (ex *Executor) subDmChannel(task *ChannelTask, step int) error {
-	defer ex.removeAction(task, step)
-
+func (ex *Executor) subscribeChannel(task *ChannelTask, step int) error {
+	defer ex.removeTask(task, step)
+	startTs := time.Now()
 	action := task.Actions()[step].(*ChannelAction)
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
 		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.String("channel", task.Channel()),
 		zap.Int64("node", action.Node()),
-		zap.Int64("source", task.SourceID()),
+		zap.String("source", task.Source().String()),
 	)
 
 	var err error
 	defer func() {
 		if err != nil {
-			task.SetErr(err)
-			task.Cancel()
+			task.Fail(err)
 		}
 	}()
 
 	ctx := task.Context()
 
-	schema, err := ex.broker.GetCollectionSchema(ctx, task.CollectionID())
+	collectionInfo, err := ex.broker.DescribeCollection(ctx, task.CollectionID())
 	if err != nil {
-		log.Warn("failed to get schema of collection")
+		log.Warn("failed to get collection info", zap.Error(err))
 		return err
 	}
-	partitions, err := utils.GetPartitions(ex.meta.CollectionManager, ex.broker, task.CollectionID())
+	loadFields := ex.meta.GetLoadFields(ctx, task.CollectionID())
+	partitions, err := utils.GetPartitions(ctx, ex.targetMgr, task.CollectionID())
 	if err != nil {
-		log.Warn("failed to get partitions of collection")
+		log.Warn("failed to get partitions of collection", zap.Error(err))
+		return err
+	}
+	indexInfo, err := ex.broker.ListIndexes(ctx, task.CollectionID())
+	if err != nil {
+		log.Warn("fail to get index meta of collection", zap.Error(err))
+		return err
+	}
+	dbResp, err := ex.broker.DescribeDatabase(ctx, collectionInfo.GetDbName())
+	if err != nil {
+		log.Warn("failed to get database info", zap.Error(err))
 		return err
 	}
 	loadMeta := packLoadMeta(
-		ex.meta.GetLoadType(task.CollectionID()),
-		task.CollectionID(),
+		ex.meta.GetLoadType(ctx, task.CollectionID()),
+		collectionInfo,
+		task.ResourceGroup(),
+		loadFields,
 		partitions...,
 	)
+	loadMeta.DbProperties = dbResp.GetProperties()
 
-	dmChannel := ex.targetMgr.GetDmChannel(action.ChannelName())
-	req := packSubDmChannelRequest(task, action, schema, loadMeta, dmChannel)
-	err = fillSubDmChannelRequest(ctx, req, ex.broker)
+	dmChannel := ex.targetMgr.GetDmChannel(ctx, task.CollectionID(), action.ChannelName(), meta.NextTarget)
+	if dmChannel == nil {
+		msg := "channel does not exist in next target, skip it"
+		log.Warn(msg, zap.String("channelName", action.ChannelName()))
+		return merr.WrapErrChannelReduplicate(action.ChannelName())
+	}
+
+	partitions, err = utils.GetPartitions(ctx, ex.targetMgr, task.collectionID)
 	if err != nil {
-		log.Warn("failed to subscribe DmChannel, failed to fill the request with segments",
+		log.Warn("failed to get partitions", zap.Error(err))
+		return merr.WrapErrServiceInternal(fmt.Sprintf("failed to get partitions for collection=%d", task.CollectionID()))
+	}
+
+	version := ex.targetMgr.GetCollectionTargetVersion(ctx, task.CollectionID(), meta.NextTargetFirst)
+	req := packSubChannelRequest(
+		task,
+		action,
+		collectionInfo.GetSchema(),
+		collectionInfo.GetProperties(),
+		loadMeta,
+		dmChannel,
+		indexInfo,
+		partitions,
+		version,
+	)
+	err = fillSubChannelRequest(ctx, req, ex.broker, ex.shouldIncludeFlushedSegmentInfo(action.Node()))
+	if err != nil {
+		log.Warn("failed to subscribe channel, failed to fill the request with segments",
 			zap.Error(err))
 		return err
 	}
-	log.Info("subscribe channel...")
+
+	sealedSegments := ex.targetMgr.GetSealedSegmentsByChannel(ctx, dmChannel.CollectionID, dmChannel.ChannelName, meta.NextTarget)
+	sealedSegmentRowCount := lo.MapValues(sealedSegments, func(segment *datapb.SegmentInfo, _ int64) int64 {
+		return segment.GetNumOfRows()
+	})
+	req.SealedSegmentRowCount = sealedSegmentRowCount
+
+	ts := dmChannel.GetSeekPosition().GetTimestamp()
+	log.Info("subscribe channel...",
+		zap.Uint64("checkpoint", ts),
+		zap.Duration("sinceCheckpoint", time.Since(tsoutil.PhysicalTime(ts))),
+	)
 	status, err := ex.cluster.WatchDmChannels(ctx, action.Node(), req)
 	if err != nil {
-		log.Warn("failed to subscribe DmChannel, it may be a false failure", zap.Error(err))
+		log.Warn("failed to subscribe channel, it may be a false failure", zap.Error(err))
 		return err
 	}
-	if status.ErrorCode != commonpb.ErrorCode_Success {
-		err = utils.WrapError("failed to subscribe DmChannel", ErrFailedResponse)
-		log.Warn("failed to subscribe DmChannel", zap.String("reason", status.GetReason()))
+	if !merr.Ok(status) {
+		err = merr.Error(status)
+		log.Warn("failed to subscribe channel", zap.Error(err))
 		return err
 	}
-	log.Info("subscribe DmChannel done")
+	elapsed := time.Since(startTs)
+	log.Info("subscribe channel done", zap.Int64("taskID", task.ID()), zap.Duration("time taken", elapsed))
 	return nil
 }
 
-func (ex *Executor) unsubDmChannel(task *ChannelTask, step int) error {
-	defer ex.removeAction(task, step)
+func (ex *Executor) shouldIncludeFlushedSegmentInfo(nodeID int64) bool {
+	node := ex.nodeMgr.Get(nodeID)
+	if node == nil {
+		return false
+	}
+	return node.Version().LT(segmentsVersion)
+}
 
+func (ex *Executor) unsubscribeChannel(task *ChannelTask, step int) error {
+	defer ex.removeTask(task, step)
+	startTs := time.Now()
 	action := task.Actions()[step].(*ChannelAction)
 	log := log.With(
 		zap.Int64("taskID", task.ID()),
 		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
 		zap.String("channel", task.Channel()),
 		zap.Int64("node", action.Node()),
-		zap.Int64("source", task.SourceID()),
+		zap.String("source", task.Source().String()),
 	)
 
 	var err error
 	defer func() {
 		if err != nil {
-			task.SetErr(err)
-			task.Cancel()
+			task.Fail(err)
 		}
 	}()
 
 	ctx := task.Context()
 
 	req := packUnsubDmChannelRequest(task, action)
+	log.Info("unsubscribe channel...")
 	status, err := ex.cluster.UnsubDmChannel(ctx, action.Node(), req)
 	if err != nil {
-		log.Warn("failed to unsubscribe DmChannel, it may be a false failure", zap.Error(err))
+		log.Warn("failed to unsubscribe channel, it may be a false failure", zap.Error(err))
 		return err
 	}
-	if status.ErrorCode != commonpb.ErrorCode_Success {
-		err = utils.WrapError("failed to unsubscribe DmChannel", ErrFailedResponse)
-		log.Warn("failed to unsubscribe DmChannel", zap.String("reason", status.GetReason()))
+	if !merr.Ok(status) {
+		err = merr.Error(status)
+		log.Warn("failed to unsubscribe channel", zap.Error(err))
 		return err
 	}
+
+	elapsed := time.Since(startTs)
+	log.Info("unsubscribe channel done", zap.Int64("taskID", task.ID()), zap.Duration("time taken", elapsed))
 	return nil
+}
+
+func (ex *Executor) executeLeaderAction(task *LeaderTask, step int) {
+	switch task.Actions()[step].Type() {
+	case ActionTypeGrow:
+		ex.setDistribution(task, step)
+
+	case ActionTypeReduce:
+		ex.removeDistribution(task, step)
+
+	case ActionTypeUpdate:
+		ex.updatePartStatsVersions(task, step)
+
+	case ActionTypeStatsUpdate:
+		ex.updatePartStatsVersions(task, step)
+	}
+}
+
+func (ex *Executor) executeDropIndexAction(task *DropIndexTask, step int) {
+	action := task.Actions()[step].(*DropIndexAction)
+	defer action.rpcReturned.Store(true)
+	ctx := task.Context()
+	log := log.Ctx(ctx).With(
+		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.String("shard", task.Shard()),
+		zap.Int64("node", action.Node()),
+		zap.String("source", task.Source().String()),
+		zap.Int64s("indexIDs", action.indexIDs),
+	)
+
+	var err error
+	defer func() {
+		if err != nil {
+			task.Fail(err)
+		}
+		ex.removeTask(task, step)
+	}()
+
+	view := ex.dist.ChannelDistManager.GetShardLeader(task.Shard(), task.replica)
+	if view == nil {
+		err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
+		log.Warn("failed to get shard leader", zap.Error(err))
+		return
+	}
+
+	req := &querypb.DropIndexRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_DropIndex),
+			commonpbutil.WithMsgID(task.ID()),
+		),
+		SegmentID:    task.SegmentID(),
+		IndexIDs:     action.indexIDs,
+		Channel:      task.Shard(),
+		NeedTransfer: true,
+	}
+
+	startTs := time.Now()
+	log.Info("drop index...")
+	status, err := ex.cluster.DropIndex(task.Context(), view.Node, req)
+	if err != nil {
+		log.Warn("failed to drop index", zap.Error(err))
+		return
+	}
+	if !merr.Ok(status) {
+		err = merr.Error(status)
+		log.Warn("failed to drop index", zap.Error(err))
+		return
+	}
+
+	elapsed := time.Since(startTs)
+	log.Info("drop index done", zap.Duration("elapsed", elapsed))
+}
+
+func (ex *Executor) updatePartStatsVersions(task *LeaderTask, step int) error {
+	action := task.Actions()[step].(*LeaderAction)
+	defer action.rpcReturned.Store(true)
+	ctx := task.Context()
+	log := log.Ctx(ctx).With(
+		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.Int64("leader", action.leaderID),
+		zap.Int64("node", action.Node()),
+		zap.String("source", task.Source().String()),
+	)
+	var err error
+	defer func() {
+		if err != nil {
+			task.Fail(err)
+		}
+		ex.removeTask(task, step)
+	}()
+
+	req := &querypb.SyncDistributionRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_SyncDistribution),
+			commonpbutil.WithMsgID(task.ID()),
+		),
+		CollectionID: task.collectionID,
+		Channel:      task.Shard(),
+		ReplicaID:    task.ReplicaID(),
+		Actions: []*querypb.SyncAction{
+			{
+				Type:                   querypb.SyncType_UpdatePartitionStats,
+				SegmentID:              action.SegmentID(),
+				NodeID:                 action.Node(),
+				Version:                action.Version(),
+				PartitionStatsVersions: action.partStatsVersions,
+			},
+		},
+	}
+	startTs := time.Now()
+	log.Debug("Update partition stats versions...")
+	status, err := ex.cluster.SyncDistribution(task.Context(), task.leaderID, req)
+	err = merr.CheckRPCCall(status, err)
+	if err != nil {
+		log.Warn("failed to update partition stats versions", zap.Error(err))
+		return err
+	}
+
+	elapsed := time.Since(startTs)
+	log.Debug("update partition stats done", zap.Duration("elapsed", elapsed))
+
+	return nil
+}
+
+func (ex *Executor) setDistribution(task *LeaderTask, step int) error {
+	action := task.Actions()[step].(*LeaderAction)
+	defer action.rpcReturned.Store(true)
+	ctx := task.Context()
+	log := log.Ctx(ctx).With(
+		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.Int64("segmentID", task.segmentID),
+		zap.Int64("leader", action.leaderID),
+		zap.Int64("node", action.Node()),
+		zap.String("source", task.Source().String()),
+	)
+
+	var err error
+	defer func() {
+		if err != nil {
+			task.Fail(err)
+		}
+		ex.removeTask(task, step)
+	}()
+
+	collectionInfo, loadMeta, channel, err := ex.getMetaInfo(ctx, task)
+	if err != nil {
+		return err
+	}
+
+	loadInfo, indexInfo, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID(), channel, commonpb.LoadPriority_LOW)
+	if err != nil {
+		return err
+	}
+
+	req := &querypb.SyncDistributionRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_LoadSegments),
+			commonpbutil.WithMsgID(task.ID()),
+		),
+		CollectionID: task.collectionID,
+		Channel:      task.Shard(),
+		Schema:       collectionInfo.GetSchema(),
+		LoadMeta:     loadMeta,
+		ReplicaID:    task.ReplicaID(),
+		Actions: []*querypb.SyncAction{
+			{
+				Type:        querypb.SyncType_Set,
+				PartitionID: loadInfo.GetPartitionID(),
+				SegmentID:   action.SegmentID(),
+				NodeID:      action.Node(),
+				Info:        loadInfo,
+				Version:     action.Version(),
+			},
+		},
+		IndexInfoList: indexInfo,
+	}
+
+	startTs := time.Now()
+	log.Info("Sync Distribution...")
+	status, err := ex.cluster.SyncDistribution(task.Context(), task.leaderID, req)
+	err = merr.CheckRPCCall(status, err)
+	if err != nil {
+		log.Warn("failed to sync distribution", zap.Error(err))
+		return err
+	}
+
+	elapsed := time.Since(startTs)
+	log.Info("sync distribution done", zap.Duration("elapsed", elapsed))
+
+	return nil
+}
+
+func (ex *Executor) removeDistribution(task *LeaderTask, step int) error {
+	action := task.Actions()[step].(*LeaderAction)
+	defer action.rpcReturned.Store(true)
+	ctx := task.Context()
+	log := log.Ctx(ctx).With(
+		zap.Int64("taskID", task.ID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()),
+		zap.Int64("segmentID", task.segmentID),
+		zap.Int64("leader", action.leaderID),
+		zap.Int64("node", action.Node()),
+		zap.String("source", task.Source().String()),
+	)
+
+	var err error
+	defer func() {
+		if err != nil {
+			task.Fail(err)
+		}
+		ex.removeTask(task, step)
+	}()
+
+	req := &querypb.SyncDistributionRequest{
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_SyncDistribution),
+			commonpbutil.WithMsgID(task.ID()),
+		),
+		CollectionID: task.collectionID,
+		Channel:      task.Shard(),
+		ReplicaID:    task.ReplicaID(),
+		Actions: []*querypb.SyncAction{
+			{
+				Type:      querypb.SyncType_Remove,
+				SegmentID: action.SegmentID(),
+				NodeID:    action.Node(),
+			},
+		},
+	}
+
+	startTs := time.Now()
+	log.Info("Remove Distribution...")
+	status, err := ex.cluster.SyncDistribution(task.Context(), task.leaderID, req)
+	err = merr.CheckRPCCall(status, err)
+	if err != nil {
+		log.Warn("failed to remove distribution", zap.Error(err))
+		return err
+	}
+
+	elapsed := time.Since(startTs)
+	log.Info("remove distribution done", zap.Duration("elapsed", elapsed))
+
+	return nil
+}
+
+func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.DescribeCollectionResponse, *querypb.LoadMetaInfo, *meta.DmChannel, error) {
+	collectionID := task.CollectionID()
+	shard := task.Shard()
+	log := log.Ctx(ctx)
+	collectionInfo, err := ex.broker.DescribeCollection(ctx, collectionID)
+	if err != nil {
+		log.Warn("failed to get collection info", zap.Error(err))
+		return nil, nil, nil, err
+	}
+	loadFields := ex.meta.GetLoadFields(ctx, task.CollectionID())
+	partitions, err := utils.GetPartitions(ctx, ex.targetMgr, collectionID)
+	if err != nil {
+		log.Warn("failed to get partitions of collection", zap.Error(err))
+		return nil, nil, nil, err
+	}
+
+	loadMeta := packLoadMeta(
+		ex.meta.GetLoadType(ctx, task.CollectionID()),
+		collectionInfo,
+		task.ResourceGroup(),
+		loadFields,
+		partitions...,
+	)
+
+	// get channel first, in case of target updated after segment info fetched
+	channel := ex.targetMgr.GetDmChannel(ctx, collectionID, shard, meta.NextTargetFirst)
+	if channel == nil {
+		return nil, nil, nil, merr.WrapErrChannelNotAvailable(shard)
+	}
+
+	return collectionInfo, loadMeta, channel, nil
+}
+
+func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int64, channel *meta.DmChannel, priority commonpb.LoadPriority) (*querypb.SegmentLoadInfo, []*indexpb.IndexInfo, error) {
+	log := log.Ctx(ctx)
+	segmentInfos, err := ex.broker.GetSegmentInfo(ctx, segmentID)
+	if err != nil || len(segmentInfos) == 0 {
+		log.Warn("failed to get segment info from DataCoord", zap.Error(err))
+		return nil, nil, err
+	}
+	segment := segmentInfos[0]
+	log = log.With(zap.String("level", segment.GetLevel().String()))
+
+	indexes, err := ex.broker.GetIndexInfo(ctx, collectionID, segment.GetID())
+	if err != nil {
+		if !errors.Is(err, merr.ErrIndexNotFound) {
+			log.Warn("failed to get index of segment", zap.Error(err))
+			return nil, nil, err
+		}
+		indexes = nil
+	}
+
+	// Get collection index info
+	indexInfos, err := ex.broker.ListIndexes(ctx, collectionID)
+	if err != nil {
+		log.Warn("fail to get index meta of collection", zap.Error(err))
+		return nil, nil, err
+	}
+	// update the field index params
+	for _, segmentIndex := range indexes[segment.GetID()] {
+		index, found := lo.Find(indexInfos, func(indexInfo *indexpb.IndexInfo) bool {
+			return indexInfo.IndexID == segmentIndex.IndexID
+		})
+		if !found {
+			log.Warn("no collection index info for the given segment index", zap.String("indexName", segmentIndex.GetIndexName()))
+		}
+
+		params := funcutil.KeyValuePair2Map(segmentIndex.GetIndexParams())
+		for _, kv := range index.GetUserIndexParams() {
+			if indexparams.IsConfigableIndexParam(kv.GetKey()) {
+				params[kv.GetKey()] = kv.GetValue()
+			}
+		}
+		segmentIndex.IndexParams = funcutil.Map2KeyValuePair(params)
+		segmentIndex.IndexParams = append(segmentIndex.IndexParams,
+			&commonpb.KeyValuePair{Key: common.LoadPriorityKey, Value: priority.String()})
+	}
+
+	loadInfo := utils.PackSegmentLoadInfo(segment, channel.GetSeekPosition(), indexes[segment.GetID()])
+	loadInfo.Priority = priority
+	return loadInfo, indexInfos, nil
 }

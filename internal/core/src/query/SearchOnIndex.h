@@ -12,7 +12,6 @@
 #pragma once
 
 #include "common/BitsetView.h"
-#include "knowhere/index/VecIndex.h"
 #include "query/SubSearchResult.h"
 #include "query/helper.h"
 #include "common/QueryInfo.h"
@@ -20,10 +19,13 @@
 
 namespace milvus::query {
 
-SubSearchResult
+void
 SearchOnIndex(const dataset::SearchDataset& search_dataset,
               const index::VectorIndex& indexing,
               const SearchInfo& search_conf,
-              const BitsetView& bitset);
+              const BitsetView& bitset,
+              milvus::OpContext* op_context,
+              SearchResult& search_result,
+              bool is_sparse = false);
 
 }  // namespace milvus::query

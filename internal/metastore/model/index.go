@@ -1,9 +1,10 @@
 package model
 
 import (
-	"github.com/golang/protobuf/proto"
-	"github.com/milvus-io/milvus/api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 )
 
 type Index struct {
@@ -101,7 +102,7 @@ func MarshalIndexModel(index *Index) *indexpb.FieldIndex {
 //	}
 //
 //	newIdx.IsDeleted = b.IsDeleted
-//	newIdx.CreateTime = b.CreateTime
+//	newIdx.CreatedUTCTime = b.CreatedUTCTime
 //
 //	if newIdx.Extra == nil && b.Extra != nil {
 //		newIdx.Extra = b.Extra

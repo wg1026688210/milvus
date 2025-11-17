@@ -18,28 +18,31 @@ package rootcoord
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"fmt"
 	"path"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/milvus-io/milvus/internal/common"
-
-	"github.com/milvus-io/milvus/internal/kv"
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/retry"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/kv"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/retry"
+	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-var (
-	// SuffixSnapshotTombstone special value for tombstone mark
-	SuffixSnapshotTombstone = []byte{0xE2, 0x9B, 0xBC}
-)
+// SuffixSnapshotTombstone special value for tombstone mark
+var SuffixSnapshotTombstone = []byte{0xE2, 0x9B, 0xBC}
 
 // IsTombstone used in migration tool also.
 func IsTombstone(value string) bool {
@@ -56,7 +59,7 @@ func ConstructTombstone() []byte {
 // SuffixSnapshot record timestamp as prefix of a key under the Snapshot prefix path
 type SuffixSnapshot struct {
 	// internal kv which SuffixSnapshot based on
-	kv.TxnKV
+	kv.MetaKv
 	// rw mutex provided range lock
 	sync.RWMutex
 	// lastestTS latest timestamp for each key
@@ -76,9 +79,10 @@ type SuffixSnapshot struct {
 	snapshotPrefix string
 	// snapshotLen pre calculated offset when parsing snapshot key
 	snapshotLen int
-	// exp is the shortcut format checker for ts-key
-	// composed with separator only
-	exp *regexp.Regexp
+
+	paginationSize int
+
+	closeGC chan struct{}
 }
 
 // tsv struct stores kv with timestamp
@@ -91,9 +95,9 @@ type tsv struct {
 var _ kv.SnapShotKV = (*SuffixSnapshot)(nil)
 
 // NewSuffixSnapshot creates a NewSuffixSnapshot with provided kv
-func NewSuffixSnapshot(txnKV kv.TxnKV, sep, root, snapshot string) (*SuffixSnapshot, error) {
-	if txnKV == nil {
-		return nil, retry.Unrecoverable(errors.New("txnKV is nil"))
+func NewSuffixSnapshot(metaKV kv.MetaKv, sep, root, snapshot string) (*SuffixSnapshot, error) {
+	if metaKV == nil {
+		return nil, retry.Unrecoverable(errors.New("MetaKv is nil"))
 	}
 
 	// handles trailing / logic
@@ -104,16 +108,19 @@ func NewSuffixSnapshot(txnKV kv.TxnKV, sep, root, snapshot string) (*SuffixSnaps
 	tk = path.Join(root, "k")
 	rootLen := len(tk) - 1
 
-	return &SuffixSnapshot{
-		TxnKV:          txnKV,
+	ss := &SuffixSnapshot{
+		MetaKv:         metaKV,
 		lastestTS:      make(map[string]typeutil.Timestamp),
 		separator:      sep,
-		exp:            regexp.MustCompile(fmt.Sprintf(`^(.+)%s(\d+)$`, sep)),
 		snapshotPrefix: snapshot,
 		snapshotLen:    snapshotLen,
 		rootPrefix:     root,
 		rootLen:        rootLen,
-	}, nil
+		paginationSize: paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(),
+		closeGC:        make(chan struct{}, 1),
+	}
+	go ss.startBackgroundGC(context.TODO())
+	return ss, nil
 }
 
 // isTombstone helper function to check whether is tombstone mark
@@ -153,12 +160,14 @@ func (ss *SuffixSnapshot) isTSKey(key string) (typeutil.Timestamp, bool) {
 		return 0, false
 	}
 	key = key[ss.snapshotLen:]
-	matches := ss.exp.FindStringSubmatch(key)
-	if len(matches) < 3 {
+	idx := strings.LastIndex(key, ss.separator)
+	if idx == -1 {
 		return 0, false
 	}
-	// err ignores since it's protected by the regexp
-	ts, _ := strconv.ParseUint(matches[2], 10, 64)
+	ts, err := strconv.ParseUint(key[idx+len(ss.separator):], 10, 64)
+	if err != nil {
+		return 0, false
+	}
 	return ts, true
 }
 
@@ -171,24 +180,26 @@ func (ss *SuffixSnapshot) isTSOfKey(key string, groupKey string) (typeutil.Times
 	}
 	key = key[ss.snapshotLen:]
 
-	matches := ss.exp.FindStringSubmatch(key)
-	if len(matches) < 3 {
+	idx := strings.LastIndex(key, ss.separator)
+	if idx == -1 {
 		return 0, false
 	}
-	if matches[1] != groupKey {
+	if key[:idx] != groupKey {
 		return 0, false
 	}
-	// err ignores since it's protected by the regexp
-	ts, _ := strconv.ParseUint(matches[2], 10, 64)
+	ts, err := strconv.ParseUint(key[idx+len(ss.separator):], 10, 64)
+	if err != nil {
+		return 0, false
+	}
 	return ts, true
 }
 
 // checkKeyTS checks provided key's latest ts is before provided ts
 // lock is needed
-func (ss *SuffixSnapshot) checkKeyTS(key string, ts typeutil.Timestamp) (bool, error) {
+func (ss *SuffixSnapshot) checkKeyTS(ctx context.Context, key string, ts typeutil.Timestamp) (bool, error) {
 	latest, has := ss.lastestTS[key]
 	if !has {
-		err := ss.loadLatestTS(key)
+		err := ss.loadLatestTS(ctx, key)
 		if err != nil {
 			return false, err
 		}
@@ -198,11 +209,11 @@ func (ss *SuffixSnapshot) checkKeyTS(key string, ts typeutil.Timestamp) (bool, e
 }
 
 // loadLatestTS load the loatest ts for specified key
-func (ss *SuffixSnapshot) loadLatestTS(key string) error {
+func (ss *SuffixSnapshot) loadLatestTS(ctx context.Context, key string) error {
 	prefix := ss.composeSnapshotPrefix(key)
-	keys, _, err := ss.TxnKV.LoadWithPrefix(prefix)
+	keys, _, err := ss.MetaKv.LoadWithPrefix(ctx, prefix)
 	if err != nil {
-		log.Warn("SuffixSnapshot txnkv LoadWithPrefix failed", zap.String("key", key),
+		log.Warn("SuffixSnapshot MetaKv LoadWithPrefix failed", zap.String("key", key),
 			zap.Error(err))
 		return err
 	}
@@ -244,7 +255,7 @@ func binarySearchRecords(records []tsv, ts typeutil.Timestamp) (string, bool) {
 	i, j := 0, len(records)
 	for i+1 < j {
 		k := (i + j) / 2
-		//log.Warn("", zap.Int("i", i), zap.Int("j", j), zap.Int("k", k))
+		// log.Warn("", zap.Int("i", i), zap.Int("j", j), zap.Int("k", k))
 		if records[k].ts == ts {
 			return records[k].value, true
 		}
@@ -259,14 +270,14 @@ func binarySearchRecords(records []tsv, ts typeutil.Timestamp) (string, bool) {
 }
 
 // Save stores key-value pairs with timestamp
-// if ts is 0, SuffixSnapshot works as a TxnKV
+// if ts == 0, SuffixSnapshot works as a MetaKv
 // otherwise, SuffixSnapshot will store a ts-key as "key[sep]ts"-value pair in snapshot path
 // and for acceleration store original key-value if ts is the latest
-func (ss *SuffixSnapshot) Save(key string, value string, ts typeutil.Timestamp) error {
-	// if ts == 0, act like TxnKv
+func (ss *SuffixSnapshot) Save(ctx context.Context, key string, value string, ts typeutil.Timestamp) error {
+	// if ts == 0, act like MetaKv
 	// will not update lastestTs since ts not not valid
 	if ts == 0 {
-		return ss.TxnKV.Save(key, value)
+		return ss.MetaKv.Save(ctx, key, value)
 	}
 
 	ss.Lock()
@@ -275,13 +286,13 @@ func (ss *SuffixSnapshot) Save(key string, value string, ts typeutil.Timestamp) 
 	tsKey := ss.composeTSKey(key, ts)
 
 	// provided key value is latest
-	// stores both tsKey and orignal key
-	after, err := ss.checkKeyTS(key, ts)
+	// stores both tsKey and original key
+	after, err := ss.checkKeyTS(ctx, key, ts)
 	if err != nil {
 		return err
 	}
 	if after {
-		err := ss.TxnKV.MultiSave(map[string]string{
+		err := ss.MetaKv.MultiSave(ctx, map[string]string{
 			key:   value,
 			tsKey: value,
 		})
@@ -293,14 +304,14 @@ func (ss *SuffixSnapshot) Save(key string, value string, ts typeutil.Timestamp) 
 	}
 
 	// modifying history key, just save tskey-value
-	return ss.TxnKV.Save(tsKey, value)
+	return ss.MetaKv.Save(ctx, tsKey, value)
 }
 
-func (ss *SuffixSnapshot) Load(key string, ts typeutil.Timestamp) (string, error) {
-	// if ts == 0, load latest by definition
+func (ss *SuffixSnapshot) Load(ctx context.Context, key string, ts typeutil.Timestamp) (string, error) {
+	// if ts == 0 or typeutil.MaxTimestamp, load latest by definition
 	// and with acceleration logic, just do load key will do
-	if ts == 0 {
-		value, err := ss.TxnKV.Load(key)
+	if ts == 0 || ts == typeutil.MaxTimestamp {
+		value, err := ss.MetaKv.Load(ctx, key)
 		if ss.isTombstone(value) {
 			return "", errors.New("no value found")
 		}
@@ -308,7 +319,7 @@ func (ss *SuffixSnapshot) Load(key string, ts typeutil.Timestamp) (string, error
 	}
 
 	ss.Lock()
-	after, err := ss.checkKeyTS(key, ts)
+	after, err := ss.checkKeyTS(ctx, key, ts)
 	ss.Unlock()
 
 	ss.RLock()
@@ -318,7 +329,7 @@ func (ss *SuffixSnapshot) Load(key string, ts typeutil.Timestamp) (string, error
 		return "", err
 	}
 	if after {
-		value, err := ss.TxnKV.Load(key)
+		value, err := ss.MetaKv.Load(ctx, key)
 		if ss.isTombstone(value) {
 			return "", errors.New("no value found")
 		}
@@ -327,9 +338,9 @@ func (ss *SuffixSnapshot) Load(key string, ts typeutil.Timestamp) (string, error
 
 	// before ts, do time travel
 	// 1. load all tsKey with key/ prefix
-	keys, values, err := ss.TxnKV.LoadWithPrefix(ss.composeSnapshotPrefix(key))
+	keys, values, err := ss.MetaKv.LoadWithPrefix(ctx, ss.composeSnapshotPrefix(key))
 	if err != nil {
-		log.Warn("prefixSnapshot txnKV LoadWithPrefix failed", zap.String("key", key), zap.Error(err))
+		log.Warn("prefixSnapshot MetaKv LoadWithPrefix failed", zap.String("key", key), zap.Error(err))
 		return "", err
 	}
 
@@ -352,7 +363,7 @@ func (ss *SuffixSnapshot) Load(key string, ts typeutil.Timestamp) (string, error
 
 	// 3. find i which ts[i] <= ts && ts[i+1] > ts
 	// corner cases like len(records)==0, ts < records[0].ts is covered in binarySearch
-	//binary search
+	// binary search
 	value, found := binarySearchRecords(records, ts)
 	if !found {
 		log.Warn("not found")
@@ -367,25 +378,25 @@ func (ss *SuffixSnapshot) Load(key string, ts typeutil.Timestamp) (string, error
 }
 
 // MultiSave save multiple kvs
-// if ts == 0, act like TxnKV
+// if ts == 0, act like MetaKv
 // each key-value will be treated using same logic like Save
-func (ss *SuffixSnapshot) MultiSave(kvs map[string]string, ts typeutil.Timestamp) error {
-	// if ts == 0, act like TxnKV
+func (ss *SuffixSnapshot) MultiSave(ctx context.Context, kvs map[string]string, ts typeutil.Timestamp) error {
+	// if ts == 0, act like MetaKv
 	if ts == 0 {
-		return ss.TxnKV.MultiSave(kvs)
+		return ss.MetaKv.MultiSave(ctx, kvs)
 	}
 	ss.Lock()
 	defer ss.Unlock()
 	var err error
 
 	// process each key, checks whether is the latest
-	execute, updateList, err := ss.generateSaveExecute(kvs, ts)
+	execute, updateList, err := ss.generateSaveExecute(ctx, kvs, ts)
 	if err != nil {
 		return err
 	}
 
 	// multi save execute map; if succeeds, update ts in the update list
-	err = ss.TxnKV.MultiSave(execute)
+	err = ss.MetaKv.MultiSave(ctx, execute)
 	if err == nil {
 		for _, key := range updateList {
 			ss.lastestTS[key] = ts
@@ -396,7 +407,7 @@ func (ss *SuffixSnapshot) MultiSave(kvs map[string]string, ts typeutil.Timestamp
 
 // generateSaveExecute examine each key is the after the corresponding latest
 // returns calculated execute map and update ts list
-func (ss *SuffixSnapshot) generateSaveExecute(kvs map[string]string, ts typeutil.Timestamp) (map[string]string, []string, error) {
+func (ss *SuffixSnapshot) generateSaveExecute(ctx context.Context, kvs map[string]string, ts typeutil.Timestamp) (map[string]string, []string, error) {
 	var after bool
 	var err error
 	execute := make(map[string]string)
@@ -404,8 +415,8 @@ func (ss *SuffixSnapshot) generateSaveExecute(kvs map[string]string, ts typeutil
 	for key, value := range kvs {
 		tsKey := ss.composeTSKey(key, ts)
 		// provided key value is latest
-		// stores both tsKey and orignal key
-		after, err = ss.checkKeyTS(key, ts)
+		// stores both tsKey and original key
+		after, err = ss.checkKeyTS(ctx, key, ts)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -421,112 +432,163 @@ func (ss *SuffixSnapshot) generateSaveExecute(kvs map[string]string, ts typeutil
 }
 
 // LoadWithPrefix load keys with provided prefix and returns value in the ts
-func (ss *SuffixSnapshot) LoadWithPrefix(key string, ts typeutil.Timestamp) ([]string, []string, error) {
+func (ss *SuffixSnapshot) LoadWithPrefix(ctx context.Context, key string, ts typeutil.Timestamp) ([]string, []string, error) {
 	// ts 0 case shall be treated as fetch latest/current value
-	if ts == 0 {
-		keys, values, err := ss.TxnKV.LoadWithPrefix(key)
-		fks := keys[:0]   //make([]string, 0, len(keys))
-		fvs := values[:0] //make([]string, 0, len(values))
+	if ts == 0 || ts == typeutil.MaxTimestamp {
+		fks := make([]string, 0)
+		fvs := make([]string, 0)
 		// hide rootPrefix from return value
-		for i, k := range keys {
+		applyFn := func(key []byte, value []byte) error {
 			// filters tombstone
-			if ss.isTombstone(values[i]) {
-				continue
+			if ss.isTombstone(string(value)) {
+				return nil
 			}
-			fks = append(fks, ss.hideRootPrefix(k))
-			fvs = append(fvs, values[i])
+			fks = append(fks, ss.hideRootPrefix(string(key)))
+			fvs = append(fvs, string(value))
+			return nil
 		}
+
+		err := ss.MetaKv.WalkWithPrefix(ctx, key, ss.paginationSize, applyFn)
 		return fks, fvs, err
 	}
 	ss.Lock()
 	defer ss.Unlock()
 
-	keys, values, err := ss.TxnKV.LoadWithPrefix(key)
+	resultKeys := make([]string, 0)
+	resultValues := make([]string, 0)
+
+	latestOriginalKey := ""
+	tValueGroups := make([]tsv, 0)
+
+	prefix := path.Join(ss.snapshotPrefix, key)
+	appendResultFn := func(ts typeutil.Timestamp) {
+		value, ok := binarySearchRecords(tValueGroups, ts)
+		if !ok || ss.isTombstone(value) {
+			return
+		}
+
+		resultKeys = append(resultKeys, latestOriginalKey)
+		resultValues = append(resultValues, value)
+	}
+
+	err := ss.MetaKv.WalkWithPrefix(ctx, prefix, ss.paginationSize, func(k []byte, v []byte) error {
+		sKey := string(k)
+		sValue := string(v)
+
+		snapshotKey := ss.hideRootPrefix(sKey)
+		curOriginalKey, err := ss.getOriginalKey(snapshotKey)
+		if err != nil {
+			return err
+		}
+
+		// reset if starting look up a new key group
+		if latestOriginalKey != "" && latestOriginalKey != curOriginalKey {
+			appendResultFn(ts)
+			tValueGroups = make([]tsv, 0)
+		}
+
+		targetTs, ok := ss.isTSKey(snapshotKey)
+		if !ok {
+			log.Warn("skip key because it doesn't contain ts", zap.String("key", key))
+			return nil
+		}
+
+		tValueGroups = append(tValueGroups, tsv{value: sValue, ts: targetTs})
+		latestOriginalKey = curOriginalKey
+		return nil
+	})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// kv group stands for
-	type kvgroup struct {
-		key, value string
-		processed  bool
-		tsRecords  []tsv
-	}
-	groups := make([]kvgroup, 0, len(keys))
-	for i, key := range keys {
-		group := kvgroup{key: key, value: values[i]}
-		// load prefix keys contains rootPrefix
-		sKeys, sValues, err := ss.TxnKV.LoadWithPrefix(ss.composeSnapshotPrefix(ss.hideRootPrefix(key)))
-		if err != nil {
-			return nil, nil, err
-		}
-		group.tsRecords = make([]tsv, 0, len(sKeys))
-		for j, sKey := range sKeys {
-			ts, ok := ss.isTSOfKey(ss.hideRootPrefix(sKey), ss.hideRootPrefix(key))
-			if ok {
-				group.tsRecords = append(group.tsRecords, tsv{ts: ts, value: sValues[j]})
-			}
-		}
-		groups = append(groups, group)
-	}
-
-	resultKeys := make([]string, 0, len(groups))
-	resultValues := make([]string, 0, len(groups))
-	// for each group, do ts travel logic if appliable
-	for _, group := range groups {
-		if len(group.tsRecords) == 0 {
-			// not ts maybe, just use k,v
-			resultKeys = append(resultKeys, group.key)
-			resultValues = append(resultValues, group.value)
-			continue
-		}
-		value, ok := binarySearchRecords(group.tsRecords, ts)
-		if ok {
-			// tombstone found, skip entry
-			if ss.isTombstone(value) {
-				continue
-			}
-			resultKeys = append(resultKeys, group.key)
-			resultValues = append(resultValues, value)
-		}
-	}
-
-	// hide rootPrefix from return value
-	for i, k := range resultKeys {
-		resultKeys[i] = ss.hideRootPrefix(k)
-	}
-
+	appendResultFn(ts)
 	return resultKeys, resultValues, nil
 }
 
-// MultiSaveAndRemoveWithPrefix save muiltple kvs and remove as well
-// if ts == 0, act like TxnKV
+// MultiSaveAndRemove save muiltple kvs and remove as well
+// if ts == 0, act like MetaKv
 // each key-value will be treated in same logic like Save
-func (ss *SuffixSnapshot) MultiSaveAndRemoveWithPrefix(saves map[string]string, removals []string, ts typeutil.Timestamp) error {
-	// if ts == 0, act like TxnKV
+func (ss *SuffixSnapshot) MultiSaveAndRemove(ctx context.Context, saves map[string]string, removals []string, ts typeutil.Timestamp) error {
+	// if ts == 0, act like MetaKv
 	if ts == 0 {
-		return ss.TxnKV.MultiSaveAndRemoveWithPrefix(saves, removals)
+		return ss.MetaKv.MultiSaveAndRemove(ctx, saves, removals)
 	}
 	ss.Lock()
 	defer ss.Unlock()
 	var err error
 
 	// process each key, checks whether is the latest
-	execute, updateList, err := ss.generateSaveExecute(saves, ts)
+	execute, updateList, err := ss.generateSaveExecute(ctx, saves, ts)
 	if err != nil {
 		return err
 	}
 
 	// load each removal, change execution to adding tombstones
 	for _, removal := range removals {
-		keys, _, err := ss.TxnKV.LoadWithPrefix(removal)
+		// if save batch contains removal, skip remove op
+		if _, ok := execute[removal]; ok {
+			continue
+		}
+		value, err := ss.MetaKv.Load(ctx, removal)
 		if err != nil {
-			log.Warn("SuffixSnapshot TxnKV LoadwithPrefix failed", zap.String("key", removal), zap.Error(err))
+			log.Warn("SuffixSnapshot MetaKv Load failed", zap.String("key", removal), zap.Error(err))
+			if errors.Is(err, merr.ErrIoKeyNotFound) {
+				continue
+			}
+			return err
+		}
+		// add tombstone to original key and add ts entry
+		if IsTombstone(value) {
+			continue
+		}
+		execute[removal] = string(SuffixSnapshotTombstone)
+		execute[ss.composeTSKey(removal, ts)] = string(SuffixSnapshotTombstone)
+		updateList = append(updateList, removal)
+	}
+
+	maxTxnNum := paramtable.Get().MetaStoreCfg.MaxEtcdTxnNum.GetAsInt()
+	err = etcd.SaveByBatchWithLimit(execute, maxTxnNum, func(partialKvs map[string]string) error {
+		return ss.MetaKv.MultiSave(ctx, partialKvs)
+	})
+	if err == nil {
+		for _, key := range updateList {
+			ss.lastestTS[key] = ts
+		}
+	}
+	return err
+}
+
+// MultiSaveAndRemoveWithPrefix save muiltple kvs and remove as well
+// if ts == 0, act like MetaKv
+// each key-value will be treated in same logic like Save
+func (ss *SuffixSnapshot) MultiSaveAndRemoveWithPrefix(ctx context.Context, saves map[string]string, removals []string, ts typeutil.Timestamp) error {
+	// if ts == 0, act like MetaKv
+	if ts == 0 {
+		return ss.MetaKv.MultiSaveAndRemoveWithPrefix(ctx, saves, removals)
+	}
+	ss.Lock()
+	defer ss.Unlock()
+	var err error
+
+	// process each key, checks whether is the latest
+	execute, updateList, err := ss.generateSaveExecute(ctx, saves, ts)
+	if err != nil {
+		return err
+	}
+
+	// load each removal, change execution to adding tombstones
+	for _, removal := range removals {
+		keys, values, err := ss.MetaKv.LoadWithPrefix(ctx, removal)
+		if err != nil {
+			log.Warn("SuffixSnapshot MetaKv LoadwithPrefix failed", zap.String("key", removal), zap.Error(err))
 			return err
 		}
 
-		// add tombstone to orignal key and add ts entry
-		for _, key := range keys {
+		// add tombstone to original key and add ts entry
+		for idx, key := range keys {
+			if IsTombstone(values[idx]) {
+				continue
+			}
 			key = ss.hideRootPrefix(key)
 			execute[key] = string(SuffixSnapshotTombstone)
 			execute[ss.composeTSKey(key, ts)] = string(SuffixSnapshotTombstone)
@@ -535,11 +597,151 @@ func (ss *SuffixSnapshot) MultiSaveAndRemoveWithPrefix(saves map[string]string, 
 	}
 
 	// multi save execute map; if succeeds, update ts in the update list
-	err = ss.TxnKV.MultiSave(execute)
+	err = ss.MetaKv.MultiSave(ctx, execute)
 	if err == nil {
 		for _, key := range updateList {
 			ss.lastestTS[key] = ts
 		}
 	}
 	return err
+}
+
+func (ss *SuffixSnapshot) Close() {
+	close(ss.closeGC)
+}
+
+// startBackgroundGC the data will clean up if key ts!=0 and expired
+func (ss *SuffixSnapshot) startBackgroundGC(ctx context.Context) {
+	log := log.Ctx(ctx)
+	log.Debug("suffix snapshot GC goroutine start!")
+	ticker := time.NewTicker(60 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ss.closeGC:
+			log.Warn("quit suffix snapshot GC goroutine!")
+			return
+		case now := <-ticker.C:
+			err := ss.removeExpiredKvs(ctx, now)
+			if err != nil {
+				log.Warn("remove expired data fail during GC", zap.Error(err))
+			}
+		}
+	}
+}
+
+func (ss *SuffixSnapshot) getOriginalKey(snapshotKey string) (string, error) {
+	if !strings.HasPrefix(snapshotKey, ss.snapshotPrefix) {
+		return "", fmt.Errorf("get original key failed, invaild snapshot key:%s", snapshotKey)
+	}
+	// collect keys that parent node is snapshot node if the corresponding the latest ts is expired.
+	idx := strings.LastIndex(snapshotKey, ss.separator)
+	if idx == -1 {
+		return "", fmt.Errorf("get original key failed, snapshot key:%s", snapshotKey)
+	}
+	prefix := snapshotKey[:idx]
+	return prefix[ss.snapshotLen:], nil
+}
+
+func (ss *SuffixSnapshot) batchRemoveExpiredKvs(ctx context.Context, keyGroup []string, originalKey string, includeOriginalKey bool) error {
+	if includeOriginalKey {
+		keyGroup = append(keyGroup, originalKey)
+	}
+
+	// to protect txn finished with ascend order, reverse the latest kv with tombstone to tail of array
+	sort.Strings(keyGroup)
+	if !includeOriginalKey && len(keyGroup) > 0 {
+		// keep the latest snapshot key for historical version compatibility
+		keyGroup = keyGroup[0 : len(keyGroup)-1]
+	}
+	removeFn := func(partialKeys []string) error {
+		return ss.MetaKv.MultiRemove(ctx, partialKeys)
+	}
+	maxTxnNum := paramtable.Get().MetaStoreCfg.MaxEtcdTxnNum.GetAsInt()
+	return etcd.RemoveByBatchWithLimit(keyGroup, maxTxnNum, removeFn)
+}
+
+// removeExpiredKvs removes expired key-value pairs from the snapshot
+// It walks through all keys with the snapshot prefix, groups them by original key,
+// and removes expired versions or all versions if the original key has been deleted
+func (ss *SuffixSnapshot) removeExpiredKvs(ctx context.Context, now time.Time) error {
+	log := log.Ctx(ctx)
+	ttlTime := paramtable.Get().ServiceParam.MetaStoreCfg.SnapshotTTLSeconds.GetAsDuration(time.Second)
+	reserveTime := paramtable.Get().ServiceParam.MetaStoreCfg.SnapshotReserveTimeSeconds.GetAsDuration(time.Second)
+
+	candidateExpiredKeys := make([]string, 0)
+	latestOriginalKey := ""
+	latestOriginValue := ""
+	totalVersions := 0
+
+	// cleanFn processes a group of keys for a single original key
+	cleanFn := func(curOriginalKey string) error {
+		if curOriginalKey == "" {
+			return nil
+		}
+		if ss.isTombstone(latestOriginValue) {
+			// If deleted, remove all versions including the original key
+			return ss.batchRemoveExpiredKvs(ctx, candidateExpiredKeys, curOriginalKey, totalVersions == len(candidateExpiredKeys))
+		}
+
+		// If not deleted, check for expired versions
+		expiredKeys := make([]string, 0)
+		for _, key := range candidateExpiredKeys {
+			ts, _ := ss.isTSKey(key)
+			expireTime, _ := tsoutil.ParseTS(ts)
+			if expireTime.Add(ttlTime).Before(now) {
+				expiredKeys = append(expiredKeys, key)
+			}
+		}
+		if len(expiredKeys) > 0 {
+			return ss.batchRemoveExpiredKvs(ctx, expiredKeys, curOriginalKey, false)
+		}
+		return nil
+	}
+
+	// Walk through all keys with the snapshot prefix
+	err := ss.MetaKv.WalkWithPrefix(ctx, ss.snapshotPrefix, ss.paginationSize, func(k []byte, v []byte) error {
+		key := ss.hideRootPrefix(string(k))
+		ts, ok := ss.isTSKey(key)
+		if !ok {
+			log.Warn("Skip key because it doesn't contain ts", zap.String("key", key))
+			return nil
+		}
+
+		curOriginalKey, err := ss.getOriginalKey(key)
+		if err != nil {
+			log.Error("Failed to parse the original key for GC", zap.String("key", key), zap.Error(err))
+			return err
+		}
+
+		// If we've moved to a new original key, process the previous group
+		if latestOriginalKey != "" && latestOriginalKey != curOriginalKey {
+			if err := cleanFn(latestOriginalKey); err != nil {
+				return err
+			}
+
+			candidateExpiredKeys = make([]string, 0)
+			totalVersions = 0
+		}
+
+		latestOriginalKey = curOriginalKey
+		latestOriginValue = string(v)
+		totalVersions++
+
+		// Record versions that are already expired but not removed
+		time, _ := tsoutil.ParseTS(ts)
+		if time.Add(reserveTime).Before(now) {
+			candidateExpiredKeys = append(candidateExpiredKeys, key)
+		}
+
+		return nil
+	})
+	if err != nil {
+		log.Error("Error occurred during WalkWithPrefix", zap.Error(err))
+		return err
+	}
+
+	// Process the last group of keys
+	return cleanFn(latestOriginalKey)
 }

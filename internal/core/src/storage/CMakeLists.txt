@@ -6,7 +6,7 @@
 # "License"); you may not use this file except in compliance
 # with the License. You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,47 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-option( EMBEDDED_MILVUS "Enable embedded Milvus" OFF )
+add_source_at_current_directory()
 
-if ( EMBEDDED_MILVUS )
-    add_compile_definitions( EMBEDDED_MILVUS )
+if (ENABLE_GCP_NATIVE)
+    add_definitions(-DENABLE_GCP_NATIVE)
+    add_subdirectory(gcp-native-storage)
 endif()
 
-milvus_add_pkg_config("milvus_storage")
-
-set(STORAGE_FILES
-        parquet_c.cpp
-        PayloadStream.cpp
-        DataCodec.cpp
-        Util.cpp
-        PayloadReader.cpp
-        PayloadWriter.cpp
-        FieldData.cpp
-        IndexData.cpp
-        InsertData.cpp
-        Event.cpp
-        storage_c.cpp)
-
-if ( BUILD_DISK_ANN STREQUAL "ON" )
-    set(STORAGE_FILES
-            ${STORAGE_FILES}
-            LocalChunkManager.cpp
-            MinioChunkManager.cpp
-            DiskFileManagerImpl.cpp)
-endif ()
-
-add_library(milvus_storage SHARED ${STORAGE_FILES})
-
-find_package(Boost REQUIRED COMPONENTS filesystem)
-
-if ( BUILD_DISK_ANN STREQUAL "ON" )
-    target_link_libraries( milvus_storage PUBLIC milvus_common Boost::filesystem aws-cpp-sdk-s3 pthread)
-else()
-    target_link_libraries( milvus_storage PUBLIC milvus_common Boost::filesystem pthread)
+if (ENABLE_AZURE_FS)
+    set(AZURE_BUILD_DIR ON)
+    add_definitions(-DAZURE_BUILD_DIR)
+    add_subdirectory(azure)
 endif()
 
-if(NOT CMAKE_INSTALL_PREFIX)
-    set(CMAKE_INSTALL_PREFIX ${CMAKE_CURRENT_BINARY_DIR})
+if(USE_OPENDAL)
+    include_directories(${OPENDAL_INCLUDE_DIR})
+    set(SOURCE_FILES ${SOURCE_FILES} opendal/OpenDALChunkManager.cpp)
 endif()
 
-install(TARGETS  milvus_storage DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+# Add loon_ffi subdirectory to include loon FFI source files
+add_subdirectory(loon_ffi)
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/loon_ffi)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/plugin)
+
+add_library(milvus_storage OBJECT ${SOURCE_FILES})

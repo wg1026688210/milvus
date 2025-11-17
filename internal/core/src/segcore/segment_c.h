@@ -20,35 +20,92 @@ extern "C" {
 #include <stdint.h>
 
 #include "common/type_c.h"
+#include "futures/future_c.h"
 #include "segcore/plan_c.h"
 #include "segcore/load_index_c.h"
+#include "segcore/load_field_data_c.h"
 
-typedef void* CSegmentInterface;
 typedef void* CSearchResult;
 typedef CProto CRetrieveResult;
 
 //////////////////////////////    common interfaces    //////////////////////////////
-CSegmentInterface
-NewSegment(CCollection collection, SegmentType seg_type, int64_t segment_id);
+CStatus
+NewSegment(CCollection collection,
+           SegmentType seg_type,
+           int64_t segment_id,
+           CSegmentInterface* newSegment,
+           bool is_sorted_by_pk);
+
+/**
+ * @brief Create a new segment with pre-loaded segment information
+ * This function creates a segment and initializes it with serialized load info,
+ * which can include precomputed metadata, statistics, or configuration data
+ *
+ * @param collection: The collection that this segment belongs to
+ * @param seg_type: Type of the segment (growing, sealed, etc.)
+ * @param segment_id: Unique identifier for this segment
+ * @param newSegment: Output parameter for the created segment interface
+ * @param is_sorted_by_pk: Whether the segment data is sorted by primary key
+ * @param load_info_blob: Serialized load information blob
+ * @param load_info_length: Length of the load_info_blob in bytes
+ * @return CStatus indicating success or failure
+ */
+CStatus
+NewSegmentWithLoadInfo(CCollection collection,
+                       SegmentType seg_type,
+                       int64_t segment_id,
+                       CSegmentInterface* newSegment,
+                       bool is_sorted_by_pk,
+                       const uint8_t* load_info_blob,
+                       const int64_t load_info_length);
+/**
+ * @brief Dispatch a segment manage load task.
+ * This function make segment itself load index & field data according to load info previously set.
+ *
+ * @param c_trace: tracing context param
+ * @param c_segment: segment handle indicate which segment to load
+ * @return CStatus indicating success or failure
+ */
+CStatus
+SegmentLoad(CTraceContext c_trace, CSegmentInterface c_segment);
 
 void
 DeleteSegment(CSegmentInterface c_segment);
 
 void
+ClearSegmentData(CSegmentInterface c_segment);
+
+void
 DeleteSearchResult(CSearchResult search_result);
 
-CStatus
-Search(CSegmentInterface c_segment,
-       CSearchPlan c_plan,
-       CPlaceholderGroup c_placeholder_group,
-       uint64_t timestamp,
-       CSearchResult* result);
+CFuture*  // Future<CSearchResultBody>
+AsyncSearch(CTraceContext c_trace,
+            CSegmentInterface c_segment,
+            CSearchPlan c_plan,
+            CPlaceholderGroup c_placeholder_group,
+            uint64_t timestamp,
+            int32_t consistency_level,
+            uint64_t collection_ttl);
 
 void
 DeleteRetrieveResult(CRetrieveResult* retrieve_result);
 
-CStatus
-Retrieve(CSegmentInterface c_segment, CRetrievePlan c_plan, uint64_t timestamp, CRetrieveResult* result);
+CFuture*  // Future<CRetrieveResult>
+AsyncRetrieve(CTraceContext c_trace,
+              CSegmentInterface c_segment,
+              CRetrievePlan c_plan,
+              uint64_t timestamp,
+              int64_t limit_size,
+              bool ignore_non_pk,
+              int32_t consistency_level,
+              uint64_t collection_ttl);
+
+CFuture*  // Future<CRetrieveResult>
+AsyncRetrieveByOffsets(CTraceContext c_trace,
+                       CSegmentInterface c_segment,
+                       CRetrievePlan c_plan,
+                       int64_t* offsets,
+                       int64_t len);
 
 int64_t
 GetMemoryUsageInBytes(CSegmentInterface c_segment);
@@ -61,6 +118,12 @@ GetDeletedCount(CSegmentInterface c_segment);
 
 int64_t
 GetRealCount(CSegmentInterface c_segment);
+
+bool
+HasRawData(CSegmentInterface c_segment, int64_t field_id);
+
+bool
+HasFieldData(CSegmentInterface c_segment, int64_t field_id);
 
 //////////////////////////////    interfaces for growing segment    //////////////////////////////
 CStatus
@@ -77,31 +140,77 @@ PreInsert(CSegmentInterface c_segment, int64_t size, int64_t* offset);
 
 //////////////////////////////    interfaces for sealed segment    //////////////////////////////
 CStatus
-LoadFieldData(CSegmentInterface c_segment, CLoadFieldDataInfo load_field_data_info);
+LoadFieldData(CSegmentInterface c_segment,
+              CLoadFieldDataInfo load_field_data_info);
 
 CStatus
-LoadDeletedRecord(CSegmentInterface c_segment, CLoadDeletedRecordInfo deleted_record_info);
+LoadDeletedRecord(CSegmentInterface c_segment,
+                  CLoadDeletedRecordInfo deleted_record_info);
 
 CStatus
-UpdateSealedSegmentIndex(CSegmentInterface c_segment, CLoadIndexInfo c_load_index_info);
+UpdateSealedSegmentIndex(CSegmentInterface c_segment,
+                         CLoadIndexInfo c_load_index_info);
 
+CStatus
+LoadTextIndex(CSegmentInterface c_segment,
+              const uint8_t* serialized_load_text_index_info,
+              const uint64_t len);
+
+CStatus
+LoadJsonKeyIndex(CTraceContext c_trace,
+                 CSegmentInterface c_segment,
+                 const uint8_t* serialied_load_json_key_index_info,
+                 const uint64_t len);
+
+CStatus
+UpdateFieldRawDataSize(CSegmentInterface c_segment,
+                       int64_t field_id,
+                       int64_t num_rows,
+                       int64_t field_data_size);
+
+// This function is currently used only in test.
+// Current implement supports only dropping of non-system fields.
 CStatus
 DropFieldData(CSegmentInterface c_segment, int64_t field_id);
 
 CStatus
 DropSealedSegmentIndex(CSegmentInterface c_segment, int64_t field_id);
 
+CStatus
+DropSealedSegmentJSONIndex(CSegmentInterface c_segment,
+                           int64_t field_id,
+                           const char* nested_path);
+
+CStatus
+AddFieldDataInfoForSealed(CSegmentInterface c_segment,
+                          CLoadFieldDataInfo c_load_field_data_info);
+
 //////////////////////////////    interfaces for SegmentInterface    //////////////////////////////
 CStatus
+ExistPk(CSegmentInterface c_segment,
+        const uint8_t* raw_ids,
+        const uint64_t size,
+        bool* results);
+
+CStatus
 Delete(CSegmentInterface c_segment,
-       int64_t reserved_offset,
        int64_t size,
        const uint8_t* ids,
        const uint64_t ids_size,
        const uint64_t* timestamps);
 
-int64_t
-PreDelete(CSegmentInterface c_segment, int64_t size);
+void
+RemoveFieldFile(CSegmentInterface c_segment, int64_t field_id);
+
+CStatus
+CreateTextIndex(CSegmentInterface c_segment, int64_t field_id);
+
+CStatus
+FinishLoad(CSegmentInterface c_segment);
+
+CStatus
+ExprResCacheEraseSegment(int64_t segment_id);
+
 #ifdef __cplusplus
 }
 #endif

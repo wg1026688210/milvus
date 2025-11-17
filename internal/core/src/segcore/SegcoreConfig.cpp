@@ -11,7 +11,7 @@
 
 #include "common/Schema.h"
 #include "SegcoreConfig.h"
-#include "utils/Json.h"
+#include "common/Json.h"
 #include "yaml-cpp/yaml.h"
 
 namespace milvus::segcore {
@@ -37,7 +37,7 @@ apply_parser(const YAML::Node& node, Func func) {
             results.emplace_back(func(element));
         }
     } else {
-        PanicInfo("node should be scalar or sequence");
+        ThrowInfo(ConfigInvalid, "node should be scalar or sequence");
     }
     return results;
 }
@@ -100,8 +100,9 @@ SegcoreConfig::parse_from(const std::string& config_path) {
     } catch (const SegcoreError& e) {
         throw e;
     } catch (const std::exception& e) {
-        std::string str = std::string("Invalid Yaml: ") + config_path + ", err: " + e.what();
-        PanicInfo(str);
+        std::string str =
+            std::string("Invalid Yaml: ") + config_path + ", err: " + e.what();
+        ThrowInfo(ConfigInvalid, str);
     }
 }
 

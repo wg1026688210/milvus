@@ -16,23 +16,25 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <mutex>
 #include <shared_mutex>
 
+#include "common/JsonCastType.h"
+#include "common/Types.h"
 #include "common/type_c.h"
-#include "config/ConfigChunkManager.h"
 #include "index/Index.h"
 #include "index/ScalarIndex.h"
 #include "index/VectorIndex.h"
 #include "index/IndexInfo.h"
 #include "storage/Types.h"
 #include "storage/FileManager.h"
-
-#ifdef BUILD_DISK_ANN
-#include "storage/LocalChunkManager.h"
-#include "storage/MinioChunkManager.h"
-#endif
+#include "index/StringIndexMarisa.h"
+#include "index/ScalarIndexSort.h"
+#include "index/StringIndexMarisa.h"
+#include "index/BoolIndex.h"
+#include "segcore/load_index_c.h"
 
 namespace milvus::index {
 
@@ -52,23 +54,99 @@ class IndexFactory {
         return instance;
     }
 
-    IndexBasePtr
-    CreateIndex(const CreateIndexInfo& create_index_info, storage::FileManagerImplPtr file_manager);
+    LoadResourceRequest
+    IndexLoadResource(DataType field_type,
+                      DataType element_type,
+                      IndexVersion index_version,
+                      uint64_t index_size_in_bytes,
+                      const std::map<std::string, std::string>& index_params,
+                      bool mmap_enable,
+                      int64_t num_rows,
+                      int64_t dim);
+
+    LoadResourceRequest
+    VecIndexLoadResource(DataType field_type,
+                         DataType element_type,
+                         IndexVersion index_version,
+                         uint64_t index_size_in_bytes,
+                         const std::map<std::string, std::string>& index_params,
+                         bool mmap_enable,
+                         int64_t num_rows,
+                         int64_t dim);
+
+    LoadResourceRequest
+    ScalarIndexLoadResource(
+        DataType field_type,
+        IndexVersion index_version,
+        uint64_t index_size_in_bytes,
+        const std::map<std::string, std::string>& index_params,
+        bool mmap_enable);
 
     IndexBasePtr
-    CreateVectorIndex(const CreateIndexInfo& create_index_info, storage::FileManagerImplPtr file_manager);
+    CreateIndex(const CreateIndexInfo& create_index_info,
+                const storage::FileManagerContext& file_manager_context,
+                bool use_build_pool = true);
 
     IndexBasePtr
-    CreateScalarIndex(const CreateIndexInfo& create_index_info);
+    CreateVectorIndex(const CreateIndexInfo& create_index_info,
+                      const storage::FileManagerContext& file_manager_context,
+                      bool use_knowhere_build_pool_ = true);
 
-    //    IndexBasePtr
-    //    CreateIndex(DataType dtype, const IndexType& index_type, const IndexMode& index_mode = IndexMode::MODE_CPU);
+    // For base types like int, float, double, string, etc
+    IndexBasePtr
+    CreatePrimitiveScalarIndex(
+        DataType data_type,
+        const CreateIndexInfo& create_index_info,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
+    // Create ngram index
+    IndexBasePtr
+    CreateNgramIndex(DataType data_type,
+                     const NgramParams& params,
+                     const storage::FileManagerContext& file_manager_context =
+                         storage::FileManagerContext());
+
+    // For types like array, struct, union, etc
+    IndexBasePtr
+    CreateCompositeScalarIndex(
+        const CreateIndexInfo& create_index_info,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
+    // For types like Json, XML, etc
+    IndexBasePtr
+    CreateComplexScalarIndex(
+        IndexType index_type,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
+    IndexBasePtr
+    CreateJsonIndex(const CreateIndexInfo& create_index_info,
+                    const storage::FileManagerContext& file_manager_context =
+                        storage::FileManagerContext());
+
+    IndexBasePtr
+    CreateGeometryIndex(
+        IndexType index_type,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
+    IndexBasePtr
+    CreateScalarIndex(const CreateIndexInfo& create_index_info,
+                      const storage::FileManagerContext& file_manager_context =
+                          storage::FileManagerContext());
+
+    // IndexBasePtr
+    // CreateIndex(DataType dtype, const IndexType& index_type);
  private:
+    FRIEND_TEST(StringIndexMarisaTest, Reverse);
+
     template <typename T>
     ScalarIndexPtr<T>
-    CreateScalarIndex(const IndexType& index_type);
+    CreatePrimitiveScalarIndex(const CreateIndexInfo& create_index_info,
+                               const storage::FileManagerContext& file_manager =
+                                   storage::FileManagerContext());
 };
 
 }  // namespace milvus::index
-
-#include "index/IndexFactory-inl.h"

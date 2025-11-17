@@ -3,13 +3,22 @@ package meta
 import (
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/metastore/model"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/cmd/tools/migration/allocator"
+	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
 	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 func alias210ToAlias220(record *pb.CollectionInfo, ts Timestamp) *model.Alias {
@@ -95,6 +104,40 @@ func (meta *CollectionsMeta210) to220() (CollectionsMeta220, FieldIndexes210, er
 	return collections, fieldIndexes, nil
 }
 
+func (meta *CollectionLoadInfo210) to220() (CollectionLoadInfo220, PartitionLoadInfo220, error) {
+	collectionLoadInfos := make(CollectionLoadInfo220)
+	partitionLoadInfos := make(PartitionLoadInfo220)
+	for collectionID, loadInfo := range *meta {
+		if loadInfo.LoadPercentage < 100 {
+			continue
+		}
+
+		switch loadInfo.LoadType {
+		case querypb.LoadType_LoadCollection:
+			collectionLoadInfos[collectionID] = loadInfo
+		case querypb.LoadType_LoadPartition:
+			partitions, ok := partitionLoadInfos[collectionID]
+			if !ok {
+				partitions = make(map[int64]*model.PartitionLoadInfo)
+				partitionLoadInfos[collectionID] = partitions
+			}
+			for _, partitionID := range loadInfo.PartitionIDs {
+				partitions[partitionID] = &model.PartitionLoadInfo{
+					CollectionID:   collectionID,
+					PartitionID:    partitionID,
+					LoadType:       querypb.LoadType_LoadPartition,
+					LoadPercentage: 100,
+					Status:         querypb.LoadStatus_Loaded,
+					ReplicaNumber:  loadInfo.ReplicaNumber,
+					FieldIndexID:   make(map[UniqueID]UniqueID),
+				}
+			}
+		}
+	}
+
+	return collectionLoadInfos, partitionLoadInfos, nil
+}
+
 func combineToCollectionIndexesMeta220(fieldIndexes FieldIndexes210, collectionIndexes CollectionIndexesMeta210) (CollectionIndexesMeta220, error) {
 	indexes := make(CollectionIndexesMeta220)
 	for collectionID := range fieldIndexes {
@@ -116,16 +159,39 @@ func combineToCollectionIndexesMeta220(fieldIndexes FieldIndexes210, collectionI
 			if err != nil {
 				return nil, err
 			}
+			newIndexParamsMap := make(map[string]string)
+			for _, kv := range indexInfo.IndexParams {
+				if kv.Key == common.ParamsKey {
+					params, err := funcutil.JSONToMap(kv.Value)
+					if err != nil {
+						return nil, err
+					}
+					for k, v := range params {
+						newIndexParamsMap[k] = v
+					}
+				} else {
+					newIndexParamsMap[kv.Key] = kv.Value
+				}
+			}
+			newIndexParams := make([]*commonpb.KeyValuePair, 0)
+			for k, v := range newIndexParamsMap {
+				newIndexParams = append(newIndexParams, &commonpb.KeyValuePair{Key: k, Value: v})
+			}
+			newIndexName := indexInfo.GetIndexName()
+			if newIndexName == "_default_idx" {
+				newIndexName = "_default_idx_" + strconv.FormatInt(index.GetFiledID(), 10)
+			}
 			record := &model.Index{
-				TenantID:     "", // TODO: how to set this if we support mysql later?
-				CollectionID: collectionID,
-				FieldID:      index.GetFiledID(),
-				IndexID:      index.GetIndexID(),
-				IndexName:    indexInfo.GetIndexName(),
-				IsDeleted:    indexInfo.GetDeleted(),
-				CreateTime:   indexInfo.GetCreateTime(),
-				TypeParams:   field.GetTypeParams(),
-				IndexParams:  indexInfo.GetIndexParams(),
+				TenantID:        "",
+				CollectionID:    collectionID,
+				FieldID:         index.GetFiledID(),
+				IndexID:         index.GetIndexID(),
+				IndexName:       newIndexName,
+				IsDeleted:       indexInfo.GetDeleted(),
+				CreateTime:      indexInfo.GetCreateTime(),
+				TypeParams:      field.GetTypeParams(),
+				IndexParams:     newIndexParams,
+				UserIndexParams: indexInfo.GetIndexParams(),
 			}
 			indexes.AddRecord(collectionID, index.GetIndexID(), record)
 		}
@@ -133,35 +199,113 @@ func combineToCollectionIndexesMeta220(fieldIndexes FieldIndexes210, collectionI
 	return indexes, nil
 }
 
+func getOrFillBuildMeta(record *pb.SegmentIndexInfo, indexBuildMeta IndexBuildMeta210, alloc allocator.Allocator) (*legacypb.IndexMeta, error) {
+	if record.GetBuildID() == 0 && !record.GetEnableIndex() {
+		buildID, err := alloc.AllocID()
+		if err != nil {
+			return nil, err
+		}
+		buildMeta := &legacypb.IndexMeta{
+			IndexBuildID:   buildID,
+			State:          commonpb.IndexState_Finished,
+			FailReason:     "",
+			Req:            nil,
+			IndexFilePaths: nil,
+			MarkDeleted:    false,
+			NodeID:         0,
+			IndexVersion:   1, // TODO: maybe a constraint is better.
+			Recycled:       false,
+			SerializeSize:  0,
+		}
+		indexBuildMeta[buildID] = buildMeta
+		return buildMeta, nil
+	}
+	buildMeta, ok := indexBuildMeta[record.GetBuildID()]
+	if !ok {
+		return nil, fmt.Errorf("index build meta not found, segment id: %d, index id: %d, index build id: %d",
+			record.GetSegmentID(), record.GetIndexID(), record.GetBuildID())
+	}
+	return buildMeta, nil
+}
+
 func combineToSegmentIndexesMeta220(segmentIndexes SegmentIndexesMeta210, indexBuildMeta IndexBuildMeta210) (SegmentIndexesMeta220, error) {
+	alloc := allocator.NewAllocatorFromList(indexBuildMeta.GetAllBuildIDs(), false, true)
+
 	segmentIndexModels := make(SegmentIndexesMeta220)
 	for segID := range segmentIndexes {
 		for indexID := range segmentIndexes[segID] {
 			record := segmentIndexes[segID][indexID]
-			buildMeta, ok := indexBuildMeta[record.GetBuildID()]
-			if !ok {
-				return nil, fmt.Errorf("index build meta not found, segment id: %d, index id: %d, index build id: %d", segID, indexID, record.GetBuildID())
+			buildMeta, err := getOrFillBuildMeta(record, indexBuildMeta, alloc)
+			if err != nil {
+				return nil, err
 			}
+
+			fileKeys := make([]string, len(buildMeta.GetIndexFilePaths()))
+			for i, filePath := range buildMeta.GetIndexFilePaths() {
+				parts := strings.Split(filePath, "/")
+				if len(parts) == 0 {
+					return nil, fmt.Errorf("invaild index file path: %s", filePath)
+				}
+
+				fileKeys[i] = parts[len(parts)-1]
+			}
+
 			segmentIndexModel := &model.SegmentIndex{
-				SegmentID:      segID,
-				CollectionID:   record.GetCollectionID(),
-				PartitionID:    record.GetPartitionID(),
-				NumRows:        0, // TODO: how to set this?
-				IndexID:        indexID,
-				BuildID:        record.GetBuildID(),
-				NodeID:         buildMeta.GetNodeID(),
-				IndexVersion:   buildMeta.GetIndexVersion(),
-				IndexState:     buildMeta.GetState(),
-				FailReason:     buildMeta.GetFailReason(),
-				IsDeleted:      buildMeta.GetMarkDeleted(),
-				CreateTime:     record.GetCreateTime(),
-				IndexFilePaths: buildMeta.GetIndexFilePaths(),
-				IndexSize:      buildMeta.GetSerializeSize(),
+				SegmentID:           segID,
+				CollectionID:        record.GetCollectionID(),
+				PartitionID:         record.GetPartitionID(),
+				NumRows:             buildMeta.GetReq().GetNumRows(),
+				IndexID:             indexID,
+				BuildID:             record.GetBuildID(),
+				NodeID:              buildMeta.GetNodeID(),
+				IndexVersion:        buildMeta.GetIndexVersion(),
+				IndexState:          buildMeta.GetState(),
+				FailReason:          buildMeta.GetFailReason(),
+				IsDeleted:           buildMeta.GetMarkDeleted(),
+				CreatedUTCTime:      record.GetCreateTime(),
+				IndexFileKeys:       fileKeys,
+				IndexSerializedSize: buildMeta.GetSerializeSize(),
+				WriteHandoff:        buildMeta.GetState() == commonpb.IndexState_Finished,
 			}
 			segmentIndexModels.AddRecord(segID, indexID, segmentIndexModel)
 		}
 	}
 	return segmentIndexModels, nil
+}
+
+func combineToLoadInfo220(collectionLoadInfo CollectionLoadInfo220, partitionLoadInto PartitionLoadInfo220, fieldIndexes FieldIndexes210) {
+	toBeReleased := make([]UniqueID, 0)
+
+	for collectionID, loadInfo := range collectionLoadInfo {
+		indexes, ok := fieldIndexes[collectionID]
+		if !ok || len(indexes.indexes) == 0 {
+			toBeReleased = append(toBeReleased, collectionID)
+			continue
+		}
+
+		for _, index := range indexes.indexes {
+			loadInfo.FieldIndexID[index.GetFiledID()] = index.GetIndexID()
+		}
+	}
+
+	for collectionID, partitions := range partitionLoadInto {
+		indexes, ok := fieldIndexes[collectionID]
+		if !ok || len(indexes.indexes) == 0 {
+			toBeReleased = append(toBeReleased, collectionID)
+			continue
+		}
+
+		for _, loadInfo := range partitions {
+			for _, index := range indexes.indexes {
+				loadInfo.FieldIndexID[index.GetFiledID()] = index.GetIndexID()
+			}
+		}
+	}
+
+	for _, collectionID := range toBeReleased {
+		log.Warn("release the collection without index", zap.Int64("collectionID", collectionID))
+		delete(collectionLoadInfo, collectionID)
+	}
 }
 
 func From210To220(metas *Meta) (*Meta, error) {
@@ -184,6 +328,11 @@ func From210To220(metas *Meta) (*Meta, error) {
 	if err != nil {
 		return nil, err
 	}
+	collectionLoadInfos, partitionLoadInfos, err := metas.Meta210.CollectionLoadInfos.to220()
+	if err != nil {
+		return nil, err
+	}
+
 	fieldIndexes.Merge(fieldIndexes2)
 	collectionIndexes, err := combineToCollectionIndexesMeta220(fieldIndexes, metas.Meta210.CollectionIndexes)
 	if err != nil {
@@ -193,20 +342,24 @@ func From210To220(metas *Meta) (*Meta, error) {
 	if err != nil {
 		return nil, err
 	}
+	combineToLoadInfo220(collectionLoadInfos, partitionLoadInfos, fieldIndexes)
+
 	metas220 := &Meta{
 		SourceVersion: metas.Version,
 		Version:       versions.Version220,
 		Meta220: &All220{
-			TtCollections:     ttCollections,
-			Collections:       collections,
-			TtAliases:         ttAliases,
-			Aliases:           aliases,
-			TtPartitions:      make(TtPartitionsMeta220),
-			Partitions:        make(PartitionsMeta220),
-			TtFields:          make(TtFieldsMeta220),
-			Fields:            make(FieldsMeta220),
-			CollectionIndexes: collectionIndexes,
-			SegmentIndexes:    segmentIndexes,
+			TtCollections:       ttCollections,
+			Collections:         collections,
+			TtAliases:           ttAliases,
+			Aliases:             aliases,
+			TtPartitions:        make(TtPartitionsMeta220),
+			Partitions:          make(PartitionsMeta220),
+			TtFields:            make(TtFieldsMeta220),
+			Fields:              make(FieldsMeta220),
+			CollectionIndexes:   collectionIndexes,
+			SegmentIndexes:      segmentIndexes,
+			CollectionLoadInfos: collectionLoadInfos,
+			PartitionLoadInfos:  partitionLoadInfos,
 		},
 	}
 	return metas220, nil

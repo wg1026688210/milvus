@@ -16,16 +16,46 @@
 
 package meta
 
+import (
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
+)
+
 type DistributionManager struct {
-	*SegmentDistManager
-	*ChannelDistManager
-	*LeaderViewManager
+	SegmentDistManager SegmentDistManagerInterface
+	ChannelDistManager ChannelDistManagerInterface
 }
 
-func NewDistributionManager() *DistributionManager {
+func NewDistributionManager(nodeManager *session.NodeManager) *DistributionManager {
 	return &DistributionManager{
 		SegmentDistManager: NewSegmentDistManager(),
-		ChannelDistManager: NewChannelDistManager(),
-		LeaderViewManager:  NewLeaderViewManager(),
+		ChannelDistManager: NewChannelDistManager(nodeManager),
 	}
+}
+
+// GetDistributionJSON returns a JSON representation of the current distribution state.
+// It includes segments, DM channels, and leader views.
+// If there are no segments, channels, or leader views, it returns an empty string.
+// In case of an error during JSON marshaling, it returns the error.
+func (dm *DistributionManager) GetDistributionJSON(collectionID int64) string {
+	segments := dm.SegmentDistManager.GetSegmentDist(collectionID)
+	channels := dm.ChannelDistManager.GetChannelDist(collectionID)
+	leaderView := dm.ChannelDistManager.GetLeaderView(collectionID)
+
+	dist := &metricsinfo.QueryCoordDist{
+		Segments:    segments,
+		DMChannels:  channels,
+		LeaderViews: leaderView,
+	}
+
+	v, err := json.Marshal(dist)
+	if err != nil {
+		log.Warn("failed to marshal dist", zap.Error(err))
+		return ""
+	}
+	return string(v)
 }

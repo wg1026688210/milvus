@@ -23,18 +23,23 @@ SearchOnSealedIndex(const Schema& schema,
                     const segcore::SealedIndexingRecord& record,
                     const SearchInfo& search_info,
                     const void* query_data,
+                    const size_t* query_offsets,
                     int64_t num_queries,
                     const BitsetView& view,
-                    SearchResult& result);
+                    milvus::OpContext* op_context,
+                    SearchResult& search_result);
 
 void
-SearchOnSealed(const Schema& schema,
-               const segcore::InsertRecord<true>& record,
-               const SearchInfo& search_info,
-               const void* query_data,
-               int64_t num_queries,
-               int64_t row_count,
-               const BitsetView& bitset,
-               SearchResult& result);
+SearchOnSealedColumn(const Schema& schema,
+                     ChunkedColumnInterface* column,
+                     const SearchInfo& search_info,
+                     const std::map<std::string, std::string>& index_info,
+                     const void* query_data,
+                     const size_t* query_offsets,
+                     int64_t num_queries,
+                     int64_t row_count,
+                     const BitsetView& bitset,
+                     milvus::OpContext* op_context,
+                     SearchResult& result);
 
 }  // namespace milvus::query

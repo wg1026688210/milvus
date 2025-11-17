@@ -16,28 +16,77 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <boost/stacktrace.hpp>
 #include "FieldMeta.h"
+#include "boost/stacktrace/frame.hpp"
+#include "boost/stacktrace/stacktrace_fwd.hpp"
+#include "common/Types.h"
 #include "pb/schema.pb.h"
+#include "log/Log.h"
 #include "Consts.h"
+
+#include "arrow/type.h"
 
 namespace milvus {
 
+using ArrowSchemaPtr = std::shared_ptr<arrow::Schema>;
 static int64_t debug_id = START_USER_FIELDID;
 
 class Schema {
  public:
     FieldId
-    AddDebugField(const std::string& name, DataType data_type) {
+    AddDebugField(const std::string& name,
+                  DataType data_type,
+                  bool nullable = false) {
         auto field_id = FieldId(debug_id);
         debug_id++;
-        this->AddField(FieldName(name), field_id, data_type);
+        this->AddField(
+            FieldName(name), field_id, data_type, nullable, std::nullopt);
+        return field_id;
+    }
+
+    FieldId
+    AddDebugFieldWithDefaultValue(const std::string& name,
+                                  DataType data_type,
+                                  DefaultValueType value,
+                                  bool nullable = true) {
+        auto field_id = FieldId(debug_id);
+        debug_id++;
+        this->AddField(
+            FieldName(name), field_id, data_type, nullable, std::move(value));
+        return field_id;
+    }
+
+    FieldId
+    AddDebugField(const std::string& name,
+                  DataType data_type,
+                  DataType element_type,
+                  bool nullable = false) {
+        auto field_id = FieldId(debug_id);
+        debug_id++;
+        this->AddField(
+            FieldName(name), field_id, data_type, element_type, nullable);
+        return field_id;
+    }
+
+    FieldId
+    AddDebugArrayField(const std::string& name,
+                       DataType element_type,
+                       bool nullable) {
+        auto field_id = FieldId(debug_id);
+        debug_id++;
+        this->AddField(
+            FieldName(name), field_id, DataType::ARRAY, element_type, nullable);
         return field_id;
     }
 
@@ -49,22 +98,121 @@ class Schema {
                   std::optional<knowhere::MetricType> metric_type) {
         auto field_id = FieldId(debug_id);
         debug_id++;
-        auto field_meta = FieldMeta(FieldName(name), field_id, data_type, dim, metric_type);
+        auto field_meta = FieldMeta(FieldName(name),
+                                    field_id,
+                                    data_type,
+                                    dim,
+                                    metric_type,
+                                    false,
+                                    std::nullopt);
+        this->AddField(std::move(field_meta));
+        return field_id;
+    }
+
+    // array of vector type
+    FieldId
+    AddDebugVectorArrayField(const std::string& name,
+                             DataType element_type,
+                             int64_t dim,
+                             std::optional<knowhere::MetricType> metric_type) {
+        auto field_id = FieldId(debug_id);
+        debug_id++;
+        auto field_meta = FieldMeta(FieldName(name),
+                                    field_id,
+                                    DataType::VECTOR_ARRAY,
+                                    element_type,
+                                    dim,
+                                    metric_type);
+        this->AddField(std::move(field_meta));
+        return field_id;
+    }
+
+    // string type
+    FieldId
+    AddDebugVarcharField(const FieldName& name,
+                         DataType data_type,
+                         int64_t max_length,
+                         bool nullable,
+                         bool enable_match,
+                         bool enable_analyzer,
+                         std::map<std::string, std::string>& params,
+                         std::optional<DefaultValueType> default_value) {
+        auto field_id = FieldId(debug_id);
+        debug_id++;
+        auto field_meta = FieldMeta(name,
+                                    field_id,
+                                    data_type,
+                                    max_length,
+                                    nullable,
+                                    enable_match,
+                                    enable_analyzer,
+                                    params,
+                                    std::move(default_value));
         this->AddField(std::move(field_meta));
         return field_id;
     }
 
     // scalar type
     void
-    AddField(const FieldName& name, const FieldId id, DataType data_type) {
-        auto field_meta = FieldMeta(name, id, data_type);
+    AddField(const FieldName& name,
+             const FieldId id,
+             DataType data_type,
+             bool nullable,
+             std::optional<DefaultValueType> default_value) {
+        auto field_meta =
+            FieldMeta(name, id, data_type, nullable, std::move(default_value));
+        this->AddField(std::move(field_meta));
+    }
+
+    // array type
+    void
+    AddField(const FieldName& name,
+             const FieldId id,
+             DataType data_type,
+             DataType element_type,
+             bool nullable) {
+        auto field_meta = FieldMeta(
+            name, id, data_type, element_type, nullable, std::nullopt);
         this->AddField(std::move(field_meta));
     }
 
     // string type
     void
-    AddField(const FieldName& name, const FieldId id, DataType data_type, int64_t max_length) {
-        auto field_meta = FieldMeta(name, id, data_type, max_length);
+    AddField(const FieldName& name,
+             const FieldId id,
+             DataType data_type,
+             int64_t max_length,
+             bool nullable,
+             std::optional<DefaultValueType> default_value) {
+        auto field_meta = FieldMeta(name,
+                                    id,
+                                    data_type,
+                                    max_length,
+                                    nullable,
+                                    std::move(default_value));
+        this->AddField(std::move(field_meta));
+    }
+
+    // string type
+    void
+    AddField(const FieldName& name,
+             const FieldId id,
+             DataType data_type,
+             int64_t max_length,
+             bool nullable,
+             bool enable_match,
+             bool enable_analyzer,
+             std::map<std::string, std::string>& params,
+             std::optional<DefaultValueType> default_value) {
+        auto field_meta = FieldMeta(name,
+                                    id,
+                                    data_type,
+                                    max_length,
+                                    nullable,
+                                    enable_match,
+                                    enable_analyzer,
+                                    params,
+                                    std::move(default_value));
         this->AddField(std::move(field_meta));
     }
 
@@ -74,14 +222,41 @@ class Schema {
              const FieldId id,
              DataType data_type,
              int64_t dim,
-             std::optional<knowhere::MetricType> metric_type) {
-        auto field_meta = FieldMeta(name, id, data_type, dim, metric_type);
+             std::optional<knowhere::MetricType> metric_type,
+             bool nullable) {
+        auto field_meta = FieldMeta(
+            name, id, data_type, dim, metric_type, false, std::nullopt);
         this->AddField(std::move(field_meta));
     }
 
     void
     set_primary_field_id(FieldId field_id) {
         this->primary_field_id_opt_ = field_id;
+    }
+
+    void
+    set_dynamic_field_id(FieldId field_id) {
+        this->dynamic_field_id_opt_ = field_id;
+    }
+
+    void
+    set_namespace_field_id(FieldId field_id) {
+        this->namespace_field_id_opt_ = field_id;
+    }
+
+    void
+    set_schema_version(uint64_t version) {
+        this->schema_version_ = version;
+    }
+
+    std::optional<FieldId>
+    get_namespace_field_id() const {
+        return this->namespace_field_id_opt_;
+    }
+
+    uint64_t
+    get_schema_version() const {
+        return this->schema_version_;
     }
 
     auto
@@ -103,13 +278,9 @@ class Schema {
     operator[](FieldId field_id) const {
         Assert(field_id.get() >= 0);
         AssertInfo(fields_.find(field_id) != fields_.end(),
-                   "Cannot find field with field_id: " + std::to_string(field_id.get()));
+                   "Cannot find field with field_id: " +
+                       std::to_string(field_id.get()));
         return fields_.at(field_id);
-    }
-
-    auto
-    get_total_sizeof() const {
-        return total_sizeof_;
     }
 
     FieldId
@@ -123,6 +294,15 @@ class Schema {
         return fields_;
     }
 
+    const std::unordered_map<FieldId, FieldMeta>
+    get_field_metas(const std::vector<FieldId>& field_ids) {
+        std::unordered_map<FieldId, FieldMeta> field_metas;
+        for (const auto& field_id : field_ids) {
+            field_metas.emplace(field_id, operator[](field_id));
+        }
+        return field_metas;
+    }
+
     const std::vector<FieldId>&
     get_field_ids() const {
         return field_ids_;
@@ -131,13 +311,47 @@ class Schema {
     const FieldMeta&
     operator[](const FieldName& field_name) const {
         auto id_iter = name_ids_.find(field_name);
-        AssertInfo(id_iter != name_ids_.end(), "Cannot find field with field_name: " + field_name.get());
+        AssertInfo(id_iter != name_ids_.end(),
+                   "Cannot find field with field_name: " + field_name.get());
         return fields_.at(id_iter->second);
     }
 
     std::optional<FieldId>
     get_primary_field_id() const {
         return primary_field_id_opt_;
+    }
+
+    std::optional<FieldId>
+    get_dynamic_field_id() const {
+        return dynamic_field_id_opt_;
+    }
+
+    const ArrowSchemaPtr
+    ConvertToArrowSchema() const;
+
+    proto::schema::CollectionSchema
+    ToProto() const;
+
+    void
+    UpdateLoadFields(const std::vector<int64_t>& field_ids) {
+        load_fields_.clear();
+        for (auto field_id : field_ids) {
+            load_fields_.emplace(field_id);
+        }
+    }
+
+    bool
+    ShouldLoadField(FieldId field_id) {
+        return load_fields_.empty() || load_fields_.count(field_id) > 0;
+    }
+
+    std::vector<int64_t>
+    load_fields() {
+        auto fields = std::vector<int64_t>();
+        for (auto field_id : field_ids_) {
+            fields.emplace_back(field_id.get());
+        }
+        return std::move(fields);
     }
 
  public:
@@ -155,10 +369,10 @@ class Schema {
 
         fields_.emplace(field_id, field_meta);
         field_ids_.emplace_back(field_id);
-
-        auto field_sizeof = field_meta.get_sizeof();
-        total_sizeof_ += field_sizeof;
     }
+
+    std::unique_ptr<std::vector<FieldMeta>>
+    AbsentFields(Schema& old_schema) const;
 
  private:
     int64_t debug_id = START_USER_FIELDID;
@@ -171,10 +385,18 @@ class Schema {
     std::unordered_map<FieldName, FieldId> name_ids_;  // field_name -> field_id
     std::unordered_map<FieldId, FieldName> id_names_;  // field_id -> field_name
 
-    int64_t total_sizeof_ = 0;
     std::optional<FieldId> primary_field_id_opt_;
+    std::optional<FieldId> dynamic_field_id_opt_;
+    std::optional<FieldId> namespace_field_id_opt_;
+
+    // field partial load list
+    // work as hint now
+    std::unordered_set<FieldId> load_fields_;
+
+    // schema_version_, currently marked with update timestamp
+    uint64_t schema_version_;
 };
 
 using SchemaPtr = std::shared_ptr<Schema>;
-
+using SafeSchemaPtr = std::atomic<SchemaPtr*>;
 }  // namespace milvus

@@ -14,13 +14,115 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
 #include "common/init_c.h"
+#include "common/Common.h"
+#include "common/Tracer.h"
+#include "storage/ThreadPool.h"
+#include "log/Log.h"
+#include "exec/expression/ExprCache.h"
 
-#include <string>
-#include "config/ConfigChunkManager.h"
+std::once_flag traceFlag;
+std::once_flag cpuNumFlag;
 
 void
-LocalRootPathInit(const char* root_path) {
-    std::string local_path_root(root_path);
-    milvus::ChunkMangerConfig::SetLocalRootPath(local_path_root);
+InitCpuNum(const int value) {
+    std::call_once(cpuNumFlag, [value]() { milvus::InitCpuNum(value); });
+}
+
+void
+SetIndexSliceSize(const int64_t size) {
+    milvus::SetIndexSliceSize(size);
+}
+
+void
+SetHighPriorityThreadCoreCoefficient(const float value) {
+    milvus::SetHighPriorityThreadCoreCoefficient(value);
+}
+
+void
+SetMiddlePriorityThreadCoreCoefficient(const float value) {
+    milvus::SetMiddlePriorityThreadCoreCoefficient(value);
+}
+
+void
+SetLowPriorityThreadCoreCoefficient(const float value) {
+    milvus::SetLowPriorityThreadCoreCoefficient(value);
+}
+
+void
+SetDefaultExprEvalBatchSize(int64_t val) {
+    milvus::SetDefaultExecEvalExprBatchSize(val);
+}
+
+void
+SetDefaultDeleteDumpBatchSize(int64_t val) {
+    milvus::SetDefaultDeleteDumpBatchSize(val);
+}
+
+void
+SetDefaultOptimizeExprEnable(bool val) {
+    milvus::SetDefaultOptimizeExprEnable(val);
+}
+
+void
+SetDefaultGrowingJSONKeyStatsEnable(bool val) {
+    milvus::SetDefaultGrowingJSONKeyStatsEnable(val);
+}
+
+void
+SetDefaultConfigParamTypeCheck(bool val) {
+    milvus::SetDefaultConfigParamTypeCheck(val);
+}
+
+void
+SetDefaultEnableParquetStatsSkipIndex(bool val) {
+    milvus::SetDefaultEnableParquetStatsSkipIndex(val);
+}
+
+void
+SetLogLevel(const char* level) {
+    milvus::SetLogLevel(level);
+}
+
+void
+SetExprResCacheEnable(bool val) {
+    milvus::exec::ExprResCacheManager::SetEnabled(val);
+}
+
+void
+SetExprResCacheCapacityBytes(int64_t bytes) {
+    milvus::exec::ExprResCacheManager::Instance().SetCapacityBytes(
+        static_cast<size_t>(bytes));
+}
+
+void
+InitTrace(CTraceConfig* config) {
+    auto traceConfig = milvus::tracer::TraceConfig{config->exporter,
+                                                   config->sampleFraction,
+                                                   config->jaegerURL,
+                                                   config->otlpEndpoint,
+                                                   config->otlpMethod,
+                                                   config->otlpHeaders,
+                                                   config->oltpSecure,
+                                                   config->nodeID};
+    std::call_once(
+        traceFlag,
+        [](const milvus::tracer::TraceConfig& c) {
+            milvus::tracer::initTelemetry(c);
+        },
+        traceConfig);
+}
+
+void
+SetTrace(CTraceConfig* config) {
+    auto traceConfig = milvus::tracer::TraceConfig{config->exporter,
+                                                   config->sampleFraction,
+                                                   config->jaegerURL,
+                                                   config->otlpEndpoint,
+                                                   config->otlpMethod,
+                                                   config->otlpHeaders,
+                                                   config->oltpSecure,
+                                                   config->nodeID};
+    milvus::tracer::initTelemetry(traceConfig);
 }

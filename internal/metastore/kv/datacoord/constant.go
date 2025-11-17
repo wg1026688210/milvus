@@ -17,12 +17,24 @@
 package datacoord
 
 const (
-	MetaPrefix                = "datacoord-meta"
-	SegmentPrefix             = MetaPrefix + "/s"
-	SegmentBinlogPathPrefix   = MetaPrefix + "/binlog"
-	SegmentDeltalogPathPrefix = MetaPrefix + "/deltalog"
-	SegmentStatslogPathPrefix = MetaPrefix + "/statslog"
-	ChannelRemovePrefix       = MetaPrefix + "/channel-removal"
+	MetaPrefix                         = "datacoord-meta"
+	SegmentPrefix                      = MetaPrefix + "/s"
+	SegmentBinlogPathPrefix            = MetaPrefix + "/binlog"
+	SegmentDeltalogPathPrefix          = MetaPrefix + "/deltalog"
+	SegmentStatslogPathPrefix          = MetaPrefix + "/statslog"
+	SegmentBM25logPathPrefix           = MetaPrefix + "/bm25log"
+	ChannelRemovePrefix                = MetaPrefix + "/channel-removal"
+	ChannelCheckpointPrefix            = MetaPrefix + "/channel-cp"
+	ImportJobPrefix                    = MetaPrefix + "/import-job"
+	ImportTaskPrefix                   = MetaPrefix + "/import-task"
+	PreImportTaskPrefix                = MetaPrefix + "/preimport-task"
+	CompactionTaskPrefix               = MetaPrefix + "/compaction-task"
+	AnalyzeTaskPrefix                  = MetaPrefix + "/analyze-task"
+	PartitionStatsInfoPrefix           = MetaPrefix + "/partition-stats"
+	PartitionStatsCurrentVersionPrefix = MetaPrefix + "/current-partition-stats-version"
+	StatsTaskPrefix                    = MetaPrefix + "/stats-task"
+	FileResourceMetaPrefix             = MetaPrefix + "/file_resource"
 
-	RemoveFlagTomestone = "removed"
+	NonRemoveFlagTomestone = "non-removed"
+	RemoveFlagTomestone    = "removed"
 )

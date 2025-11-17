@@ -1,21 +1,34 @@
 package rootcoord
 
+import (
+	"fmt"
+
+	"github.com/milvus-io/milvus/pkg/v2/util"
+)
+
 const (
 	// ComponentPrefix prefix for rootcoord component
 	ComponentPrefix = "root-coord"
 
+	DatabaseMetaPrefix       = ComponentPrefix + "/database"
+	DBInfoMetaPrefix         = DatabaseMetaPrefix + "/db-info"
+	CollectionInfoMetaPrefix = DatabaseMetaPrefix + "/collection-info"
+
 	// CollectionMetaPrefix prefix for collection meta
 	CollectionMetaPrefix = ComponentPrefix + "/collection"
 
-	PartitionMetaPrefix = ComponentPrefix + "/partitions"
-	AliasMetaPrefix     = ComponentPrefix + "/aliases"
-	FieldMetaPrefix     = ComponentPrefix + "/fields"
+	PartitionMetaPrefix        = ComponentPrefix + "/partitions"
+	AliasMetaPrefix            = ComponentPrefix + "/aliases"
+	FieldMetaPrefix            = ComponentPrefix + "/fields"
+	StructArrayFieldMetaPrefix = ComponentPrefix + "/struct-array-fields"
+	FunctionMetaPrefix         = ComponentPrefix + "/functions"
 
 	// CollectionAliasMetaPrefix210 prefix for collection alias meta
 	CollectionAliasMetaPrefix210 = ComponentPrefix + "/collection-alias"
 
 	SnapshotsSep   = "_ts"
 	SnapshotPrefix = "snapshots"
+	Aliases        = "aliases"
 
 	// CommonCredentialPrefix subpath for common credential
 	/* #nosec G101 */
@@ -38,4 +51,30 @@ const (
 
 	// GranteeIDPrefix prefix for mapping among privilege and grantor
 	GranteeIDPrefix = ComponentPrefix + CommonCredentialPrefix + "/grantee-id"
+
+	// PrivilegeGroupPrefix prefix for privilege group
+	PrivilegeGroupPrefix = ComponentPrefix + "/privilege-group"
 )
+
+func BuildDatabasePrefixWithDBID(dbID int64) string {
+	return fmt.Sprintf("%s/%d", CollectionInfoMetaPrefix, dbID)
+}
+
+func BuildCollectionKeyWithDBID(dbID int64, collectionID int64) string {
+	return fmt.Sprintf("%s/%d/%d", CollectionInfoMetaPrefix, dbID, collectionID)
+}
+
+func BuildDatabaseKey(dbID int64) string {
+	return fmt.Sprintf("%s/%d", DBInfoMetaPrefix, dbID)
+}
+
+func getDatabasePrefix(dbID int64) string {
+	if dbID != util.NonDBID {
+		return BuildDatabasePrefixWithDBID(dbID)
+	}
+	return CollectionMetaPrefix
+}
+
+func BuildPrivilegeGroupkey(groupName string) string {
+	return fmt.Sprintf("%s/%s", PrivilegeGroupPrefix, groupName)
+}

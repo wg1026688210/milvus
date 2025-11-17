@@ -13,6 +13,8 @@
 
 #include <memory>
 #include "common/Types.h"
+#include "index/Index.h"
+#include "storage/FileManager.h"
 
 namespace milvus::indexbuilder {
 class IndexCreatorBase {
@@ -22,12 +24,18 @@ class IndexCreatorBase {
     virtual void
     Build(const milvus::DatasetPtr& dataset) = 0;
 
+    virtual void
+    Build() = 0;
+
     virtual milvus::BinarySet
     Serialize() = 0;
 
     // used for test.
     virtual void
     Load(const milvus::BinarySet&) = 0;
+
+    virtual index::IndexStatsPtr
+    Upload() = 0;
 };
 
 using IndexCreatorBasePtr = std::unique_ptr<IndexCreatorBase>;

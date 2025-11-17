@@ -1,7 +1,7 @@
 package indexcgowrapper
 
 import (
-	"github.com/milvus-io/milvus/api/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 )
 
@@ -23,9 +23,46 @@ func GenFloatVecDataset(vectors []float32) *Dataset {
 	}
 }
 
+func GenFloat16VecDataset(vectors []byte) *Dataset {
+	return &Dataset{
+		DType: schemapb.DataType_Float16Vector,
+		Data: map[string]interface{}{
+			keyRawArr: vectors,
+		},
+	}
+}
+
+func GenBFloat16VecDataset(vectors []byte) *Dataset {
+	return &Dataset{
+		DType: schemapb.DataType_BFloat16Vector,
+		Data: map[string]interface{}{
+			keyRawArr: vectors,
+		},
+	}
+}
+
+func GenSparseFloatVecDataset(data *storage.SparseFloatVectorFieldData) *Dataset {
+	// TODO(SPARSE): This is used only for testing. In order to make any golang
+	// tests that uses this method work, we'll need to expose
+	// knowhere::sparse::SparseRow to Go, which is the accepted format in cgo
+	// wrapper. Such tests are skipping sparse vector for now.
+	return &Dataset{
+		DType: schemapb.DataType_SparseFloatVector,
+	}
+}
+
 func GenBinaryVecDataset(vectors []byte) *Dataset {
 	return &Dataset{
 		DType: schemapb.DataType_BinaryVector,
+		Data: map[string]interface{}{
+			keyRawArr: vectors,
+		},
+	}
+}
+
+func GenInt8VecDataset(vectors []int8) *Dataset {
+	return &Dataset{
+		DType: schemapb.DataType_Int8Vector,
 		Data: map[string]interface{}{
 			keyRawArr: vectors,
 		},
@@ -85,7 +122,7 @@ func GenDataset(data storage.FieldData) *Dataset {
 		}
 	case *storage.StringFieldData:
 		return &Dataset{
-			DType: schemapb.DataType_String,
+			DType: schemapb.DataType_VarChar,
 			Data: map[string]interface{}{
 				keyRawArr: f.Data,
 			},
@@ -94,6 +131,14 @@ func GenDataset(data storage.FieldData) *Dataset {
 		return GenBinaryVecDataset(f.Data)
 	case *storage.FloatVectorFieldData:
 		return GenFloatVecDataset(f.Data)
+	case *storage.Float16VectorFieldData:
+		return GenFloat16VecDataset(f.Data)
+	case *storage.BFloat16VectorFieldData:
+		return GenBFloat16VecDataset(f.Data)
+	case *storage.SparseFloatVectorFieldData:
+		return GenSparseFloatVecDataset(f)
+	case *storage.Int8VectorFieldData:
+		return GenInt8VecDataset(f.Data)
 	default:
 		return &Dataset{
 			DType: schemapb.DataType_None,

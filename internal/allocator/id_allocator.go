@@ -21,17 +21,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/milvus-io/milvus/api/commonpb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
 )
 
 const (
 	idCountPerRPC = 200000
 )
-
-// UniqueID is alias of typeutil.UniqueID
-type UniqueID = typeutil.UniqueID
 
 // IDAllocator allocates Unique and monotonically increasing IDs from Root Coord.
 // It could also batch allocate for less root coord server access
@@ -85,7 +84,6 @@ func (ia *IDAllocator) gatherReqIDCount() uint32 {
 }
 
 func (ia *IDAllocator) syncID() (bool, error) {
-
 	need := ia.gatherReqIDCount()
 	if need < ia.countPerRPC {
 		need = ia.countPerRPC
@@ -93,12 +91,10 @@ func (ia *IDAllocator) syncID() (bool, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	req := &rootcoordpb.AllocIDRequest{
-		Base: &commonpb.MsgBase{
-			MsgType:   commonpb.MsgType_RequestID,
-			MsgID:     0,
-			Timestamp: 0,
-			SourceID:  ia.PeerID,
-		},
+		Base: commonpbutil.NewMsgBase(
+			commonpbutil.WithMsgType(commonpb.MsgType_RequestID),
+			commonpbutil.WithSourceID(ia.PeerID),
+		),
 		Count: need,
 	}
 	resp, err := ia.remoteAllocator.AllocID(ctx, req)
@@ -151,6 +147,9 @@ func (ia *IDAllocator) AllocOne() (UniqueID, error) {
 
 // Alloc allocates the id of the count number.
 func (ia *IDAllocator) Alloc(count uint32) (UniqueID, UniqueID, error) {
+	if ia.closed() {
+		return 0, 0, errors.New("fail to allocate ID, closed allocator")
+	}
 	req := &IDRequest{BaseRequest: BaseRequest{Done: make(chan error), Valid: false}}
 
 	req.count = count
@@ -161,4 +160,14 @@ func (ia *IDAllocator) Alloc(count uint32) (UniqueID, UniqueID, error) {
 
 	start, count := req.id, req.count
 	return start, start + int64(count), nil
+}
+
+// preventing alloc from a closed allocator stucking forever
+func (ia *IDAllocator) closed() bool {
+	select {
+	case <-ia.Ctx.Done():
+		return true
+	default:
+		return false
+	}
 }

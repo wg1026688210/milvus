@@ -5,28 +5,34 @@
 #   proxy/cmake-build-debug/
 #   a/b/c/cmake-build-debug/
 **/cmake-build-debug/*
+**/cmake-build-debug-coverage/*
 **/cmake-build-release/*
 **/cmake_build_release/*
 **/cmake_build/*
+**/CMakeFiles/*
+**/.cmake/*
+CMakeCache.txt
 .cache
+coverage_report/
 
 internal/core/output/*
 internal/core/build/*
 **/.idea/*
 internal/msgstream/pulsarms/client-cpp/build/
 internal/msgstream/pulsarms/client-cpp/build/*
-internal/kv/rocksdb/cwrapper/output/
 tests/python_client/default.etcd/
 
 # vscode generated files
 .vscode
 docker-compose-devcontainer.yml
 docker-compose-devcontainer.yml.tmp
+.cursor
 
 *.code-workspace
 
 # Docker generated cache file
 .docker/
+.docker-gpu/
 
 **/_artifacts/**
 
@@ -82,13 +88,35 @@ cpp_coverage/
 
 # virtualenv
 venv/
+.venv/
+
+# gopls generated
+go.work
+go.work.sum
 
 # docker compose volumes
 deployments/docker/*/volumes
+deployments/docker/gpu/*/volumes
 
 # rocksdb
 cwrapper_rocksdb_build/
-internal/kv/rocksdb/cwrapper/
 
 # local file data
 **/data/*
+!**/tantivy-binding/src/analyzer/data/*
+
+internal/proto/**/*.pb.go
+pkg/streaming/**/*.pb.go
+internal/core/src/pb/*.pb.h
+internal/core/src/pb/*.pb.cc
+**/legacypb/*.pb.go
+pkg/streaming/proto/**/*.pb.go
+
+#AI rules
+WARP.md
+
+# Antlr
+.antlr
+
+# Gocache
+**/.gocache/

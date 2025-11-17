@@ -21,14 +21,35 @@
 #include <string>
 #include <vector>
 #include <boost/dynamic_bitset.hpp>
-
+#include "common/Types.h"
+#include "knowhere/index/index_factory.h"
 #include "index/VectorIndex.h"
+#include "storage/MemFileManagerImpl.h"
+#include "index/IndexInfo.h"
 
 namespace milvus::index {
-
+// TODO : growing index should be isolated from VectorMemIndex
+// For general index, it should not suppport AddWithDataset etc.
+// For growing index, it should suppport AddWithDataset etc.
+template <typename T>
 class VectorMemIndex : public VectorIndex {
  public:
-    explicit VectorMemIndex(const IndexType& index_type, const MetricType& metric_type, const IndexMode& index_mode);
+    explicit VectorMemIndex(
+        DataType elem_type /* used for embedding list only */,
+        const IndexType& index_type,
+        const MetricType& metric_type,
+        const IndexVersion& version,
+        bool use_knowhere_build_pool = true,
+        const storage::FileManagerContext& file_manager_context =
+            storage::FileManagerContext());
+
+    // knowhere data view index special constucter for intermin index, no need to hold file_manager_ to upload or download files
+    VectorMemIndex(DataType elem_type /* used for embedding list only */,
+                   const IndexType& index_type,
+                   const MetricType& metric_type,
+                   const IndexVersion& version,
+                   const knowhere::ViewDataOp view_data,
+                   bool use_knowhere_build_pool = true);
 
     BinarySet
     Serialize(const Config& config) override;
@@ -37,32 +58,66 @@ class VectorMemIndex : public VectorIndex {
     Load(const BinarySet& binary_set, const Config& config = {}) override;
 
     void
-    BuildWithDataset(const DatasetPtr& dataset, const Config& config = {}) override;
+    Load(milvus::tracer::TraceContext ctx, const Config& config = {}) override;
+
+    void
+    BuildWithDataset(const DatasetPtr& dataset,
+                     const Config& config = {}) override;
+
+    void
+    Build(const Config& config = {}) override;
+
+    void
+    AddWithDataset(const DatasetPtr& dataset, const Config& config) override;
 
     int64_t
     Count() override {
-        return index_->Count();
+        return index_.Count();
     }
 
-    std::unique_ptr<SearchResult>
-    Query(const DatasetPtr dataset, const SearchInfo& search_info, const BitsetView& bitset) override;
+    void
+    Query(const DatasetPtr dataset,
+          const SearchInfo& search_info,
+          const BitsetView& bitset,
+          milvus::OpContext* op_context,
+          SearchResult& search_result) const override;
+
+    const bool
+    HasRawData() const override;
+
+    std::vector<uint8_t>
+    GetVector(const DatasetPtr dataset) const override;
+
+    std::unique_ptr<const knowhere::sparse::SparseRow<SparseValueType>[]>
+    GetSparseVector(const DatasetPtr dataset) const override;
+
+    IndexStatsPtr
+    Upload(const Config& config = {}) override;
+
+    knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+    VectorIterators(const DatasetPtr dataset,
+                    const knowhere::Json& json,
+                    const BitsetView& bitset) const override;
+
+ protected:
+    virtual void
+    LoadWithoutAssemble(const BinarySet& binary_set, const Config& config);
 
  private:
     void
-    store_raw_data(const knowhere::DatasetPtr& dataset);
+    LoadFromFile(const Config& config);
 
-    void
-    parse_config(Config& config);
-
-    void
-    LoadRawData();
-
- private:
+ protected:
     Config config_;
-    knowhere::VecIndexPtr index_ = nullptr;
-    std::vector<uint8_t> raw_data_;
-    std::once_flag raw_data_loaded_;
+    knowhere::Index<knowhere::IndexNode> index_;
+    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
+    // used for embedding list only
+    DataType elem_type_;
+
+    CreateIndexInfo create_index_info_;
+    bool use_knowhere_build_pool_;
 };
 
-using VectorMemIndexPtr = std::unique_ptr<VectorMemIndex>;
+template <typename T>
+using VectorMemIndexPtr = std::unique_ptr<VectorMemIndex<T>>;
 }  // namespace milvus::index

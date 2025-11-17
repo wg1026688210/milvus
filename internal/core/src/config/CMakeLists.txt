@@ -14,20 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-option( EMBEDDED_MILVUS "Enable embedded Milvus" OFF )
-
-if ( EMBEDDED_MILVUS )
-    add_compile_definitions( EMBEDDED_MILVUS )
-endif()
-
-set(CONFIG_SRC
-        ConfigKnowhere.cpp
-        ConfigChunkManager.cpp
-        )
-
-add_library(milvus_config STATIC ${CONFIG_SRC})
-
-target_link_libraries(milvus_config
-        milvus_exceptions
-        knowhere
-        )
+add_source_at_current_directory_recursively()
+add_library(milvus_config OBJECT ${SOURCE_FILES})

@@ -18,6 +18,7 @@ package distributed
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
@@ -26,32 +27,50 @@ import (
 	"testing"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/indexpb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
-	"github.com/milvus-io/milvus/internal/proto/rootcoordpb"
-	"github.com/milvus-io/milvus/internal/util/etcd"
-	"github.com/milvus-io/milvus/internal/util/paramtable"
-	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-var Params paramtable.BaseTable
+func TestMain(t *testing.M) {
+	// init embed etcd
+	embedetcdServer, tempDir, err := etcd.StartTestEmbedEtcdServer()
+	if err != nil {
+		log.Fatal("failed to start embed etcd server for unittest", zap.Error(err))
+	}
+
+	defer os.RemoveAll(tempDir)
+	defer embedetcdServer.Server.Stop()
+
+	addrs := etcd.GetEmbedEtcdEndpoints(embedetcdServer)
+
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().EtcdCfg.Endpoints.Key, strings.Join(addrs, ","))
+
+	os.Exit(t.Run())
+}
 
 func TestConnectionManager(t *testing.T) {
-	Params.Init()
 	ctx := context.Background()
+
+	testPath := fmt.Sprintf("TestConnectionManager-%d", time.Now().Unix())
+	paramtable.Get().Save(paramtable.Get().EtcdCfg.RootPath.Key, testPath)
 
 	session := initSession(ctx)
 	cm := NewConnectionManager(session)
 	cm.AddDependency(typeutil.RootCoordRole)
 	cm.AddDependency(typeutil.QueryCoordRole)
 	cm.AddDependency(typeutil.DataCoordRole)
-	cm.AddDependency(typeutil.IndexCoordRole)
 	cm.AddDependency(typeutil.QueryNodeRole)
 	cm.AddDependency(typeutil.DataNodeRole)
 	cm.AddDependency(typeutil.IndexNodeRole)
@@ -59,7 +78,7 @@ func TestConnectionManager(t *testing.T) {
 
 	t.Run("rootCoord", func(t *testing.T) {
 		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer lis.Close()
 		rootCoord := &testRootCoord{}
 		grpcServer := grpc.NewServer()
@@ -76,7 +95,7 @@ func TestConnectionManager(t *testing.T) {
 
 	t.Run("queryCoord", func(t *testing.T) {
 		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer lis.Close()
 		queryCoord := &testQueryCoord{}
 		grpcServer := grpc.NewServer()
@@ -93,7 +112,7 @@ func TestConnectionManager(t *testing.T) {
 
 	t.Run("dataCoord", func(t *testing.T) {
 		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer lis.Close()
 		dataCoord := &testDataCoord{}
 		grpcServer := grpc.NewServer()
@@ -108,26 +127,9 @@ func TestConnectionManager(t *testing.T) {
 		}, 10*time.Second, 100*time.Millisecond)
 	})
 
-	t.Run("indexCoord", func(t *testing.T) {
-		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
-		defer lis.Close()
-		indexCoord := &testIndexCoord{}
-		grpcServer := grpc.NewServer()
-		defer grpcServer.Stop()
-		indexpb.RegisterIndexCoordServer(grpcServer, indexCoord)
-		go grpcServer.Serve(lis)
-		session.Init(typeutil.IndexCoordRole, lis.Addr().String(), true, false)
-		session.Register()
-		assert.Eventually(t, func() bool {
-			indexCoord, ok := cm.GetIndexCoordClient()
-			return indexCoord != nil && ok
-		}, 10*time.Second, 100*time.Millisecond)
-	})
-
 	t.Run("queryNode", func(t *testing.T) {
 		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer lis.Close()
 		queryNode := &testQueryNode{}
 		grpcServer := grpc.NewServer()
@@ -144,7 +146,7 @@ func TestConnectionManager(t *testing.T) {
 
 	t.Run("dataNode", func(t *testing.T) {
 		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer lis.Close()
 		dataNode := &testDataNode{}
 		grpcServer := grpc.NewServer()
@@ -161,12 +163,12 @@ func TestConnectionManager(t *testing.T) {
 
 	t.Run("indexNode", func(t *testing.T) {
 		lis, err := net.Listen("tcp", "127.0.0.1:")
-		assert.Nil(t, err)
+		assert.NoError(t, err)
 		defer lis.Close()
 		indexNode := &testIndexNode{}
 		grpcServer := grpc.NewServer()
 		defer grpcServer.Stop()
-		indexpb.RegisterIndexNodeServer(grpcServer, indexNode)
+		workerpb.RegisterIndexNodeServer(grpcServer, indexNode)
 		go grpcServer.Serve(lis)
 		session.Init(typeutil.IndexNodeRole, lis.Addr().String(), true, false)
 		session.Register()
@@ -220,8 +222,10 @@ func TestConnectionManager_processEvent(t *testing.T) {
 		cm := &ConnectionManager{
 			closeCh: make(chan struct{}),
 			session: &sessionutil.Session{
-				ServerID:    1,
-				TriggerKill: true,
+				SessionRaw: sessionutil.SessionRaw{
+					ServerID:    1,
+					TriggerKill: true,
+				},
 			},
 		}
 
@@ -253,10 +257,6 @@ type testDataCoord struct {
 	datapb.DataCoordServer
 }
 
-type testIndexCoord struct {
-	indexpb.IndexCoordServer
-}
-
 type testQueryNode struct {
 	querypb.QueryNodeServer
 }
@@ -266,30 +266,31 @@ type testDataNode struct {
 }
 
 type testIndexNode struct {
-	indexpb.IndexNodeServer
+	workerpb.IndexNodeServer
 }
 
 func initSession(ctx context.Context) *sessionutil.Session {
-	rootPath, err := Params.Load("etcd.rootPath")
+	baseTable := paramtable.GetBaseTable()
+	rootPath, err := baseTable.Load("etcd.rootPath")
 	if err != nil {
 		panic(err)
 	}
-	subPath, err := Params.Load("etcd.metaSubPath")
+	subPath, err := baseTable.Load("etcd.metaSubPath")
 	if err != nil {
 		panic(err)
 	}
 	metaRootPath := rootPath + "/" + subPath
 
-	endpoints := Params.LoadWithDefault("etcd.endpoints", paramtable.DefaultEtcdEndpoints)
+	endpoints := baseTable.GetWithDefault("etcd.endpoints", paramtable.DefaultEtcdEndpoints)
 	etcdEndpoints := strings.Split(endpoints, ",")
 
-	log.Debug("metaRootPath", zap.Any("metaRootPath", metaRootPath))
-	log.Debug("etcdPoints", zap.Any("etcdPoints", etcdEndpoints))
+	log.Ctx(context.TODO()).Debug("metaRootPath", zap.Any("metaRootPath", metaRootPath))
+	log.Ctx(context.TODO()).Debug("etcdPoints", zap.Any("etcdPoints", etcdEndpoints))
 
 	etcdCli, err := etcd.GetRemoteEtcdClient(etcdEndpoints)
 	if err != nil {
 		panic(err)
 	}
-	session := sessionutil.NewSession(ctx, metaRootPath, etcdCli)
+	session := sessionutil.NewSessionWithEtcd(ctx, metaRootPath, etcdCli)
 	return session
 }

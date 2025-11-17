@@ -1,12 +1,13 @@
 package migration
 
-import "github.com/milvus-io/milvus/internal/util/typeutil"
+import "github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 
 const (
 	Role = "migration"
 )
 
 var Roles = []string{
+	typeutil.MixCoordRole,
 	typeutil.RootCoordRole,
 	typeutil.IndexCoordRole,
 	typeutil.IndexNodeRole,

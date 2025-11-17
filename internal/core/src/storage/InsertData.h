@@ -20,12 +20,14 @@
 #include <memory>
 
 #include "storage/DataCodec.h"
+#include "storage/PayloadReader.h"
 
 namespace milvus::storage {
 
 class InsertData : public DataCodec {
  public:
-    explicit InsertData(std::shared_ptr<FieldData> data) : DataCodec(data, CodecType::InsertDataType) {
+    explicit InsertData(std::shared_ptr<PayloadReader>& payload_reader)
+        : DataCodec(payload_reader, CodecType::InsertDataType) {
     }
 
     std::vector<uint8_t>

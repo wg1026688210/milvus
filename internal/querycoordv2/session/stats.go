@@ -17,8 +17,10 @@
 package session
 
 type stats struct {
-	segmentCnt int
-	channelCnt int
+	segmentCnt      int
+	channelCnt      int
+	memCapacityInMB float64
+	CPUNum          int64
 }
 
 func (s *stats) setSegmentCnt(cnt int) {
@@ -35,6 +37,22 @@ func (s *stats) setChannelCnt(cnt int) {
 
 func (s *stats) getChannelCnt() int {
 	return s.channelCnt
+}
+
+func (s *stats) setMemCapacity(capacity float64) {
+	s.memCapacityInMB = capacity
+}
+
+func (s *stats) getMemCapacity() float64 {
+	return s.memCapacityInMB
+}
+
+func (s *stats) setCPUNum(num int64) {
+	s.CPUNum = num
+}
+
+func (s *stats) getCPUNum() int64 {
+	return s.CPUNum
 }
 
 func newStats() stats {

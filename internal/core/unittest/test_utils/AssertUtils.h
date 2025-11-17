@@ -15,8 +15,11 @@
 #include <vector>
 #include <memory>
 
-using milvus::index::ScalarIndex;
+#include "common/QueryResult.h"
+#include "common/Types.h"
+#include "index/ScalarIndex.h"
 
+using milvus::index::ScalarIndex;
 namespace {
 
 bool
@@ -33,8 +36,24 @@ compare_double(double x, double y, double epsilon = 0.000001f) {
     return false;
 }
 
+bool
+Any(const milvus::TargetBitmap& bitmap) {
+    return bitmap.any();
+}
+
+bool
+BitSetNone(const milvus::TargetBitmap& bitmap) {
+    return bitmap.none();
+}
+
+uint64_t
+Count(const milvus::TargetBitmap& bitmap) {
+    return bitmap.count();
+}
+
 inline void
-assert_order(const milvus::SearchResult& result, const knowhere::MetricType& metric_type) {
+assert_order(const milvus::SearchResult& result,
+             const knowhere::MetricType& metric_type) {
     bool dsc = milvus::PositivelyRelated(metric_type);
     auto& ids = result.seg_offsets_;
     auto& dist = result.distances_;
@@ -70,24 +89,24 @@ assert_in(ScalarIndex<T>* index, const std::vector<T>& arr) {
     }
 
     auto bitset1 = index->In(arr.size(), arr.data());
-    ASSERT_EQ(arr.size(), bitset1->size());
-    ASSERT_TRUE(bitset1->any());
+    ASSERT_EQ(arr.size(), bitset1.size());
+    ASSERT_TRUE(Any(bitset1));
     auto test = std::make_unique<T>(arr[arr.size() - 1] + 1);
     auto bitset2 = index->In(1, test.get());
-    ASSERT_EQ(arr.size(), bitset2->size());
-    ASSERT_TRUE(bitset2->none());
+    ASSERT_EQ(arr.size(), bitset2.size());
+    ASSERT_TRUE(BitSetNone(bitset2));
 }
 
 template <typename T>
 inline void
 assert_not_in(ScalarIndex<T>* index, const std::vector<T>& arr) {
     auto bitset1 = index->NotIn(arr.size(), arr.data());
-    ASSERT_EQ(arr.size(), bitset1->size());
-    ASSERT_TRUE(bitset1->none());
+    ASSERT_EQ(arr.size(), bitset1.size());
+    ASSERT_TRUE(BitSetNone(bitset1));
     auto test = std::make_unique<T>(arr[arr.size() - 1] + 1);
     auto bitset2 = index->NotIn(1, test.get());
-    ASSERT_EQ(arr.size(), bitset2->size());
-    ASSERT_TRUE(bitset2->any());
+    ASSERT_EQ(arr.size(), bitset2.size());
+    ASSERT_TRUE(Any(bitset2));
 }
 
 template <typename T>
@@ -97,31 +116,33 @@ assert_range(ScalarIndex<T>* index, const std::vector<T>& arr) {
     auto test_max = arr[arr.size() - 1];
 
     auto bitset1 = index->Range(test_min - 1, milvus::OpType::GreaterThan);
-    ASSERT_EQ(arr.size(), bitset1->size());
-    ASSERT_TRUE(bitset1->any());
+    ASSERT_EQ(arr.size(), bitset1.size());
+    ASSERT_TRUE(Any(bitset1));
 
     auto bitset2 = index->Range(test_min, milvus::OpType::GreaterEqual);
-    ASSERT_EQ(arr.size(), bitset2->size());
-    ASSERT_TRUE(bitset2->any());
+    ASSERT_EQ(arr.size(), bitset2.size());
+    ASSERT_TRUE(Any(bitset2));
 
     auto bitset3 = index->Range(test_max + 1, milvus::OpType::LessThan);
-    ASSERT_EQ(arr.size(), bitset3->size());
-    ASSERT_TRUE(bitset3->any());
+    ASSERT_EQ(arr.size(), bitset3.size());
+    ASSERT_TRUE(Any(bitset3));
 
     auto bitset4 = index->Range(test_max, milvus::OpType::LessEqual);
-    ASSERT_EQ(arr.size(), bitset4->size());
-    ASSERT_TRUE(bitset4->any());
+    ASSERT_EQ(arr.size(), bitset4.size());
+    ASSERT_TRUE(Any(bitset4));
 
     auto bitset5 = index->Range(test_min, true, test_max, true);
-    ASSERT_EQ(arr.size(), bitset5->size());
-    ASSERT_TRUE(bitset5->any());
+    ASSERT_EQ(arr.size(), bitset5.size());
+    ASSERT_TRUE(Any(bitset5));
 }
 
 template <typename T>
 inline void
 assert_reverse(ScalarIndex<T>* index, const std::vector<T>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_EQ(index->Reverse_Lookup(offset), arr[offset]);
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_EQ(raw.value(), arr[offset]);
     }
 }
 
@@ -129,7 +150,9 @@ template <>
 inline void
 assert_reverse(ScalarIndex<float>* index, const std::vector<float>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_TRUE(compare_float(index->Reverse_Lookup(offset), arr[offset]));
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_TRUE(compare_float(raw.value(), arr[offset]));
     }
 }
 
@@ -137,50 +160,58 @@ template <>
 inline void
 assert_reverse(ScalarIndex<double>* index, const std::vector<double>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_TRUE(compare_double(index->Reverse_Lookup(offset), arr[offset]));
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_TRUE(compare_double(raw.value(), arr[offset]));
     }
 }
 
 template <>
 inline void
-assert_reverse(ScalarIndex<std::string>* index, const std::vector<std::string>& arr) {
+assert_reverse(ScalarIndex<std::string>* index,
+               const std::vector<std::string>& arr) {
     for (size_t offset = 0; offset < arr.size(); ++offset) {
-        ASSERT_TRUE(arr[offset].compare(index->Reverse_Lookup(offset)) == 0);
+        auto raw = index->Reverse_Lookup(offset);
+        ASSERT_TRUE(raw.has_value());
+        ASSERT_TRUE(arr[offset].compare(raw.value()) == 0);
     }
 }
 
 template <>
 inline void
-assert_in(ScalarIndex<std::string>* index, const std::vector<std::string>& arr) {
+assert_in(ScalarIndex<std::string>* index,
+          const std::vector<std::string>& arr) {
     auto bitset1 = index->In(arr.size(), arr.data());
-    ASSERT_EQ(arr.size(), bitset1->size());
-    ASSERT_TRUE(bitset1->any());
+    ASSERT_EQ(arr.size(), bitset1.size());
+    ASSERT_TRUE(Any(bitset1));
 }
 
 template <>
 inline void
-assert_not_in(ScalarIndex<std::string>* index, const std::vector<std::string>& arr) {
+assert_not_in(ScalarIndex<std::string>* index,
+              const std::vector<std::string>& arr) {
     auto bitset1 = index->NotIn(arr.size(), arr.data());
-    ASSERT_EQ(arr.size(), bitset1->size());
-    ASSERT_TRUE(bitset1->none());
+    ASSERT_EQ(arr.size(), bitset1.size());
+    ASSERT_TRUE(BitSetNone(bitset1));
 }
 
 template <>
 inline void
-assert_range(ScalarIndex<std::string>* index, const std::vector<std::string>& arr) {
+assert_range(ScalarIndex<std::string>* index,
+             const std::vector<std::string>& arr) {
     auto test_min = arr[0];
     auto test_max = arr[arr.size() - 1];
 
     auto bitset2 = index->Range(test_min, milvus::OpType::GreaterEqual);
-    ASSERT_EQ(arr.size(), bitset2->size());
-    ASSERT_TRUE(bitset2->any());
+    ASSERT_EQ(arr.size(), bitset2.size());
+    ASSERT_TRUE(Any(bitset2));
 
     auto bitset4 = index->Range(test_max, milvus::OpType::LessEqual);
-    ASSERT_EQ(arr.size(), bitset4->size());
-    ASSERT_TRUE(bitset4->any());
+    ASSERT_EQ(arr.size(), bitset4.size());
+    ASSERT_TRUE(Any(bitset4));
 
     auto bitset5 = index->Range(test_min, true, test_max, true);
-    ASSERT_EQ(arr.size(), bitset5->size());
-    ASSERT_TRUE(bitset5->any());
+    ASSERT_EQ(arr.size(), bitset5.size());
+    ASSERT_TRUE(Any(bitset5));
 }
 }  // namespace

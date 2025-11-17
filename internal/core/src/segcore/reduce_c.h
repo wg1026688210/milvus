@@ -18,9 +18,27 @@ extern "C" {
 #include "segcore/segment_c.h"
 
 typedef void* CSearchResultDataBlobs;
+typedef void* CSearchStreamReducer;
 
 CStatus
-ReduceSearchResultsAndFillData(CSearchResultDataBlobs* cSearchResultDataBlobs,
+NewStreamReducer(CSearchPlan c_plan,
+                 int64_t* slice_nqs,
+                 int64_t* slice_topKs,
+                 int64_t num_slices,
+                 CSearchStreamReducer* stream_reducer);
+
+CStatus
+StreamReduce(CSearchStreamReducer c_stream_reducer,
+             CSearchResult* c_search_results,
+             int64_t num_segments);
+
+CStatus
+GetStreamReduceResult(CSearchStreamReducer c_stream_reducer,
+                      CSearchResultDataBlobs* c_search_result_data_blobs);
+
+CStatus
+ReduceSearchResultsAndFillData(CTraceContext c_trace,
+                               CSearchResultDataBlobs* cSearchResultDataBlobs,
                                CSearchPlan c_plan,
                                CSearchResult* search_results,
                                int64_t num_segments,
@@ -30,11 +48,16 @@ ReduceSearchResultsAndFillData(CSearchResultDataBlobs* cSearchResultDataBlobs,
 
 CStatus
 GetSearchResultDataBlob(CProto* searchResultDataBlob,
+                        int64_t* scanned_remote_bytes,
+                        int64_t* scanned_total_bytes,
                         CSearchResultDataBlobs cSearchResultDataBlobs,
                         int32_t blob_index);
 
 void
 DeleteSearchResultDataBlobs(CSearchResultDataBlobs cSearchResultDataBlobs);
+
+void
+DeleteStreamSearchReducer(CSearchStreamReducer c_stream_reducer);
 
 #ifdef __cplusplus
 }

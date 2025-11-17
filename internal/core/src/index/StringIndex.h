@@ -16,29 +16,35 @@
 
 #pragma once
 
-#include "index/ScalarIndex.h"
-#include <string>
-#include <memory>
-#include <vector>
-#include "index/Meta.h"
 #include <pb/schema.pb.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "index/Meta.h"
+#include "index/ScalarIndex.h"
 
 namespace milvus::index {
 
 class StringIndex : public ScalarIndex<std::string> {
  public:
-    const TargetBitmapPtr
+    StringIndex(const std::string& index_type)
+        : ScalarIndex<std::string>(index_type) {
+    }
+
+    const TargetBitmap
     Query(const DatasetPtr& dataset) override {
         auto op = dataset->Get<OpType>(OPERATOR_TYPE);
         if (op == OpType::PrefixMatch) {
-            auto prefix = dataset->Get<std::string>(PREFIX_VALUE);
+            auto prefix = dataset->Get<std::string>(MATCH_VALUE);
             return PrefixMatch(prefix);
         }
         return ScalarIndex<std::string>::Query(dataset);
     }
 
-    virtual const TargetBitmapPtr
-    PrefixMatch(std::string prefix) = 0;
+    virtual const TargetBitmap
+    PrefixMatch(const std::string_view prefix) = 0;
 };
 using StringIndexPtr = std::unique_ptr<StringIndex>;
 }  // namespace milvus::index

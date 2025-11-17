@@ -18,15 +18,17 @@ package components
 
 import (
 	"context"
+	"time"
 
-	"github.com/milvus-io/milvus/api/commonpb"
-	"github.com/milvus-io/milvus/api/milvuspb"
+	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/internal/log"
-	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	grpcquerynode "github.com/milvus-io/milvus/internal/distributed/querynode"
+	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // QueryNode implements QueryNode grpc server
@@ -46,24 +48,26 @@ func NewQueryNode(ctx context.Context, factory dependency.Factory) (*QueryNode, 
 		ctx: ctx,
 		svr: svr,
 	}, nil
+}
 
+func (q *QueryNode) Prepare() error {
+	return q.svr.Prepare()
 }
 
 // Run starts service
 func (q *QueryNode) Run() error {
 	if err := q.svr.Run(); err != nil {
-		panic(err)
+		log.Ctx(q.ctx).Error("QueryNode starts error", zap.Error(err))
+		return err
 	}
-	log.Debug("QueryNode successfully started")
+	log.Ctx(q.ctx).Info("QueryNode successfully started")
 	return nil
 }
 
 // Stop terminates service
 func (q *QueryNode) Stop() error {
-	if err := q.svr.Stop(); err != nil {
-		return err
-	}
-	return nil
+	timeout := paramtable.Get().QueryNodeCfg.GracefulStopTimeout.GetAsDuration(time.Second)
+	return exitWhenStopTimeout(q.svr.Stop, timeout)
 }
 
 // GetComponentStates returns QueryNode's states

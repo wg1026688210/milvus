@@ -19,21 +19,24 @@
 #include <tbb/concurrent_hash_map.h>
 
 #include "common/Types.h"
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
+#include "index/Index.h"
 #include "index/VectorIndex.h"
 
 namespace milvus::segcore {
 
 struct SealedIndexingEntry {
     MetricType metric_type_;
-    index::IndexBasePtr indexing_;
+    index::CacheIndexBasePtr indexing_;
 };
 
-using SealedIndexingEntryPtr = std::unique_ptr<SealedIndexingEntry>;
+using SealedIndexingEntryPtr = std::shared_ptr<SealedIndexingEntry>;
 
 struct SealedIndexingRecord {
     void
-    append_field_indexing(FieldId field_id, const MetricType& metric_type, index::IndexBasePtr indexing) {
+    append_field_indexing(FieldId field_id,
+                          const MetricType& metric_type,
+                          index::CacheIndexBasePtr indexing) {
         auto ptr = std::make_unique<SealedIndexingEntry>();
         ptr->indexing_ = std::move(indexing);
         ptr->metric_type_ = metric_type;
@@ -41,11 +44,11 @@ struct SealedIndexingRecord {
         field_indexings_[field_id] = std::move(ptr);
     }
 
-    const SealedIndexingEntry*
+    const SealedIndexingEntryPtr
     get_field_indexing(FieldId field_id) const {
         std::shared_lock lck(mutex_);
         AssertInfo(field_indexings_.count(field_id), "field_id not found");
-        return field_indexings_.at(field_id).get();
+        return field_indexings_.at(field_id);
     }
 
     void
@@ -58,6 +61,12 @@ struct SealedIndexingRecord {
     is_ready(FieldId field_id) const {
         std::shared_lock lck(mutex_);
         return field_indexings_.count(field_id);
+    }
+
+    void
+    clear() {
+        std::unique_lock lck(mutex_);
+        field_indexings_.clear();
     }
 
  private:

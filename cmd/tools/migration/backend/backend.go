@@ -6,11 +6,9 @@ import (
 	"github.com/blang/semver/v4"
 
 	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
-
 	"github.com/milvus-io/milvus/cmd/tools/migration/meta"
-	"github.com/milvus-io/milvus/internal/util"
+	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
+	"github.com/milvus-io/milvus/pkg/v2/util"
 )
 
 type Backend interface {
@@ -18,13 +16,13 @@ type Backend interface {
 	Save(meta *meta.Meta) error
 	Clean() error
 	Backup(meta *meta.Meta, backupFile string) error
+	BackupV2(file string) error
 	Restore(backupFile string) error
 }
 
 func NewBackend(cfg *configs.MilvusConfig, version string) (Backend, error) {
-	switch cfg.MetaStoreCfg.MetaStoreType {
-	case util.MetaStoreTypeMysql:
-		return nil, fmt.Errorf("%s is not supported now", cfg.MetaStoreCfg.MetaStoreType)
+	if cfg.MetaStoreCfg.MetaStoreType.GetValue() != util.MetaStoreTypeEtcd {
+		return nil, fmt.Errorf("%s is not supported now", cfg.MetaStoreCfg.MetaStoreType.GetValue())
 	}
 	v, err := semver.Parse(version)
 	if err != nil {

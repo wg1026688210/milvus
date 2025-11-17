@@ -18,13 +18,14 @@ package allocator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/log"
+	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/pkg/v2/log"
 )
 
 const (
@@ -255,8 +256,8 @@ func (ta *CachedAllocator) failRemainRequest() {
 	}
 	if len(ta.ToDoReqs) > 0 {
 		log.Warn("Allocator has some reqs to fail",
-			zap.Any("Role", ta.Role),
-			zap.Any("reqLen", len(ta.ToDoReqs)))
+			zap.String("Role", ta.Role),
+			zap.Int("reqLen", len(ta.ToDoReqs)))
 	}
 	for _, req := range ta.ToDoReqs {
 		if req != nil {

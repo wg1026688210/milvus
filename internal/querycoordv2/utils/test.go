@@ -17,13 +17,14 @@
 package utils
 
 import (
-	"github.com/milvus-io/milvus/internal/proto/datapb"
-	"github.com/milvus-io/milvus/internal/proto/querypb"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-func CreateTestLeaderView(id, collection int64, channel string, segments map[int64]int64, growings []int64) *meta.LeaderView {
+func CreateTestLeaderView(id, collection int64, channel string, segments map[int64]int64, growings map[int64]*meta.Segment) *meta.LeaderView {
 	segmentVersions := make(map[int64]*querypb.SegmentDist)
 	for segment, node := range segments {
 		segmentVersions[segment] = &querypb.SegmentDist{
@@ -36,7 +37,7 @@ func CreateTestLeaderView(id, collection int64, channel string, segments map[int
 		CollectionID:    collection,
 		Channel:         channel,
 		Segments:        segmentVersions,
-		GrowingSegments: typeutil.NewUniqueSet(growings...),
+		GrowingSegments: growings,
 	}
 }
 
@@ -52,13 +53,30 @@ func CreateTestChannel(collection, node, version int64, channel string) *meta.Dm
 }
 
 func CreateTestReplica(id, collectionID int64, nodes []int64) *meta.Replica {
-	return &meta.Replica{
-		Replica: &querypb.Replica{
-			ID:           id,
-			CollectionID: collectionID,
-			Nodes:        nodes,
+	return meta.NewReplica(
+		&querypb.Replica{
+			ID:            id,
+			CollectionID:  collectionID,
+			Nodes:         nodes,
+			ResourceGroup: meta.DefaultResourceGroupName,
 		},
-		Nodes: typeutil.NewUniqueSet(nodes...),
+		typeutil.NewUniqueSet(nodes...),
+	)
+}
+
+func CreateTestSchema() *schemapb.CollectionSchema {
+	return &schemapb.CollectionSchema{
+		Name:        "schema",
+		Description: "schema",
+		AutoID:      true,
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      101,
+				Name:         "id",
+				IsPrimaryKey: false,
+				DataType:     schemapb.DataType_Int64,
+			},
+		},
 	}
 }
 
@@ -67,6 +85,16 @@ func CreateTestCollection(collection int64, replica int32) *meta.Collection {
 		CollectionLoadInfo: &querypb.CollectionLoadInfo{
 			CollectionID:  collection,
 			ReplicaNumber: replica,
+		},
+	}
+}
+
+func CreateTestPartition(collection int64, partitionID int64) *meta.Partition {
+	return &meta.Partition{
+		PartitionLoadInfo: &querypb.PartitionLoadInfo{
+			CollectionID:  collection,
+			PartitionID:   partitionID,
+			ReplicaNumber: 1,
 		},
 	}
 }

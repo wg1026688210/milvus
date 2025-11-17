@@ -17,14 +17,16 @@
 package storage
 
 import (
-	"github.com/milvus-io/milvus/api/schemapb"
-	"github.com/milvus-io/milvus/internal/common"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/v2/common"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // DataSorter sorts insert data
 type DataSorter struct {
 	InsertCodec *InsertCodec
 	InsertData  *InsertData
+	AllFields   []*schemapb.FieldSchema
 }
 
 // getRowIDFieldData returns auto generated row id Field
@@ -50,7 +52,10 @@ func (ds *DataSorter) Len() int {
 
 // Swap swaps each field's i-th and j-th element
 func (ds *DataSorter) Swap(i, j int) {
-	for _, field := range ds.InsertCodec.Schema.Schema.Fields {
+	if ds.AllFields == nil {
+		ds.AllFields = typeutil.GetAllFieldSchemas(ds.InsertCodec.Schema.Schema)
+	}
+	for _, field := range ds.AllFields {
 		singleData, has := ds.InsertData.Data[field.FieldID]
 		if !has {
 			continue
@@ -77,6 +82,9 @@ func (ds *DataSorter) Swap(i, j int) {
 		case schemapb.DataType_Double:
 			data := singleData.(*DoubleFieldData).Data
 			data[i], data[j] = data[j], data[i]
+		case schemapb.DataType_Timestamptz:
+			data := singleData.(*TimestamptzFieldData).Data
+			data[i], data[j] = data[j], data[i]
 		case schemapb.DataType_String, schemapb.DataType_VarChar:
 			data := singleData.(*StringFieldData).Data
 			data[i], data[j] = data[j], data[i]
@@ -94,6 +102,35 @@ func (ds *DataSorter) Swap(i, j int) {
 			for idx := 0; idx < dim; idx++ {
 				data[i*dim+idx], data[j*dim+idx] = data[j*dim+idx], data[i*dim+idx]
 			}
+		case schemapb.DataType_Float16Vector:
+			data := singleData.(*Float16VectorFieldData).Data
+			dim := singleData.(*Float16VectorFieldData).Dim
+			steps := dim * 2
+			for idx := 0; idx < steps; idx++ {
+				data[i*steps+idx], data[j*steps+idx] = data[j*steps+idx], data[i*steps+idx]
+			}
+		case schemapb.DataType_BFloat16Vector:
+			data := singleData.(*BFloat16VectorFieldData).Data
+			dim := singleData.(*BFloat16VectorFieldData).Dim
+			steps := dim * 2
+			for idx := 0; idx < steps; idx++ {
+				data[i*steps+idx], data[j*steps+idx] = data[j*steps+idx], data[i*steps+idx]
+			}
+		case schemapb.DataType_Array:
+			data := singleData.(*ArrayFieldData).Data
+			data[i], data[j] = data[j], data[i]
+		case schemapb.DataType_JSON:
+			data := singleData.(*JSONFieldData).Data
+			data[i], data[j] = data[j], data[i]
+		case schemapb.DataType_Geometry:
+			data := singleData.(*GeometryFieldData).Data
+			data[i], data[j] = data[j], data[i]
+		case schemapb.DataType_SparseFloatVector:
+			fieldData := singleData.(*SparseFloatVectorFieldData)
+			fieldData.Contents[i], fieldData.Contents[j] = fieldData.Contents[j], fieldData.Contents[i]
+		case schemapb.DataType_ArrayOfVector:
+			fieldData := singleData.(*VectorArrayFieldData)
+			fieldData.Data[i], fieldData.Data[j] = fieldData.Data[j], fieldData.Data[i]
 		default:
 			errMsg := "undefined data type " + string(field.DataType)
 			panic(errMsg)

@@ -3,38 +3,43 @@ package migration
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
-
 	"github.com/blang/semver/v4"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/console"
+	"github.com/cockroachdb/errors"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/atomic"
 
 	"github.com/milvus-io/milvus/cmd/tools/migration/backend"
-	clientv3 "go.etcd.io/etcd/client/v3"
-
-	"github.com/milvus-io/milvus/internal/util/etcd"
+	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
+	"github.com/milvus-io/milvus/cmd/tools/migration/console"
+	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/etcd"
 )
 
 type Runner struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	cfg      *configs.Config
-	initOnce sync.Once
-	session  *sessionutil.Session
-	address  string
-	etcdCli  *clientv3.Client
-	wg       sync.WaitGroup
+	ctx            context.Context
+	cancel         context.CancelFunc
+	cfg            *configs.Config
+	initOnce       sync.Once
+	session        *sessionutil.Session
+	address        string
+	etcdCli        *clientv3.Client
+	wg             sync.WaitGroup
+	backupFinished atomic.Bool
 }
 
 func NewRunner(ctx context.Context, cfg *configs.Config) *Runner {
 	ctx1, cancel := context.WithCancel(ctx)
-	runner := &Runner{ctx: ctx1, cancel: cancel, cfg: cfg}
+	runner := &Runner{
+		ctx:            ctx1,
+		cancel:         cancel,
+		cfg:            cfg,
+		backupFinished: *atomic.NewBool(false),
+	}
 	runner.initOnce.Do(runner.init)
 	return runner
 }
@@ -42,7 +47,8 @@ func NewRunner(ctx context.Context, cfg *configs.Config) *Runner {
 func (r *Runner) watchByPrefix(prefix string) {
 	defer r.wg.Done()
 	_, revision, err := r.session.GetSessions(prefix)
-	console.ExitIf(err)
+	fn := func() { r.Stop() }
+	console.AbnormalExitIf(err, r.backupFinished.Load(), console.AddCallbacks(fn))
 	eventCh := r.session.WatchServices(prefix, revision, nil)
 	for {
 		select {
@@ -50,7 +56,7 @@ func (r *Runner) watchByPrefix(prefix string) {
 			return
 		case event := <-eventCh:
 			msg := fmt.Sprintf("session up/down, exit migration, event type: %s, session: %s", event.EventType.String(), event.Session.String())
-			console.Exit(msg)
+			console.AbnormalExit(r.backupFinished.Load(), msg, console.AddCallbacks(fn))
 		}
 	}
 }
@@ -63,15 +69,31 @@ func (r *Runner) WatchSessions() {
 }
 
 func (r *Runner) initEtcdCli() {
-	cli, err := etcd.GetEtcdClient(r.cfg.EtcdCfg)
-	console.ExitIf(err)
+	cli, err := etcd.CreateEtcdClient(
+		r.cfg.EtcdCfg.UseEmbedEtcd.GetAsBool(),
+		r.cfg.EtcdCfg.EtcdEnableAuth.GetAsBool(),
+		r.cfg.EtcdCfg.EtcdAuthUserName.GetValue(),
+		r.cfg.EtcdCfg.EtcdAuthPassword.GetValue(),
+		r.cfg.EtcdCfg.EtcdUseSSL.GetAsBool(),
+		r.cfg.EtcdCfg.Endpoints.GetAsStrings(),
+		r.cfg.EtcdCfg.EtcdTLSCert.GetValue(),
+		r.cfg.EtcdCfg.EtcdTLSKey.GetValue(),
+		r.cfg.EtcdCfg.EtcdTLSCACert.GetValue(),
+		r.cfg.EtcdCfg.EtcdTLSMinVersion.GetValue(),
+		r.cfg.EtcdCfg.ClientOptions()...)
+	console.AbnormalExitIf(err, r.backupFinished.Load())
 	r.etcdCli = cli
 }
 
 func (r *Runner) init() {
 	r.initEtcdCli()
-
-	r.session = sessionutil.NewSession(r.ctx, r.cfg.EtcdCfg.MetaRootPath, r.etcdCli)
+	r.session = sessionutil.NewSessionWithEtcd(
+		r.ctx,
+		r.cfg.EtcdCfg.MetaRootPath.GetValue(),
+		r.etcdCli,
+		sessionutil.WithTTL(60),
+		sessionutil.WithRetryTimes(30),
+	)
 	// address not important here.
 	address := time.Now().String()
 	r.address = address
@@ -123,7 +145,7 @@ func (r *Runner) checkMySelf() error {
 	}
 	for _, session := range sessions {
 		if session.Address != r.address {
-			return fmt.Errorf("other migration is running")
+			return errors.New("other migration is running")
 		}
 	}
 	return nil
@@ -143,7 +165,7 @@ func (r *Runner) CheckSessions() error {
 
 func (r *Runner) RegisterSession() error {
 	r.session.Register()
-	go r.session.LivenessCheck(r.ctx, func() {})
+	r.session.LivenessCheck(r.ctx, func() {})
 	return nil
 }
 
@@ -152,11 +174,11 @@ func (r *Runner) Backup() error {
 	if err != nil {
 		return err
 	}
-	metas, err := source.Load()
-	if err != nil {
+	if err := source.BackupV2(r.cfg.BackupFilePath); err != nil {
 		return err
 	}
-	return source.Backup(metas, r.cfg.BackupFilePath)
+	r.backupFinished.Store(true)
+	return nil
 }
 
 func (r *Runner) Rollback() error {
@@ -190,9 +212,6 @@ func (r *Runner) Migrate() error {
 	if err != nil {
 		return err
 	}
-	if err := source.Backup(metas, r.cfg.BackupFilePath); err != nil {
-		return err
-	}
 	if err := source.Clean(); err != nil {
 		return err
 	}
@@ -207,8 +226,28 @@ func (r *Runner) Migrate() error {
 	return target.Save(targetMetas)
 }
 
+func (r *Runner) waitUntilSessionExpired() {
+	for {
+		err := r.checkSessionsWithPrefix(Role)
+		if err == nil {
+			console.Success("migration session expired")
+			return
+		}
+
+		// TODO: better to wrap this error.
+		if !strings.Contains(err.Error(), "there are still sessions alive") {
+			console.Warning(err.Error())
+			return
+		}
+
+		// 1s may be enough to expire the lease session.
+		time.Sleep(time.Second)
+	}
+}
+
 func (r *Runner) Stop() {
 	r.session.Revoke(time.Second)
+	r.waitUntilSessionExpired()
 	r.cancel()
 	r.wg.Wait()
 }

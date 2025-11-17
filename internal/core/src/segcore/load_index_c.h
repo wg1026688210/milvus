@@ -17,31 +17,42 @@ extern "C" {
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "common/resource_c.h"
 #include "common/binary_set_c.h"
 #include "common/type_c.h"
 #include "segcore/collection_c.h"
 
 typedef void* CLoadIndexInfo;
 
+bool
+IsLoadWithDisk(const char* index_type, int index_engine_version);
+
 CStatus
-NewLoadIndexInfo(CLoadIndexInfo* c_load_index_info, CStorageConfig c_storage_config);
+NewLoadIndexInfo(CLoadIndexInfo* c_load_index_info);
 
 void
 DeleteLoadIndexInfo(CLoadIndexInfo c_load_index_info);
 
 CStatus
-AppendIndexParam(CLoadIndexInfo c_load_index_info, const char* index_key, const char* index_value);
+AppendIndexParam(CLoadIndexInfo c_load_index_info,
+                 const char* index_key,
+                 const char* index_value);
+
+LoadResourceRequest
+EstimateLoadIndexResource(CLoadIndexInfo c_load_index_info);
+
+bool
+TryReserveLoadingResourceWithTimeout(CResourceUsage size,
+                                     int64_t millisecond_timeout);
+
+void
+ReleaseLoadingResource(CResourceUsage size);
 
 CStatus
-AppendFieldInfo(CLoadIndexInfo c_load_index_info,
-                int64_t collection_id,
-                int64_t partition_id,
-                int64_t segment_id,
-                int64_t field_id,
-                enum CDataType field_type);
-
-CStatus
-AppendIndexInfo(CLoadIndexInfo c_load_index_info, int64_t index_id, int64_t build_id, int64_t version);
+AppendIndexInfo(CLoadIndexInfo c_load_index_info,
+                int64_t index_id,
+                int64_t build_id,
+                int64_t version);
 
 CStatus
 AppendIndex(CLoadIndexInfo c_load_index_info, CBinarySet c_binary_set);
@@ -50,8 +61,24 @@ CStatus
 AppendIndexFilePath(CLoadIndexInfo c_load_index_info, const char* file_path);
 
 CStatus
+AppendIndexV2(CTraceContext c_trace, CLoadIndexInfo c_load_index_info);
+
+CStatus
+AppendIndexEngineVersionToLoadInfo(CLoadIndexInfo c_load_index_info,
+                                   int32_t index_engine_version);
+
+CStatus
 CleanLoadedIndex(CLoadIndexInfo c_load_index_info);
 
+void
+AppendStorageInfo(CLoadIndexInfo c_load_index_info,
+                  const char* uri,
+                  int64_t version);
+
+CStatus
+FinishLoadIndexInfo(CLoadIndexInfo c_load_index_info,
+                    const uint8_t* serialized_load_index_info,
+                    const uint64_t len);
 #ifdef __cplusplus
 }
 #endif

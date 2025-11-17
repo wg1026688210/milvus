@@ -8,8 +8,8 @@ import (
 	"path"
 	"syscall"
 
-	"github.com/milvus-io/milvus/internal/util/hardware"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 const (
@@ -34,7 +34,7 @@ func (c *stop) execute(args []string, flags *flag.FlagSet) {
 		fmt.Fprintln(os.Stderr, c.getHelp())
 	}
 	c.serverType = args[2]
-	if _, ok := typeutil.ServerTypeMap()[c.serverType]; !ok {
+	if !typeutil.ServerTypeSet().Contain(c.serverType) {
 		fmt.Fprintf(os.Stderr, "Unknown server type = %s\n", c.serverType)
 		os.Exit(-1)
 	}
@@ -61,7 +61,7 @@ func (c *stop) formatFlags(args []string, flags *flag.FlagSet) {
 func (c *stop) stopPid(filename string, runtimeDir string) error {
 	var pid int
 
-	fd, err := os.OpenFile(path.Join(runtimeDir, filename), os.O_RDONLY, 0664)
+	fd, err := os.OpenFile(path.Join(runtimeDir, filename), os.O_RDONLY, 0o664)
 	if err != nil {
 		return err
 	}

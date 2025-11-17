@@ -22,13 +22,16 @@ def pytest_addoption(parser):
     parser.addoption("--host", action="store", default="localhost", help="service's ip")
     parser.addoption("--service", action="store", default="", help="service address")
     parser.addoption("--port", action="store", default=19530, help="service's port")
-    parser.addoption("--user", action="store", default="", help="user name for connection")
-    parser.addoption("--password", action="store", default="", help="password for connection")
-    parser.addoption("--secure", type=bool, action="store", default=True, help="secure for connection")
+    parser.addoption("--user", action="store", default="root", help="user name for connection")
+    parser.addoption("--password", action="store", default="Milvus", help="password for connection")
+    parser.addoption("--db_name", action="store", default="default", help="database name for connection")
+    parser.addoption("--secure", action="store", default=False, help="secure for connection")
+    parser.addoption("--milvus_ns", action="store", default="chaos-testing", help="milvus_ns")
     parser.addoption("--http_port", action="store", default=19121, help="http's port")
     parser.addoption("--handler", action="store", default="GRPC", help="handler of request")
     parser.addoption("--tag", action="store", default="all", help="only run tests matching the tag.")
     parser.addoption('--dry_run', action='store_true', default=False, help="")
+    parser.addoption('--database_name', action='store', default="default", help="name of database")
     parser.addoption('--partition_name', action='store', default="partition_name", help="name of partition")
     parser.addoption('--connect_name', action='store', default="connect_name", help="name of connect")
     parser.addoption('--descriptions', action='store', default="partition_des", help="descriptions of partition")
@@ -42,8 +45,19 @@ def pytest_addoption(parser):
     parser.addoption('--term_expr', action='store', default="term_expr", help="expr of query quest")
     parser.addoption('--check_content', action='store', default="check_content", help="content of check")
     parser.addoption('--field_name', action='store', default="field_name", help="field_name of index")
-    parser.addoption('--replica_num', type='int', action='store', default=ct.default_replica_num, help="memory replica number")
+    parser.addoption('--replica_num', action='store', default=ct.default_replica_num, help="memory replica number")
+    parser.addoption('--minio_host', action='store', default="localhost", help="minio service's ip")
+    parser.addoption('--minio_bucket', action='store', default="milvus-bucket", help="minio bucket name")
+    parser.addoption('--uri', action='store', default="", help="uri for milvus client")
+    parser.addoption('--token', action='store', default="root:Milvus", help="token for milvus client")
+    parser.addoption("--request_duration", action="store", default="10m", help="request_duration")
+    parser.addoption('--data_size', type=int, action='store', default=3000, help="data size for deploy test")
+    parser.addoption("--is_check", action="store", type=bool, default=False, help="is_check")
+    # a tei endpoint for text embedding, default is http://text-embeddings-service.milvus-ci.svc.cluster.local:80 which is deployed in house
+    parser.addoption("--tei_endpoint", action="store", default="http://text-embeddings-service.milvus-ci.svc.cluster.local:80", help="tei embedding endpoint")
 
+    parser.addoption("--tei_reranker_endpoint", action="store", default="http://text-rerank-service.milvus-ci.svc.cluster.local:80", help="tei rerank endpoint")
+    parser.addoption("--vllm_reranker_endpoint", action="store", default="http://vllm-rerank-service.milvus-ci.svc.cluster.local:80", help="vllm rerank endpoint")
 
 @pytest.fixture
 def host(request):
@@ -71,8 +85,18 @@ def password(request):
 
 
 @pytest.fixture
+def db_name(request):
+    return request.config.getoption("--db_name")
+
+
+@pytest.fixture
 def secure(request):
     return request.config.getoption("--secure")
+
+
+@pytest.fixture
+def milvus_ns(request):
+    return request.config.getoption("--milvus_ns")
 
 
 @pytest.fixture
@@ -98,6 +122,11 @@ def dry_run(request):
 @pytest.fixture
 def connect_name(request):
     return request.config.getoption("--connect_name")
+
+
+@pytest.fixture
+def database_name(request):
+    return request.config.getoption("--database_name")
 
 
 @pytest.fixture
@@ -162,6 +191,49 @@ def field_name(request):
     return request.config.getoption("--field_name")
 
 
+@pytest.fixture
+def minio_host(request):
+    return request.config.getoption("--minio_host")
+
+@pytest.fixture
+def minio_bucket(request):
+    return request.config.getoption("--minio_bucket")
+
+
+@pytest.fixture
+def uri(request):
+    return request.config.getoption("--uri")
+
+
+@pytest.fixture
+def token(request):
+    return request.config.getoption("--token")
+
+
+@pytest.fixture
+def request_duration(request):
+    return request.config.getoption("--request_duration")
+
+@pytest.fixture
+def tei_endpoint(request):
+    return request.config.getoption("--tei_endpoint")
+
+@pytest.fixture
+def tei_reranker_endpoint(request):
+    return request.config.getoption("--tei_reranker_endpoint")
+
+@pytest.fixture
+def vllm_reranker_endpoint(request):
+    return request.config.getoption("--vllm_reranker_endpoint")
+
+@pytest.fixture
+def data_size(request):
+    return request.config.getoption("--data_size")
+
+@pytest.fixture
+def is_check(request):
+    return request.config.getoption("--is_check")
+
 """ fixture func """
 
 
@@ -176,6 +248,9 @@ def initialize_env(request):
     secure = request.config.getoption("--secure")
     clean_log = request.config.getoption("--clean_log")
     replica_num = request.config.getoption("--replica_num")
+    uri = request.config.getoption("--uri")
+    token = request.config.getoption("--token")
+    minio_bucket = request.config.getoption("--minio_bucket")
 
     """ params check """
     assert ip_check(host) and number_check(port)
@@ -188,44 +263,13 @@ def initialize_env(request):
 
     log.info("#" * 80)
     log.info("[initialize_milvus] Log cleaned up, start testing...")
-    param_info.prepare_param_info(host, port, handler, replica_num, user, password, secure)
-
-
-@pytest.fixture(params=ct.get_invalid_strs)
-def get_invalid_string(request):
-    yield request.param
-
-
-@pytest.fixture(params=cf.gen_simple_index())
-def get_index_param(request):
-    yield request.param
-
-
-@pytest.fixture(params=ct.get_invalid_strs)
-def get_invalid_collection_name(request):
-    yield request.param
-
-
-@pytest.fixture(params=ct.get_invalid_strs)
-def get_invalid_field_name(request):
-    yield request.param
-
-
-@pytest.fixture(params=ct.get_invalid_strs)
-def get_invalid_index_type(request):
-    yield request.param
+    param_info.prepare_param_info(host, port, handler, replica_num, user, password, secure, uri, token, minio_bucket)
 
 
 # TODO: construct invalid index params for all index types
 @pytest.fixture(params=[{"metric_type": "L3", "index_type": "IVF_FLAT"},
-                        {"metric_type": "L2", "index_type": "IVF_FLAT", "err_params": {"nlist": 10}},
                         {"metric_type": "L2", "index_type": "IVF_FLAT", "params": {"nlist": -1}}])
 def get_invalid_index_params(request):
-    yield request.param
-
-
-@pytest.fixture(params=ct.get_invalid_strs)
-def get_invalid_partition_name(request):
     yield request.param
 
 
@@ -315,7 +359,7 @@ def check_server_connection(request):
 #     yield
 
 
-@pytest.fixture(scope="module")
+# @pytest.fixture(scope="module")
 def connect(request):
     host = request.config.getoption("--host")
     service_name = request.config.getoption("--service")
@@ -342,7 +386,7 @@ def connect(request):
     return milvus
 
 
-@pytest.fixture(scope="module")
+# @pytest.fixture(scope="module")
 def dis_connect(request):
     host = request.config.getoption("--host")
     service_name = request.config.getoption("--service")

@@ -10,56 +10,53 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <map>
+#include <utility>
 
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "index/Utils.h"
 #include "index/IndexFactory.h"
 #include "pb/index_cgo_msg.pb.h"
 
-#ifdef BUILD_DISK_ANN
-#include "storage/DiskFileManagerImpl.h"
-#endif
-
 namespace milvus::indexbuilder {
 
-VecIndexCreator::VecIndexCreator(DataType data_type,
-                                 const char* serialized_type_params,
-                                 const char* serialized_index_params,
-                                 const storage::StorageConfig& storage_config)
-    : data_type_(data_type) {
-    proto::indexcgo::TypeParams type_params_;
-    proto::indexcgo::IndexParams index_params_;
-    milvus::index::ParseFromString(type_params_, std::string(serialized_type_params));
-    milvus::index::ParseFromString(index_params_, std::string(serialized_index_params));
+VecIndexCreator::VecIndexCreator(
+    DataType data_type,
+    Config& config,
+    const storage::FileManagerContext& file_manager_context)
+    : VecIndexCreator(data_type, "", 0, config, file_manager_context) {
+}
 
-    for (auto i = 0; i < type_params_.params_size(); ++i) {
-        const auto& param = type_params_.params(i);
-        config_[param.key()] = param.value();
+VecIndexCreator::VecIndexCreator(
+    DataType data_type,
+    const std::string& field_name,
+    const int64_t dim,
+    Config& config,
+    const storage::FileManagerContext& file_manager_context)
+    : config_(config), data_type_(data_type) {
+    if (data_type == DataType::VECTOR_ARRAY) {
+        // TODO(SpadeA): record dim in config as there's the dim cannot be inferred in
+        // parquet due to the serialize method of vector array.
+        // This should be a temp solution.
+        config_[DIM_KEY] = file_manager_context.indexMeta.dim;
     }
 
-    for (auto i = 0; i < index_params_.params_size(); ++i) {
-        const auto& param = index_params_.params(i);
-        config_[param.key()] = param.value();
-    }
+    config_["build_id"] =
+        std::to_string(file_manager_context.indexMeta.build_id);
 
     index::CreateIndexInfo index_info;
     index_info.field_type = data_type_;
-    index_info.index_mode = index::GetIndexModeFromConfig(config_);
     index_info.index_type = index::GetIndexTypeFromConfig(config_);
     index_info.metric_type = index::GetMetricTypeFromConfig(config_);
+    index_info.field_name = field_name;
+    index_info.index_engine_version =
+        index::GetIndexEngineVersionFromConfig(config_);
+    index_info.dim = dim;
 
-    std::shared_ptr<storage::FileManagerImpl> file_manager = nullptr;
-#ifdef BUILD_DISK_ANN
-    if (index::is_in_disk_list(index_info.index_type)) {
-        // For now, only support diskann index
-        file_manager = std::make_shared<storage::DiskFileManagerImpl>(
-            index::GetFieldDataMetaFromConfig(config_), index::GetIndexMetaFromConfig(config_), storage_config);
-    }
-#endif
-
-    index_ = index::IndexFactory::GetInstance().CreateIndex(index_info, file_manager);
-    AssertInfo(index_ != nullptr, "[VecIndexCreator]Index is null after create index");
+    index_ = index::IndexFactory::GetInstance().CreateIndex(
+        index_info, file_manager_context);
+    AssertInfo(index_ != nullptr,
+               "[VecIndexCreator]Index is null after create index");
 }
 
 int64_t
@@ -70,6 +67,11 @@ VecIndexCreator::dim() {
 void
 VecIndexCreator::Build(const milvus::DatasetPtr& dataset) {
     index_->BuildWithDataset(dataset, config_);
+}
+
+void
+VecIndexCreator::Build() {
+    index_->Build(config_);
 }
 
 milvus::BinarySet
@@ -83,9 +85,20 @@ VecIndexCreator::Load(const milvus::BinarySet& binary_set) {
 }
 
 std::unique_ptr<SearchResult>
-VecIndexCreator::Query(const milvus::DatasetPtr& dataset, const SearchInfo& search_info, const BitsetView& bitset) {
+VecIndexCreator::Query(const milvus::DatasetPtr& dataset,
+                       const SearchInfo& search_info,
+                       const BitsetView& bitset,
+                       milvus::OpContext* op_context) {
     auto vector_index = dynamic_cast<index::VectorIndex*>(index_.get());
-    return vector_index->Query(dataset, search_info, bitset);
+    auto search_result = std::make_unique<SearchResult>();
+    vector_index->Query(
+        dataset, search_info, bitset, op_context, *search_result);
+    return search_result;
+}
+
+index::IndexStatsPtr
+VecIndexCreator::Upload() {
+    return index_->Upload();
 }
 
 void

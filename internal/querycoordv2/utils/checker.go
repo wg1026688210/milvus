@@ -18,8 +18,41 @@ package utils
 
 import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
+
+const (
+	SegmentCheckerName = "segment_checker"
+	ChannelCheckerName = "channel_checker"
+	BalanceCheckerName = "balance_checker"
+	IndexCheckerName   = "index_checker"
+	LeaderCheckerName  = "leader_checker"
+	ManualBalanceName  = "manual_balance"
+)
+
+type CheckerType int32
+
+const (
+	ChannelChecker CheckerType = iota + 1
+	SegmentChecker
+	BalanceChecker
+	IndexChecker
+	LeaderChecker
+	ManualBalance
+)
+
+var checkerNames = map[CheckerType]string{
+	SegmentChecker: SegmentCheckerName,
+	ChannelChecker: ChannelCheckerName,
+	BalanceChecker: BalanceCheckerName,
+	IndexChecker:   IndexCheckerName,
+	LeaderChecker:  LeaderCheckerName,
+	ManualBalance:  ManualBalanceName,
+}
+
+func (s CheckerType) String() string {
+	return checkerNames[s]
+}
 
 func FilterReleased[E interface{ GetCollectionID() int64 }](elems []E, collections []int64) []E {
 	collectionSet := typeutil.NewUniqueSet(collections...)

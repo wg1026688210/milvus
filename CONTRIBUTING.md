@@ -74,12 +74,18 @@ Once the 2 labels are on your PR, and all actions pass, your PR will be merged i
 
 Generally, we follow the "fork-and-pull" Git workflow.
 
-1.  [Fork](https://docs.github.com/en/github/getting-started-with-github/fork-a-repo) the repository on GitHub.
-2.  Clone your fork to your local machine with `git clone git@github.com:<yourname>/milvus.git`.
-3.  Create a branch with `git checkout -b my-topic-branch`.
-4.  [Commit](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/committing-changes-to-a-pull-request-branch-created-from-a-fork) changes to your own branch, then push to GitHub with `git push origin my-topic-branch`.
-5.  Submit a [pull request](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests) so that we can review your changes.
+* [Fork](https://docs.github.com/en/github/getting-started-with-github/fork-a-repo) the [Milvus repo](https://github.com/milvus-io/milvus/tree/master) on GitHub.
+* Clone your fork to your local machine with `git clone git@github.com:<yourname>/milvus.git`.
+* Work in your local repo and file a PR. 
 
+In your local repo:
+
+1. [Configure](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/configuring-a-remote-repository-for-a-fork) your local repo by adding the remote official repo as upstream. 
+2.  Then you can create a branch, make changes and [commit](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/committing-changes-to-a-pull-request-branch-created-from-a-fork).
+3.  Lastly, fetch upstream (and resolve merge conflicts if necessary), rebase and push the changes to origin. You can submit a [pull request](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests) to get your code reviewed.
+4.  Once getting approved, your code can be merged to `master`, yay!
+
+Here is the process illustrated in details:
 ![](docs/developer_guides/figs/fork-and-pull.png)
 
 Remember to [sync your forked repository](https://docs.github.com/en/github/getting-started-with-github/fork-a-repo#keep-your-fork-synced) _before_ submitting proposed changes upstream. If you have an existing local repository, please update it before you start, to minimize the chance of merge conflicts.
@@ -190,6 +196,26 @@ sub tests with name "segmentFlushed". When running sub tests, the coverage is no
 ```shell
 $ go test ./internal/datanode -run SegmentReplica/segmentFlushed
 ok  	github.com/milvus-io/milvus/internal/datanode 0.019s
+```
+
+### Using mockery
+
+It is recommended to use [Mockery](https://github.com/vektra/mockery) to generate mock implementations for unit test dependencies.
+
+If your PR changes any interface definition, you shall run following commands to update all mockery implemented type before submitting it:
+
+```shell
+make generate-mockery
+```
+
+If your PR adds any new interface and related mockery types, please add a new entry under proper [Makefile](Makefile) `generate-mockery-xxx` command.
+
+```Makefile
+generate-mockery-xxx: getdeps
+    # ...
+    # other mockery generation commands
+    # use mockery under $(INSTALL_PATH) to unify mockery binary version
+    $(INSTALL_PATH)/mockery --name=NewInterface ...
 ```
 
 ### Run C++ unit tests

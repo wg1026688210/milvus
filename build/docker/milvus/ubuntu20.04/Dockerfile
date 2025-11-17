@@ -9,37 +9,45 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 
-FROM milvusdb/openblas:ubuntu20.04-20220914-179ea77 AS openblas
+FROM ubuntu:focal-20240530
 
-#FROM alpine
-FROM ubuntu:focal-20220426
+ARG TARGETARCH
+ARG MILVUS_ASAN_LIB
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
-
+# Install ca-certificates first, then switch to HTTPS and install other packages
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl libtbb-dev gfortran netcat iputils-ping ca-certificates liblapack3 libzstd-dev uuid-dev libaio-dev libboost-program-options-dev libboost-filesystem-dev && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    sed -i 's/http:/https:/g' /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends curl libaio-dev libgomp1 libopenblas-dev && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata && \
+        ln -sf /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
+        echo "Etc/UTC" > /etc/timezone && \
     apt-get remove --purge -y && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=openblas /usr/local/lib/libopenblasp-r0.3.21.so /usr/lib/
+# Add Tini
+RUN curl -L -o /tini https://github.com/krallin/tini/releases/download/v0.19.0/tini-$TARGETARCH && \
+    chmod +x /tini
 
-RUN ln -s /usr/lib/libopenblasp-r0.3.21.so /usr/lib/libopenblas.so.3 && \
-    ln -s /usr/lib/libopenblas.so.3 /usr/lib/libopenblas.so
+RUN mkdir -p /milvus/bin
+COPY --chown=root:root --chmod=774 ./bin/milvus /milvus/bin/milvus
 
-COPY ./bin/ /milvus/bin/
+COPY --chown=root:root --chmod=774 ./configs/ /milvus/configs/
 
-COPY ./configs/ /milvus/configs/
-
-COPY ./lib/ /milvus/lib/
+COPY --chown=root:root --chmod=774 ./lib/ /milvus/lib/
 
 ENV PATH=/milvus/bin:$PATH
 ENV LD_LIBRARY_PATH=/milvus/lib:$LD_LIBRARY_PATH:/usr/lib
-ENV LD_PRELOAD=/milvus/lib/libjemalloc.so
+ENV LD_PRELOAD=${MILVUS_ASAN_LIB}:/milvus/lib/libjemalloc.so
+ENV MALLOC_CONF=background_thread:true
 
-# Add Tini
-ADD https://github.com/krallin/tini/releases/download/v0.19.0/tini /tini
-RUN chmod +x /tini
+# Change user to milvus
+RUN groupadd -r milvus && useradd -r -g milvus milvus && \
+    mkdir -p /var/lib/milvus && \
+    chown -R milvus:milvus /milvus /var/lib/milvus
+USER milvus:milvus
+
 ENTRYPOINT ["/tini", "--"]
 
 WORKDIR /milvus/

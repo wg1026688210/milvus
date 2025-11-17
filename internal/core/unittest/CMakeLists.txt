@@ -11,80 +11,92 @@
 
 include_directories(${CMAKE_HOME_DIRECTORY}/src)
 include_directories(${CMAKE_HOME_DIRECTORY}/src/thirdparty)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(
+    ${KNOWHERE_INCLUDE_DIR}
+    ${SIMDJSON_INCLUDE_DIR}
+    ${TANTIVY_INCLUDE_DIR}
+    ${CONAN_INCLUDE_DIRS}
+    ${MILVUS_COMMON_INCLUDE_DIR}
+    ${MILVUS_STORAGE_INCLUDE_DIR}
+)
 
-add_definitions(-DMILVUS_TEST_SEGCORE_YAML_PATH="${CMAKE_SOURCE_DIR}/unittest/test_utils/test_segcore.yaml")
+add_definitions(-DMILVUS_TEST_SEGCORE_YAML_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test_utils/test_segcore.yaml")
+
+# Collect test files from source directories using glob pattern
+file(GLOB_RECURSE SOURCE_TEST_FILES
+    "${CMAKE_HOME_DIRECTORY}/src/**/*Test.cpp"
+    "${CMAKE_HOME_DIRECTORY}/src/**/*_test.cpp"
+)
 
 # TODO: better to use ls/find pattern
 set(MILVUS_TEST_FILES
+        ${SOURCE_TEST_FILES}
         init_gtest.cpp
-        test_bf.cpp
-        test_binary.cpp
-        test_bitmap.cpp
-        test_bool_index.cpp
-        test_common.cpp
-        test_concurrent_vector.cpp
-        test_conf_adapter_mgr.cpp
-        test_c_api.cpp
-        test_expr.cpp
-        test_growing.cpp
+        test_loading.cpp
+        test_exec.cpp
+        test_expr_materialized_view.cpp
+        test_float16.cpp
+        test_group_by.cpp
+        test_iterative_filter.cpp
         test_indexing.cpp
-        test_index_c_api.cpp
         test_index_wrapper.cpp
-        test_init.cpp
-        test_parquet_c.cpp
-        test_plan_proto.cpp
+        test_integer_overflow.cpp
         test_query.cpp
-        test_reduce.cpp
-        test_reduce_c.cpp
-        test_relational.cpp
-        test_retrieve.cpp
-        test_scalar_index.cpp
         test_sealed.cpp
-        test_segcore.cpp
-        test_similarity_corelation.cpp
-        test_span.cpp
+        test_storage.cpp
         test_string_expr.cpp
-        test_timestamp_index.cpp
-        test_utils.cpp
-        test_data_codec.cpp
+        test_rust_result.cpp
+        test_storage_v2_index_raw_data.cpp
+        test_group_by_json.cpp
         )
 
-if ( BUILD_DISK_ANN STREQUAL "ON" )
-    set(MILVUS_TEST_FILES
-            ${MILVUS_TEST_FILES}
-#            test_minio_chunk_manager.cpp
-#            test_disk_file_manager_test.cpp
-            test_local_chunk_manager.cpp
-            )
+if ( NOT (INDEX_ENGINE STREQUAL "cardinal") )
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "KmeansClusteringTest\\.cpp$")
 endif()
 
-if (LINUX OR APPLE)
-    set(MILVUS_TEST_FILES
-            ${MILVUS_TEST_FILES}
-            test_scalar_index_creator.cpp
-            test_string_index.cpp
-            )
+# need update aws-sdk-cpp, see more from https://github.com/aws/aws-sdk-cpp/issues/1757.
+# now we always remove this file from MILVUS_TEST_FILES thus it is never compiled.
+# once done, compile this test file only if `BUILD_DISK_ANN STREQUAL "ON"`.
+# if ( BUILD_DISK_ANN STREQUAL "OFF" )
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "MinioChunkManagerTest\\.cpp$")
+# endif()
+
+# bitset has its own test binary
+list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "BitsetTest\\.cpp$")
+
+if (NOT (LINUX OR APPLE))
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "ScalarIndexCreatorTest\\.cpp$")
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "StringIndexTest\\.cpp$")
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "ArrayTest\\.cpp$")
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "ExprArrayTest\\.cpp$")
+endif()
+
+if (ENABLE_AZURE_FS)
+    set(AZURE_BUILD_DIR ON)
+    add_definitions(-DAZURE_BUILD_DIR)
+else()
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "AzureChunkManagerTest\\.cpp$")
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "AzureBlobChunkManagerTest\\.cpp$")
+endif()
+# need update aws-sdk-cpp, see more from https://github.com/aws/aws-sdk-cpp/issues/2119
+# once done, move this line to the else branch of `if (DEFINED AZURE_BUILD_DIR)`
+list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "RemoteChunkManagerTest\\.cpp$")
+
+if (ENABLE_GCP_NATIVE)
+    add_definitions(-DENABLE_GCP_NATIVE)
+else()
+    list(FILTER MILVUS_TEST_FILES EXCLUDE REGEX "GcpNativeChunkManagerTest\\.cpp$")
 endif()
 
 if (LINUX)
-    # check if memory leak exists in index builder
-    set(INDEX_BUILDER_TEST_FILES
-            test_index_wrapper.cpp
-            test_scalar_index_creator.cpp
-            test_index_c_api.cpp
-            )
-
-    add_executable(index_builder_test
-            ${INDEX_BUILDER_TEST_FILES}
-            )
-
-    target_link_libraries(index_builder_test
-            gtest
-            gtest_main
-            milvus_segcore
-            milvus_indexbuilder
-            )
-    install(TARGETS index_builder_test DESTINATION unittest)
+    message( STATUS "Building Milvus Unit Test on Linux")
+    option(USE_ASAN "Whether to use AddressSanitizer" OFF)
+    if ( USE_ASAN )
+        message( STATUS "Building Milvus using AddressSanitizer")
+        add_compile_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+        add_link_options(-fno-stack-protector -fno-omit-frame-pointer -fno-var-tracking -fsanitize=address)
+    endif()
 endif()
 
 add_executable(all_tests
@@ -93,13 +105,68 @@ add_executable(all_tests
 
 target_link_libraries(all_tests
         gtest
-        milvus_segcore
-        milvus_indexbuilder
-        pthread
+        gmock
+        milvus_core
+        knowhere
+        milvus-storage
+        milvus-common
         )
 
 install(TARGETS all_tests DESTINATION unittest)
 
-if (LINUX)
-    add_subdirectory(bench)
-endif ()
+add_subdirectory(bench)
+add_subdirectory(test_json_stats)
+
+# Optionally include external scalar-benchmark project
+option(ENABLE_SCALAR_BENCH "Enable fetching and building scalar-benchmark" OFF)
+set(SCALAR_BENCHMARK_GIT_URL "https://github.com/zilliztech/scalar-benchmark" CACHE STRING "Scalar benchmark git repo URL")
+set(SCALAR_BENCHMARK_GIT_TAG "main" CACHE STRING "Scalar benchmark git tag/branch")
+
+if (ENABLE_SCALAR_BENCH)
+    include(FetchContent)
+    if (DEFINED SCALAR_BENCHMARK_SOURCE_DIR AND EXISTS ${SCALAR_BENCHMARK_SOURCE_DIR}/CMakeLists.txt)
+        message(STATUS "Using local scalar-benchmark from ${SCALAR_BENCHMARK_SOURCE_DIR}")
+        add_subdirectory(${SCALAR_BENCHMARK_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/scalar-benchmark-build)
+    else()
+        message(STATUS "Fetching scalar-benchmark from ${SCALAR_BENCHMARK_GIT_URL} (${SCALAR_BENCHMARK_GIT_TAG})")
+        FetchContent_Declare(
+            scalar_benchmark
+            GIT_REPOSITORY ${SCALAR_BENCHMARK_GIT_URL}
+            GIT_TAG        ${SCALAR_BENCHMARK_GIT_TAG}
+            SOURCE_DIR     ${CMAKE_CURRENT_BINARY_DIR}/scalar-benchmark-src
+            BINARY_DIR     ${CMAKE_CURRENT_BINARY_DIR}/scalar-benchmark-build
+        )
+        FetchContent_GetProperties(scalar_benchmark)
+        if (NOT scalar_benchmark_POPULATED)
+            FetchContent_Populate(scalar_benchmark)
+            add_subdirectory(${scalar_benchmark_SOURCE_DIR} ${scalar_benchmark_BINARY_DIR})
+        endif()
+    endif()
+endif()
+
+# bitset unit test
+include(CheckCXXCompilerFlag)
+include(CheckIncludeFileCXX)
+
+check_cxx_compiler_flag("-march=armv8-a+sve" COMPILER_SUPPORTS_SVE)
+check_include_file_cxx("arm_sve.h" COMPILER_HAS_ARM_SVE_HEADER)
+
+add_executable(bitset_test
+        ${CMAKE_HOME_DIRECTORY}/src/bitset/BitsetTest.cpp
+)
+
+if (COMPILER_SUPPORTS_SVE AND COMPILER_HAS_ARM_SVE_HEADER)
+        message(STATUS "SVE support for the bitset library UT is enabled")
+        target_compile_definitions(bitset_test PRIVATE BITSET_ENABLE_SVE_SUPPORT=1)
+
+        set_source_files_properties(${CMAKE_HOME_DIRECTORY}/src/bitset/BitsetTest.cpp PROPERTIES COMPILE_FLAGS "-march=armv8-a+sve")
+else()
+        message(STATUS "SVE support for the bitset library UT is disabled")
+endif()
+
+target_link_libraries(bitset_test
+        milvus_bitset
+        gtest
+        ${CONAN_LIBS}
+)
+install(TARGETS bitset_test DESTINATION unittest)

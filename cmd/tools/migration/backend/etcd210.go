@@ -1,25 +1,29 @@
 package backend
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"path"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/errors"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/milvus-io/milvus/cmd/tools/migration/configs"
-	"github.com/milvus-io/milvus/cmd/tools/migration/legacy"
-
-	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
-
-	"github.com/golang/protobuf/proto"
 	"github.com/milvus-io/milvus/cmd/tools/migration/console"
+	"github.com/milvus-io/milvus/cmd/tools/migration/legacy"
+	"github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb"
 	"github.com/milvus-io/milvus/cmd/tools/migration/meta"
 	"github.com/milvus-io/milvus/cmd/tools/migration/utils"
 	"github.com/milvus-io/milvus/cmd/tools/migration/versions"
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
-	pb "github.com/milvus-io/milvus/internal/proto/etcdpb"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/storage"
+	pb "github.com/milvus-io/milvus/pkg/v2/proto/etcdpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
 // etcd210 implements Backend.
@@ -39,19 +43,19 @@ func newEtcd210(cfg *configs.MilvusConfig) (*etcd210, error) {
 func (b etcd210) loadTtAliases() (meta.TtAliasesMeta210, error) {
 	ttAliases := make(meta.TtAliasesMeta210)
 	prefix := path.Join(rootcoord.SnapshotPrefix, rootcoord.CollectionAliasMetaPrefix210)
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
 		tsKey := keys[i]
 		tsValue := values[i]
 		valueIsTombstone := rootcoord.IsTombstone(tsValue)
-		var aliasInfo = &pb.CollectionInfo{} // alias stored in collection info.
+		aliasInfo := &pb.CollectionInfo{} // alias stored in collection info.
 		if valueIsTombstone {
 			aliasInfo = nil
 		} else {
@@ -71,19 +75,19 @@ func (b etcd210) loadTtAliases() (meta.TtAliasesMeta210, error) {
 func (b etcd210) loadAliases() (meta.AliasesMeta210, error) {
 	aliases := make(meta.AliasesMeta210)
 	prefix := rootcoord.CollectionAliasMetaPrefix210
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
 		key := keys[i]
 		value := values[i]
 		valueIsTombstone := rootcoord.IsTombstone(value)
-		var aliasInfo = &pb.CollectionInfo{} // alias stored in collection info.
+		aliasInfo := &pb.CollectionInfo{} // alias stored in collection info.
 		if valueIsTombstone {
 			aliasInfo = nil
 		} else {
@@ -99,12 +103,12 @@ func (b etcd210) loadAliases() (meta.AliasesMeta210, error) {
 func (b etcd210) loadTtCollections() (meta.TtCollectionsMeta210, error) {
 	ttCollections := make(meta.TtCollectionsMeta210)
 	prefix := path.Join(rootcoord.SnapshotPrefix, rootcoord.CollectionMetaPrefix)
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
@@ -117,7 +121,7 @@ func (b etcd210) loadTtCollections() (meta.TtCollectionsMeta210, error) {
 		}
 
 		valueIsTombstone := rootcoord.IsTombstone(tsValue)
-		var coll = &pb.CollectionInfo{}
+		coll := &pb.CollectionInfo{}
 		if valueIsTombstone {
 			coll = nil
 		} else {
@@ -141,12 +145,12 @@ func (b etcd210) loadTtCollections() (meta.TtCollectionsMeta210, error) {
 func (b etcd210) loadCollections() (meta.CollectionsMeta210, error) {
 	collections := make(meta.CollectionsMeta210)
 	prefix := rootcoord.CollectionMetaPrefix
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
@@ -159,7 +163,7 @@ func (b etcd210) loadCollections() (meta.CollectionsMeta210, error) {
 		}
 
 		valueIsTombstone := rootcoord.IsTombstone(value)
-		var coll = &pb.CollectionInfo{}
+		coll := &pb.CollectionInfo{}
 		if valueIsTombstone {
 			coll = nil
 		} else {
@@ -196,19 +200,19 @@ func parseCollectionIndexKey(key string) (collectionID, indexID typeutil.UniqueI
 func (b etcd210) loadCollectionIndexes() (meta.CollectionIndexesMeta210, error) {
 	collectionIndexes := make(meta.CollectionIndexesMeta210)
 	prefix := legacy.IndexMetaBefore220Prefix
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
 		key := keys[i]
 		value := values[i]
 
-		var index = &pb.IndexInfo{}
+		index := &pb.IndexInfo{}
 		if err := proto.Unmarshal([]byte(value), index); err != nil {
 			return nil, err
 		}
@@ -224,18 +228,18 @@ func (b etcd210) loadCollectionIndexes() (meta.CollectionIndexesMeta210, error) 
 func (b etcd210) loadSegmentIndexes() (meta.SegmentIndexesMeta210, error) {
 	segmentIndexes := make(meta.SegmentIndexesMeta210)
 	prefix := legacy.SegmentIndexPrefixBefore220
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
 		value := values[i]
 
-		var index = &pb.SegmentIndexInfo{}
+		index := &pb.SegmentIndexInfo{}
 		if err := proto.Unmarshal([]byte(value), index); err != nil {
 			return nil, err
 		}
@@ -247,18 +251,18 @@ func (b etcd210) loadSegmentIndexes() (meta.SegmentIndexesMeta210, error) {
 func (b etcd210) loadIndexBuildMeta() (meta.IndexBuildMeta210, error) {
 	indexBuildMeta := make(meta.IndexBuildMeta210)
 	prefix := legacy.IndexBuildPrefixBefore220
-	keys, values, err := b.txn.LoadWithPrefix(prefix)
+	keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 	if err != nil {
 		return nil, err
 	}
 	if len(keys) != len(values) {
-		return nil, fmt.Errorf("length mismatch")
+		return nil, errors.New("length mismatch")
 	}
 	l := len(keys)
 	for i := 0; i < l; i++ {
 		value := values[i]
 
-		var record = &legacypb.IndexMeta{}
+		record := &legacypb.IndexMeta{}
 		if err := proto.Unmarshal([]byte(value), record); err != nil {
 			return nil, err
 		}
@@ -276,18 +280,47 @@ func (b etcd210) loadLastDDLRecords() (meta.LastDDLRecords, error) {
 		path.Join(rootcoord.SnapshotPrefix, legacy.DDMsgSendPrefixBefore220),
 	}
 	for _, prefix := range prefixes {
-		keys, values, err := b.txn.LoadWithPrefix(prefix)
+		keys, values, err := b.txn.LoadWithPrefix(context.TODO(), prefix)
 		if err != nil {
 			return nil, err
 		}
 		if len(keys) != len(values) {
-			return nil, fmt.Errorf("length mismatch")
+			return nil, errors.New("length mismatch")
 		}
 		for i, k := range keys {
 			records.AddRecord(k, values[i])
 		}
 	}
 	return records, nil
+}
+
+func (b etcd210) loadLoadInfos() (meta.CollectionLoadInfo210, error) {
+	loadInfo := make(meta.CollectionLoadInfo210)
+	_, collectionValues, err := b.txn.LoadWithPrefix(context.TODO(), legacy.CollectionLoadMetaPrefixV1)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range collectionValues {
+		collectionInfo := querypb.CollectionInfo{}
+		err = proto.Unmarshal([]byte(value), &collectionInfo)
+		if err != nil {
+			return nil, err
+		}
+		if collectionInfo.InMemoryPercentage < 100 {
+			continue
+		}
+		loadInfo[collectionInfo.CollectionID] = &model.CollectionLoadInfo{
+			CollectionID:         collectionInfo.GetCollectionID(),
+			PartitionIDs:         collectionInfo.GetPartitionIDs(),
+			ReleasedPartitionIDs: collectionInfo.GetReleasedPartitionIDs(),
+			LoadType:             collectionInfo.GetLoadType(),
+			LoadPercentage:       100,
+			Status:               querypb.LoadStatus_Loaded,
+			ReplicaNumber:        collectionInfo.GetReplicaNumber(),
+			FieldIndexID:         make(map[int64]int64),
+		}
+	}
+	return loadInfo, nil
 }
 
 func (b etcd210) Load() (*meta.Meta, error) {
@@ -323,17 +356,22 @@ func (b etcd210) Load() (*meta.Meta, error) {
 	if err != nil {
 		return nil, err
 	}
+	loadInfos, err := b.loadLoadInfos()
+	if err != nil {
+		return nil, err
+	}
 	return &meta.Meta{
 		Version: versions.Version210,
 		Meta210: &meta.All210{
-			TtCollections:     ttCollections,
-			Collections:       collections,
-			TtAliases:         ttAliases,
-			Aliases:           aliases,
-			CollectionIndexes: collectionIndexes,
-			SegmentIndexes:    segmentIndexes,
-			IndexBuildMeta:    indexBuildMeta,
-			LastDDLRecords:    lastDdlRecords,
+			TtCollections:       ttCollections,
+			Collections:         collections,
+			TtAliases:           ttAliases,
+			Aliases:             aliases,
+			CollectionIndexes:   collectionIndexes,
+			SegmentIndexes:      segmentIndexes,
+			IndexBuildMeta:      indexBuildMeta,
+			LastDDLRecords:      lastDdlRecords,
+			CollectionLoadInfos: loadInfos,
 		},
 	}, nil
 }
@@ -374,7 +412,7 @@ func (b etcd210) Backup(meta *meta.Meta, backupFile string) error {
 	saves := meta.Meta210.GenerateSaves()
 	codec := NewBackupCodec()
 	var instance, metaPath string
-	metaRootPath := b.cfg.EtcdCfg.MetaRootPath
+	metaRootPath := b.cfg.EtcdCfg.MetaRootPath.GetValue()
 	parts := strings.Split(metaRootPath, "/")
 	if len(parts) > 1 {
 		metaPath = parts[len(parts)-1]
@@ -383,7 +421,7 @@ func (b etcd210) Backup(meta *meta.Meta, backupFile string) error {
 		instance = metaRootPath
 	}
 	header := &BackupHeader{
-		Version:   BackupHeaderVersionV1,
+		Version:   int32(BackupHeaderVersionV1),
 		Instance:  instance,
 		MetaPath:  metaPath,
 		Entries:   int64(len(saves)),
@@ -395,21 +433,84 @@ func (b etcd210) Backup(meta *meta.Meta, backupFile string) error {
 		return err
 	}
 	console.Warning(fmt.Sprintf("backup to: %s", backupFile))
-	return ioutil.WriteFile(backupFile, backup, 0600)
+	return storage.WriteFile(backupFile, backup, 0o600)
+}
+
+func (b etcd210) BackupV2(file string) error {
+	var instance, metaPath string
+	metaRootPath := b.cfg.EtcdCfg.MetaRootPath.GetValue()
+	parts := strings.Split(metaRootPath, "/")
+	if len(parts) > 1 {
+		metaPath = parts[len(parts)-1]
+		instance = path.Join(parts[:len(parts)-1]...)
+	} else {
+		instance = metaRootPath
+	}
+
+	ctx := context.Background()
+	// TODO: optimize this if memory consumption is too large.
+	saves := make(map[string]string)
+	cntResp, err := b.etcdCli.Get(ctx, metaRootPath, clientv3.WithPrefix(), clientv3.WithCountOnly())
+	if err != nil {
+		return err
+	}
+
+	opts := []clientv3.OpOption{clientv3.WithFromKey(), clientv3.WithRev(cntResp.Header.Revision), clientv3.WithLimit(1)}
+	currentKey := metaRootPath
+	for i := 0; int64(i) < cntResp.Count; i++ {
+		resp, err := b.etcdCli.Get(ctx, currentKey, opts...)
+		if err != nil {
+			return err
+		}
+		for _, kv := range resp.Kvs {
+			currentKey = string(append(kv.Key, 0))
+			if kv.Lease != 0 {
+				console.Warning(fmt.Sprintf("lease key won't be backuped: %s, lease id: %d", kv.Key, kv.Lease))
+				continue
+			}
+			saves[string(kv.Key)] = string(kv.Value)
+		}
+	}
+
+	header := &BackupHeader{
+		Version:   int32(BackupHeaderVersionV1),
+		Instance:  instance,
+		MetaPath:  metaPath,
+		Entries:   int64(len(saves)),
+		Component: "",
+		Extra:     newBackupHeaderExtra(setEntryIncludeRootPath(true)).ToJSONBytes(),
+	}
+
+	codec := NewBackupCodec()
+	backup, err := codec.Serialize(header, saves)
+	if err != nil {
+		return err
+	}
+
+	console.Warning(fmt.Sprintf("backup to: %s", file))
+	return storage.WriteFile(file, backup, 0o600)
 }
 
 func (b etcd210) Restore(backupFile string) error {
-	backup, err := ioutil.ReadFile(backupFile)
+	backup, err := storage.ReadFile(backupFile)
 	if err != nil {
 		return err
 	}
 	codec := NewBackupCodec()
-	_, saves, err := codec.DeSerialize(backup)
+	header, saves, err := codec.DeSerialize(backup)
 	if err != nil {
 		return err
 	}
+	entryIncludeRootPath := GetExtra(header.Extra).EntryIncludeRootPath
+	getRealKey := func(key string) string {
+		if entryIncludeRootPath {
+			return key
+		}
+		return path.Join(header.Instance, header.MetaPath, key)
+	}
+	ctx := context.Background()
 	for k, v := range saves {
-		if err := b.txn.Save(k, v); err != nil {
+		if _, err := b.etcdCli.Put(ctx, getRealKey(k), v); err != nil {
 			return err
 		}
 	}

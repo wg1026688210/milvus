@@ -19,31 +19,68 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 #include <boost/dynamic_bitset.hpp>
 
-#include "knowhere/index/VecIndex.h"
+#include "Utils.h"
+#include "knowhere/index/index_factory.h"
 #include "index/Index.h"
 #include "common/Types.h"
 #include "common/BitsetView.h"
 #include "common/QueryResult.h"
 #include "common/QueryInfo.h"
+#include "common/OpContext.h"
+#include "knowhere/version.h"
 
 namespace milvus::index {
 
 class VectorIndex : public IndexBase {
  public:
-    explicit VectorIndex(const IndexType& index_type, const IndexMode& index_mode, const MetricType& metric_type)
-        : index_type_(index_type), index_mode_(index_mode), metric_type_(metric_type) {
+    explicit VectorIndex(const IndexType& index_type,
+                         const MetricType& metric_type)
+        : IndexBase(index_type), metric_type_(metric_type) {
     }
 
  public:
     void
-    BuildWithRawData(size_t n, const void* values, const Config& config = {}) override {
-        PanicInfo("vector index don't support build index with raw data");
+    BuildWithRawDataForUT(size_t n,
+                          const void* values,
+                          const Config& config = {}) override {
+        ThrowInfo(Unsupported,
+                  "vector index don't support build index with raw data");
     };
 
-    virtual std::unique_ptr<SearchResult>
-    Query(const DatasetPtr dataset, const SearchInfo& search_info, const BitsetView& bitset) = 0;
+    virtual void
+    AddWithDataset(const DatasetPtr& dataset, const Config& config) {
+        ThrowInfo(Unsupported, "vector index don't support add with dataset");
+    }
+
+    virtual void
+    Query(const DatasetPtr dataset,
+          const SearchInfo& search_info,
+          const BitsetView& bitset,
+          milvus::OpContext* op_context,
+          SearchResult& search_result) const = 0;
+
+    virtual knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+    VectorIterators(const DatasetPtr dataset,
+                    const knowhere::Json& json,
+                    const BitsetView& bitset) const {
+        ThrowInfo(NotImplemented,
+                  "VectorIndex:" + this->GetIndexType() +
+                      " didn't implement VectorIterator interface, "
+                      "there must be sth wrong in the code");
+    }
+
+    virtual const bool
+    HasRawData() const = 0;
+
+    virtual std::vector<uint8_t>
+    GetVector(const DatasetPtr dataset) const = 0;
+
+    virtual std::unique_ptr<
+        const knowhere::sparse::SparseRow<SparseValueType>[]>
+    GetSparseVector(const DatasetPtr dataset) const = 0;
 
     IndexType
     GetIndexType() const {
@@ -53,11 +90,6 @@ class VectorIndex : public IndexBase {
     MetricType
     GetMetricType() const {
         return metric_type_;
-    }
-
-    IndexMode
-    GetIndexMode() const {
-        return index_mode_;
     }
 
     int64_t
@@ -74,12 +106,48 @@ class VectorIndex : public IndexBase {
     CleanLocalData() {
     }
 
+    virtual void
+    CheckCompatible(const IndexVersion& version) {
+        std::string err_msg =
+            "version not support : " + std::to_string(version) +
+            " , knowhere current version " +
+            std::to_string(
+                knowhere::Version::GetCurrentVersion().VersionNumber());
+        AssertInfo(
+            knowhere::Version::VersionSupport(knowhere::Version(version)),
+            err_msg);
+    }
+
+    virtual bool
+    IsMmapSupported() const {
+        return knowhere::IndexFactory::Instance().FeatureCheck(
+            index_type_, knowhere::feature::MMAP);
+    }
+
+    knowhere::Json
+    PrepareSearchParams(const SearchInfo& search_info) const {
+        knowhere::Json search_cfg = search_info.search_params_;
+
+        search_cfg[knowhere::meta::METRIC_TYPE] = search_info.metric_type_;
+        search_cfg[knowhere::meta::TOPK] = search_info.topk_;
+
+        // save trace context into search conf
+        if (search_info.trace_ctx_.traceID != nullptr &&
+            search_info.trace_ctx_.spanID != nullptr) {
+            search_cfg[knowhere::meta::TRACE_ID] =
+                tracer::GetTraceIDAsHexStr(&search_info.trace_ctx_);
+            search_cfg[knowhere::meta::SPAN_ID] =
+                tracer::GetSpanIDAsHexStr(&search_info.trace_ctx_);
+            search_cfg[knowhere::meta::TRACE_FLAGS] =
+                search_info.trace_ctx_.traceFlags;
+        }
+
+        return search_cfg;
+    }
+
  private:
-    IndexType index_type_;
-    IndexMode index_mode_;
     MetricType metric_type_;
     int64_t dim_;
 };
 
-using VectorIndexPtr = std::unique_ptr<VectorIndex>;
 }  // namespace milvus::index

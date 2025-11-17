@@ -5,13 +5,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/milvus-io/milvus/internal/util/typeutil"
-
 	"github.com/milvus-io/milvus/internal/metastore/kv/rootcoord"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-type UniqueID = typeutil.UniqueID
-type Timestamp = typeutil.Timestamp
+type (
+	UniqueID  = typeutil.UniqueID
+	Timestamp = typeutil.Timestamp
+)
 
 type errNotOfTsKey struct {
 	key string

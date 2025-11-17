@@ -21,7 +21,6 @@
 #include <vector>
 
 #include "storage/ChunkManager.h"
-#include "config/ConfigChunkManager.h"
 
 namespace milvus::storage {
 
@@ -30,7 +29,7 @@ namespace milvus::storage {
  * that inherited from ChunkManager
  */
 class LocalChunkManager : public ChunkManager {
- private:
+ public:
     explicit LocalChunkManager(const std::string& path) : path_prefix_(path) {
     }
 
@@ -39,13 +38,6 @@ class LocalChunkManager : public ChunkManager {
     operator=(const LocalChunkManager&);
 
  public:
-    static LocalChunkManager&
-    GetInstance() {
-        // thread-safe enough after c++ 11
-        static LocalChunkManager instance(ChunkMangerConfig::GetLocalRootPath());
-        return instance;
-    }
-
     virtual ~LocalChunkManager() {
     }
 
@@ -88,7 +80,10 @@ class LocalChunkManager : public ChunkManager {
     Read(const std::string& filepath, uint64_t offset, void* buf, uint64_t len);
 
     virtual void
-    Write(const std::string& filepath, uint64_t offset, void* buf, uint64_t len);
+    Write(const std::string& filepath,
+          uint64_t offset,
+          void* buf,
+          uint64_t len);
 
     virtual std::vector<std::string>
     ListWithPrefix(const std::string& filepath);
@@ -106,14 +101,14 @@ class LocalChunkManager : public ChunkManager {
         return "LocalChunkManager";
     }
 
-    inline std::string
-    GetPathPrefix() {
+    virtual std::string
+    GetRootPath() const {
         return path_prefix_;
     }
 
-    inline void
-    SetPathPrefix(const std::string& path) {
-        path_prefix_ = path;
+    virtual std::string
+    GetBucketName() const {
+        return "";
     }
 
     bool
@@ -147,6 +142,7 @@ class LocalChunkManager : public ChunkManager {
     std::string path_prefix_;
 };
 
-using LocalChunkManagerSPtr = std::shared_ptr<milvus::storage::LocalChunkManager>;
+using LocalChunkManagerSPtr =
+    std::shared_ptr<milvus::storage::LocalChunkManager>;
 
 }  // namespace milvus::storage

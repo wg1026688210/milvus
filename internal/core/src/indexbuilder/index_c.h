@@ -17,24 +17,61 @@ extern "C" {
 
 #include <stdint.h>
 #include "common/type_c.h"
+#include "common/protobuf_utils_c.h"
 #include "common/binary_set_c.h"
 #include "indexbuilder/type_c.h"
 
 CStatus
-CreateIndex(enum CDataType dtype,
-            const char* serialized_type_params,
-            const char* serialized_index_params,
-            CIndex* res_index,
-            CStorageConfig storage_config);
+CreateIndex(CIndex* res_index,
+            const uint8_t* serialized_build_index_info,
+            const uint64_t len);
 
 CStatus
 DeleteIndex(CIndex index);
+
+CStatus
+BuildJsonKeyIndex(ProtoLayoutInterface c_binary_set,
+                  const uint8_t* serialized_build_index_info,
+                  const uint64_t len);
+
+CStatus
+BuildTextIndex(ProtoLayoutInterface c_binary_set,
+               const uint8_t* serialized_build_index_info,
+               const uint64_t len);
+
+CStatus
+CleanLocalData(CIndex index);
+
+CStatus
+SerializeIndexAndUpLoad(CIndex index, ProtoLayoutInterface result);
+
+// =========== Followings are used only in test ==========
+CStatus
+CreateIndexForUT(enum CDataType dtype,
+                 const char* serialized_type_params,
+                 const char* serialized_index_params,
+                 CIndex* res_index);
 
 CStatus
 BuildFloatVecIndex(CIndex index, int64_t float_value_num, const float* vectors);
 
 CStatus
 BuildBinaryVecIndex(CIndex index, int64_t data_size, const uint8_t* vectors);
+
+CStatus
+BuildFloat16VecIndex(CIndex index, int64_t data_size, const uint8_t* vectors);
+
+CStatus
+BuildBFloat16VecIndex(CIndex index, int64_t data_size, const uint8_t* vectors);
+
+CStatus
+BuildSparseFloatVecIndex(CIndex index,
+                         int64_t row_num,
+                         int64_t dim,
+                         const uint8_t* vectors);
+
+CStatus
+BuildInt8VecIndex(CIndex index, int64_t data_size, const int8_t* vectors);
 
 // field_data:
 //  1, serialized proto::schema::BoolArray, if type is bool;
@@ -49,9 +86,6 @@ SerializeIndexToBinarySet(CIndex index, CBinarySet* c_binary_set);
 
 CStatus
 LoadIndexFromBinarySet(CIndex index, CBinarySet c_binary_set);
-
-CStatus
-CleanLocalData(CIndex index);
 
 #ifdef __cplusplus
 };

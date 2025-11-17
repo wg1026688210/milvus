@@ -16,28 +16,25 @@
 #include <limits>
 #include <cmath>
 #include <google/protobuf/text_format.h>
-#include <boost/filesystem.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include "DataGen.h"
+#include "index/Meta.h"
 #include "index/ScalarIndex.h"
 #include "index/StringIndex.h"
 #include "index/Utils.h"
 #include "indexbuilder/ScalarIndexCreator.h"
 #include "indexbuilder/VecIndexCreator.h"
 #include "indexbuilder/index_c.h"
-#include "knowhere/index/VecIndexFactory.h"
-#include "knowhere/index/vector_index/helpers/IndexParameter.h"
-#include "knowhere/index/vector_index/adapter/VectorAdapter.h"
+#include "knowhere/comp/index_param.h"
 #include "pb/index_cgo_msg.pb.h"
 #include "storage/Types.h"
+#include "knowhere/comp/index_param.h"
 
-constexpr int64_t DIM = 16;
+constexpr int64_t DIM = 4;
+constexpr int64_t BINARY_DIM =
+    8;  // Binary vectors need dim to be multiple of 8
 constexpr int64_t NQ = 10;
 constexpr int64_t K = 4;
-#ifdef MILVUS_GPU_VERSION
-int DEVICEID = 0;
-#endif
 
 namespace indexcgo = milvus::proto::indexcgo;
 namespace schemapb = milvus::proto::schema;
@@ -46,165 +43,109 @@ using milvus::indexbuilder::ScalarIndexCreator;
 using ScalarTestParams = std::pair<MapParams, MapParams>;
 using milvus::index::ScalarIndexPtr;
 using milvus::index::StringIndexPtr;
-using milvus::storage::StorageConfig;
-using namespace boost::filesystem;
 
 namespace {
 
-bool
-find_file(const path& dir, const std::string& file_name, path& path_found) {
-    const recursive_directory_iterator end;
-    boost::system::error_code err;
-    auto iter = recursive_directory_iterator(dir, err);
-    while (iter != end) {
-        try {
-            if ((*iter).path().filename() == file_name) {
-                path_found = (*iter).path();
-                return true;
-            }
-            iter++;
-        } catch (filesystem_error& e) {
-        } catch (std::exception& e) {
-            // ignore error
-        }
-    }
-    return false;
-}
-
-StorageConfig
-get_default_storage_config() {
-    char testPath[100];
-    auto pwd = std::string(getcwd(testPath, sizeof(testPath)));
-    path filepath;
-    auto currentPath = path(pwd);
-    while (!find_file(currentPath, "milvus.yaml", filepath)) {
-        currentPath = currentPath.append("../");
-    }
-    auto configPath = filepath.string();
-    YAML::Node config;
-    config = YAML::LoadFile(configPath);
-    auto minioConfig = config["minio"];
-    auto address = minioConfig["address"].as<std::string>();
-    auto port = minioConfig["port"].as<std::string>();
-    auto endpoint = address + ":" + port;
-    auto accessKey = minioConfig["accessKeyID"].as<std::string>();
-    auto accessValue = minioConfig["secretAccessKey"].as<std::string>();
-    auto rootPath = minioConfig["rootPath"].as<std::string>();
-    auto useSSL = minioConfig["useSSL"].as<bool>();
-    auto useIam = minioConfig["useIAM"].as<bool>();
-    auto iamEndPoint = minioConfig["iamEndpoint"].as<std::string>();
-    auto bucketName = minioConfig["bucketName"].as<std::string>();
-
-    return StorageConfig{endpoint, bucketName, accessKey, accessValue, rootPath, "minio", iamEndPoint, useSSL, useIam};
-}
-
-CStorageConfig
-get_default_cstorage_config() {
-    char testPath[100];
-    auto pwd = std::string(getcwd(testPath, sizeof(testPath)));
-    path filepath;
-    auto currentPath = path(pwd);
-    while (!find_file(currentPath, "milvus.yaml", filepath)) {
-        currentPath = currentPath.append("../");
-    }
-    auto configPath = filepath.string();
-    YAML::Node config;
-    config = YAML::LoadFile(configPath);
-    auto minioConfig = config["minio"];
-    auto address = minioConfig["address"].as<std::string>();
-    auto port = minioConfig["port"].as<std::string>();
-    auto endpoint = address + ":" + port;
-    auto accessKey = minioConfig["accessKeyID"].as<std::string>();
-    auto accessValue = minioConfig["secretAccessKey"].as<std::string>();
-    auto rootPath = minioConfig["rootPath"].as<std::string>();
-    auto useSSL = minioConfig["useSSL"].as<bool>();
-    auto useIam = minioConfig["useIAM"].as<bool>();
-    auto iamEndPoint = minioConfig["iamEndpoint"].as<std::string>();
-    auto bucketName = minioConfig["bucketName"].as<std::string>();
-
-    return CStorageConfig{endpoint.c_str(),
-                          bucketName.c_str(),
-                          accessKey.c_str(),
-                          accessValue.c_str(),
-                          rootPath.c_str(),
-                          "minio",
-                          iamEndPoint.c_str(),
-                          useSSL,
-                          useIam};
-}
-
 auto
-generate_build_conf(const milvus::IndexType& index_type, const milvus::MetricType& metric_type) {
+generate_build_conf(const milvus::IndexType& index_type,
+                    const milvus::MetricType& metric_type) {
     if (index_type == knowhere::IndexEnum::INDEX_FAISS_IDMAP) {
-        return knowhere::Config{
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
         };
     } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_IVFPQ) {
-        return knowhere::Config{
-            {knowhere::meta::METRIC_TYPE, metric_type}, {knowhere::meta::DIM, std::to_string(DIM)},
-            {knowhere::indexparam::NLIST, "16"},        {knowhere::indexparam::M, "4"},
+        return knowhere::Json{
+            {knowhere::meta::METRIC_TYPE, metric_type},
+            {knowhere::meta::DIM, std::to_string(DIM)},
+            {knowhere::indexparam::NLIST, "16"},
+            {knowhere::indexparam::M, "4"},
             {knowhere::indexparam::NBITS, "8"},
         };
-    } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT) {
-        return knowhere::Config{
+    } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT ||
+               index_type == knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC) {
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
             {knowhere::indexparam::NLIST, "16"},
         };
     } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_IVFSQ8) {
-        return knowhere::Config{
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
             {knowhere::indexparam::NLIST, "16"},
         };
     } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_BIN_IVFFLAT) {
-        return knowhere::Config{
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
-            {knowhere::meta::DIM, std::to_string(DIM)},
+            {knowhere::meta::DIM, std::to_string(BINARY_DIM)},
             {knowhere::indexparam::NLIST, "16"},
         };
     } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_BIN_IDMAP) {
-        return knowhere::Config{
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
-            {knowhere::meta::DIM, std::to_string(DIM)},
+            {knowhere::meta::DIM, std::to_string(BINARY_DIM)},
         };
     } else if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
-        return knowhere::Config{
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
             {knowhere::indexparam::HNSW_M, "16"},
             {knowhere::indexparam::EFCONSTRUCTION, "200"},
         };
-    } else if (index_type == knowhere::IndexEnum::INDEX_ANNOY) {
-        return knowhere::Config{
-            {knowhere::meta::METRIC_TYPE, metric_type},
-            {knowhere::meta::DIM, std::to_string(DIM)},
-            {knowhere::indexparam::N_TREES, "4"},
-        };
     } else if (index_type == knowhere::IndexEnum::INDEX_DISKANN) {
-        return knowhere::Config{
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
             {milvus::index::DISK_ANN_MAX_DEGREE, std::to_string(48)},
             {milvus::index::DISK_ANN_SEARCH_LIST_SIZE, std::to_string(128)},
             {milvus::index::DISK_ANN_PQ_CODE_BUDGET, std::to_string(0.001)},
             {milvus::index::DISK_ANN_BUILD_DRAM_BUDGET, std::to_string(32)},
+            {milvus::index::DISK_ANN_BUILD_THREAD_NUM, std::to_string(2)},
         };
-    }
-    return knowhere::Config();
-}
-
-auto
-generate_load_conf(const milvus::IndexType& index_type, const milvus::MetricType& metric_type, int64_t nb) {
-    if (index_type == knowhere::IndexEnum::INDEX_DISKANN) {
-        return knowhere::Config{
+    } else if (index_type == knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX ||
+               index_type == knowhere::IndexEnum::INDEX_SPARSE_WAND) {
+        if (metric_type == knowhere::metric::BM25) {
+            return knowhere::Json{
+                {knowhere::meta::METRIC_TYPE, metric_type},
+                {knowhere::indexparam::DROP_RATIO_BUILD, "0.1"},
+                {knowhere::meta::BM25_K1, "1.2"},
+                {knowhere::meta::BM25_B, "0.75"},
+                {knowhere::meta::BM25_AVGDL, "100"}};
+        }
+        return knowhere::Json{
+            {knowhere::meta::METRIC_TYPE, metric_type},
+            {knowhere::indexparam::DROP_RATIO_BUILD, "0.1"},
+        };
+    } else if (index_type == knowhere::IndexEnum::INDEX_FAISS_SCANN ||
+               index_type == knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR) {
+        return knowhere::Json{
             {knowhere::meta::METRIC_TYPE, metric_type},
             {knowhere::meta::DIM, std::to_string(DIM)},
-            {milvus::index::DISK_ANN_SEARCH_CACHE_BUDGET, std::to_string(0.0002)},
         };
     }
-    return knowhere::Config();
+    return knowhere::Json();
+}
+
+template <typename DataType = float>
+inline auto
+generate_load_conf(const milvus::IndexType& index_type,
+                   const milvus::MetricType& metric_type,
+                   int64_t nb) {
+    if (index_type == knowhere::IndexEnum::INDEX_DISKANN) {
+        return knowhere::Json{
+            {knowhere::meta::METRIC_TYPE, metric_type},
+            {knowhere::meta::DIM, std::to_string(DIM)},
+            {milvus::index::DISK_ANN_LOAD_THREAD_NUM, std::to_string(2)},
+            {milvus::index::DISK_ANN_SEARCH_CACHE_BUDGET,
+             std::to_string(0.05 * sizeof(DataType) * nb /
+                            (1024.0 * 1024.0 * 1024.0))},
+        };
+    }
+    return knowhere::Json{
+        {knowhere::meta::METRIC_TYPE, metric_type},
+        {knowhere::meta::DIM, std::to_string(DIM)},
+    };
 }
 
 std::vector<milvus::IndexType>
@@ -219,18 +160,17 @@ search_with_nprobe_list() {
 }
 
 auto
-generate_search_conf(const milvus::IndexType& index_type, const milvus::MetricType& metric_type) {
+generate_search_conf(const milvus::IndexType& index_type,
+                     const milvus::MetricType& metric_type) {
     auto conf = milvus::Config{
-        {knowhere::meta::SLICE_SIZE, knowhere::index_file_slice_size},
         {knowhere::meta::METRIC_TYPE, metric_type},
     };
 
-    if (milvus::index::is_in_list<milvus::IndexType>(index_type, search_with_nprobe_list)) {
+    if (milvus::is_in_list<milvus::IndexType>(index_type,
+                                              search_with_nprobe_list)) {
         conf[knowhere::indexparam::NPROBE] = 4;
     } else if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
         conf[knowhere::indexparam::EF] = 200;
-    } else if (index_type == knowhere::IndexEnum::INDEX_ANNOY) {
-        conf[knowhere::indexparam::SEARCH_K] = 100;
     } else if (index_type == knowhere::IndexEnum::INDEX_DISKANN) {
         conf[milvus::index::DISK_ANN_QUERY_LIST] = K * 2;
     }
@@ -238,7 +178,34 @@ generate_search_conf(const milvus::IndexType& index_type, const milvus::MetricTy
 }
 
 auto
-generate_params(const knowhere::IndexType& index_type, const knowhere::MetricType& metric_type) {
+generate_range_search_conf(const milvus::IndexType& index_type,
+                           const milvus::MetricType& metric_type) {
+    auto conf = milvus::Config{
+        {knowhere::meta::METRIC_TYPE, metric_type},
+    };
+
+    if (metric_type == knowhere::metric::IP) {
+        conf[knowhere::meta::RADIUS] = 0.1;
+        conf[knowhere::meta::RANGE_FILTER] = 0.2;
+    } else {
+        conf[knowhere::meta::RADIUS] = 0.2;
+        conf[knowhere::meta::RANGE_FILTER] = 0.1;
+    }
+
+    if (milvus::is_in_list<milvus::IndexType>(index_type,
+                                              search_with_nprobe_list)) {
+        conf[knowhere::indexparam::NPROBE] = 4;
+    } else if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
+        conf[knowhere::indexparam::EF] = 200;
+    } else if (index_type == knowhere::IndexEnum::INDEX_DISKANN) {
+        conf[milvus::index::DISK_ANN_QUERY_LIST] = K * 2;
+    }
+    return conf;
+}
+
+auto
+generate_params(const knowhere::IndexType& index_type,
+                const knowhere::MetricType& metric_type) {
     namespace indexcgo = milvus::proto::indexcgo;
 
     indexcgo::TypeParams type_params;
@@ -247,7 +214,8 @@ generate_params(const knowhere::IndexType& index_type, const knowhere::MetricTyp
     auto configs = generate_build_conf(index_type, metric_type);
     for (auto& [key, value] : configs.items()) {
         auto param = index_params.add_params();
-        auto value_str = value.is_string() ? value.get<std::string>() : value.dump();
+        auto value_str =
+            value.is_string() ? value.get<std::string>() : value.dump();
         param->set_key(key);
         param->set_value(value_str);
     }
@@ -260,15 +228,17 @@ generate_params(const knowhere::IndexType& index_type, const knowhere::MetricTyp
 }
 
 auto
-GenDataset(int64_t N, const knowhere::MetricType& metric_type, bool is_binary, int64_t dim = DIM) {
+GenFieldData(int64_t N,
+             const knowhere::MetricType& metric_type,
+             milvus::DataType data_type = milvus::DataType::VECTOR_FLOAT,
+             int64_t dim = DIM) {
     auto schema = std::make_shared<milvus::Schema>();
-    if (!is_binary) {
-        schema->AddDebugField("fakevec", milvus::DataType::VECTOR_FLOAT, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    } else {
-        schema->AddDebugField("fakebinvec", milvus::DataType::VECTOR_BINARY, dim, metric_type);
-        return milvus::segcore::DataGen(schema, N);
-    }
+    schema->AddDebugField(
+        "fakevec",
+        data_type,
+        (data_type != milvus::DataType::VECTOR_SPARSE_U32_F32 ? dim : 0),
+        metric_type);
+    return milvus::segcore::DataGen(schema, N);
 }
 
 using QueryResultPtr = std::unique_ptr<milvus::SearchResult>;
@@ -327,15 +297,22 @@ Jaccard(const uint8_t* point_a, const uint8_t* point_b, int dim) {
 }
 
 float
-CountDistance(
-    const void* point_a, const void* point_b, int dim, const knowhere::MetricType& metric, bool is_binary = false) {
+CountDistance(const void* point_a,
+              const void* point_b,
+              int dim,
+              const knowhere::MetricType& metric,
+              bool is_binary = false) {
     if (point_a == nullptr || point_b == nullptr) {
         return std::numeric_limits<float>::max();
     }
     if (milvus::IsMetricType(metric, knowhere::metric::L2)) {
-        return L2(static_cast<const float*>(point_a), static_cast<const float*>(point_b), dim);
+        return L2(static_cast<const float*>(point_a),
+                  static_cast<const float*>(point_b),
+                  dim);
     } else if (milvus::IsMetricType(metric, knowhere::metric::JACCARD)) {
-        return Jaccard(static_cast<const uint8_t*>(point_a), static_cast<const uint8_t*>(point_b), dim);
+        return Jaccard(static_cast<const uint8_t*>(point_a),
+                       static_cast<const uint8_t*>(point_b),
+                       dim);
     } else {
         return std::numeric_limits<float>::max();
     }
@@ -343,20 +320,21 @@ CountDistance(
 
 void
 CheckDistances(const QueryResultPtr& result,
-               const knowhere::DatasetPtr& base_dataset,
-               const knowhere::DatasetPtr& query_dataset,
+               const knowhere::DataSetPtr& base_dataset,
+               const knowhere::DataSetPtr& query_dataset,
                const knowhere::MetricType& metric,
                const float threshold = 1.0e-5) {
-    auto base_vecs = (float*)knowhere::GetDatasetTensor(base_dataset);
-    auto query_vecs = (float*)knowhere::GetDatasetTensor(query_dataset);
-    auto dim = knowhere::GetDatasetDim(base_dataset);
+    auto base_vecs = (float*)(base_dataset->GetTensor());
+    auto query_vecs = (float*)(query_dataset->GetTensor());
+    auto dim = base_dataset->GetDim();
     auto nq = result->total_nq_;
     auto k = result->unity_topK_;
     for (auto i = 0; i < nq; i++) {
         for (auto j = 0; j < k; ++j) {
             auto dis = result->distances_[i * k + j];
             auto id = result->seg_offsets_[i * k + j];
-            auto count_dis = CountDistance(query_vecs + i * dim, base_vecs + id * dim, dim, metric);
+            auto count_dis = CountDistance(
+                query_vecs + i * dim, base_vecs + id * dim, dim, metric);
             // assert(std::abs(dis - count_dis) < threshold);
         }
     }
@@ -391,9 +369,11 @@ generate_index_params(const MapParams& m) {
 }
 
 // TODO: std::is_arithmetic_v, hard to compare float point value. std::is_integral_v.
-template <typename T, typename = typename std::enable_if_t<std::is_arithmetic_v<T> || std::is_same_v<T, std::string>>>
+template <typename T,
+          typename = typename std::enable_if_t<std::is_arithmetic_v<T> ||
+                                               std::is_same_v<T, std::string>>>
 inline std::vector<T>
-GenArr(int64_t n) {
+GenSortedArr(int64_t n) {
     auto max_i8 = std::numeric_limits<int8_t>::max() - 1;
     std::vector<T> arr;
     arr.resize(n);
@@ -419,14 +399,15 @@ GenStrArr(int64_t n) {
 
 template <>
 inline std::vector<std::string>
-GenArr<std::string>(int64_t n) {
+GenSortedArr<std::string>(int64_t n) {
     return GenStrArr(n);
 }
 
 std::vector<ScalarTestParams>
 GenBoolParams() {
     std::vector<ScalarTestParams> ret;
-    ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "inverted_index"}}));
+    ret.emplace_back(
+        ScalarTestParams(MapParams(), {{"index_type", "STL_SORT"}}));
     ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "flat"}}));
     return ret;
 }
@@ -434,11 +415,13 @@ GenBoolParams() {
 std::vector<ScalarTestParams>
 GenStringParams() {
     std::vector<ScalarTestParams> ret;
-    ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "marisa"}}));
+    ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "Trie"}}));
     return ret;
 }
 
-template <typename T, typename = typename std::enable_if_t<std::is_arithmetic_v<T> | std::is_same_v<std::string, T>>>
+template <typename T,
+          typename = typename std::enable_if_t<std::is_arithmetic_v<T> |
+                                               std::is_same_v<std::string, T>>>
 inline std::vector<ScalarTestParams>
 GenParams() {
     if (std::is_same_v<std::string, T>) {
@@ -450,7 +433,8 @@ GenParams() {
     }
 
     std::vector<ScalarTestParams> ret;
-    ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "inverted_index"}}));
+    ret.emplace_back(
+        ScalarTestParams(MapParams(), {{"index_type", "STL_SORT"}}));
     ret.emplace_back(ScalarTestParams(MapParams(), {{"index_type", "flat"}}));
     return ret;
 }
@@ -475,21 +459,36 @@ PrintMapParams(const std::vector<ScalarTestParams>& tps) {
 // memory generated by this function should be freed by the caller.
 auto
 GenDsFromPB(const google::protobuf::Message& msg) {
-    auto data = new char[msg.ByteSize()];
-    msg.SerializeToArray(data, msg.ByteSize());
-    return knowhere::GenDataset(msg.ByteSize(), 8, data);
+    auto data = new char[msg.ByteSizeLong()];
+    msg.SerializeToArray(data, msg.ByteSizeLong());
+    return knowhere::GenDataSet(msg.ByteSizeLong(), 8, data);
 }
 
 template <typename T>
 inline std::vector<std::string>
 GetIndexTypes() {
-    return std::vector<std::string>{"inverted_index"};
+    return std::vector<std::string>{"STL_SORT",
+                                    milvus::index::BITMAP_INDEX_TYPE};
 }
 
 template <>
 inline std::vector<std::string>
 GetIndexTypes<std::string>() {
-    return std::vector<std::string>{"marisa"};
+    return std::vector<std::string>{
+        "STL_SORT", "Trie", milvus::index::BITMAP_INDEX_TYPE};
+}
+
+template <typename T>
+inline std::vector<std::string>
+GetIndexTypesV2() {
+    return std::vector<std::string>{"STL_SORT",
+                                    milvus::index::INVERTED_INDEX_TYPE};
+}
+
+template <>
+inline std::vector<std::string>
+GetIndexTypesV2<std::string>() {
+    return std::vector<std::string>{"Trie", milvus::index::INVERTED_INDEX_TYPE};
 }
 
 }  // namespace

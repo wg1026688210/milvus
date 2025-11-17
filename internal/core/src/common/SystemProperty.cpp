@@ -18,13 +18,14 @@
 
 #include "SystemProperty.h"
 #include "Consts.h"
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
 
 namespace milvus {
 class SystemPropertyImpl : public SystemProperty {
  public:
     bool
-    SystemFieldVerify(const FieldName& field_name, FieldId field_id) const override {
+    SystemFieldVerify(const FieldName& field_name,
+                      FieldId field_id) const override {
         if (!IsSystem(field_name)) {
             return false;
         }

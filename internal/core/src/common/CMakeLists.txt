@@ -9,38 +9,5 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
-milvus_add_pkg_config("milvus_common")
-
-set(COMMON_SRC
-        Schema.cpp
-        SystemProperty.cpp
-        binary_set_c.cpp
-        init_c.cpp
-        )
-
-add_library(milvus_common SHARED ${COMMON_SRC})
-
-if ( MSYS )
-    target_link_libraries(milvus_common
-            milvus_config
-            milvus_utils
-            milvus_log
-            yaml-cpp
-            boost_bitset_ext
-            arrow
-            parquet
-            )
-else()
-    target_link_libraries(milvus_common
-            milvus_config
-            milvus_utils
-            milvus_log
-            yaml-cpp
-            boost_bitset_ext
-            arrow
-            parquet
-            arrow_bundled
-            )
-endif()
-
-install(TARGETS milvus_common DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+add_source_at_current_directory_recursively()
+add_library(milvus_common OBJECT ${SOURCE_FILES})

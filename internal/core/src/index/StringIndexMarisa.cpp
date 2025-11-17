@@ -17,44 +17,150 @@
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/uuid_generators.hpp>
+#include <cstring>
+#include <memory>
+#include <optional>
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
-#include <knowhere/index/VecIndex.h>
+#include <sys/errno.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
+#include "common/File.h"
+#include "common/Types.h"
+#include "common/EasyAssert.h"
+#include "common/Exception.h"
+#include "common/Utils.h"
+#include "common/Slice.h"
 #include "index/StringIndexMarisa.h"
 #include "index/Utils.h"
 #include "index/Index.h"
-#include "common/Utils.h"
+#include "marisa/base.h"
+#include "storage/ThreadPools.h"
+#include "storage/Util.h"
+#include "storage/FileWriter.h"
 
 namespace milvus::index {
 
-#if defined(__linux__) || defined(__APPLE__)
+StringIndexMarisa::StringIndexMarisa(
+    const storage::FileManagerContext& file_manager_context)
+    : StringIndex(MARISA_TRIE) {
+    if (file_manager_context.Valid()) {
+        file_manager_ =
+            std::make_shared<storage::MemFileManagerImpl>(file_manager_context);
+    }
+}
 
 int64_t
 StringIndexMarisa::Size() {
-    return trie_.size();
+    return total_size_;
+}
+
+int64_t
+StringIndexMarisa::CalculateTotalSize() const {
+    int64_t size = 0;
+
+    // Size of the trie structure
+    // marisa trie uses io_size() to get the serialized size
+    // which approximates the memory usage
+    size += trie_.io_size();
+
+    // Size of str_ids_ vector (main data structure)
+    size += str_ids_.size() * sizeof(int64_t);
+
+    // Size of str_ids_to_offsets_ map data
+    for (const auto& [key, vec] : str_ids_to_offsets_) {
+        size += sizeof(size_t);               // key
+        size += vec.size() * sizeof(size_t);  // vector data
+    }
+
+    return size;
+}
+
+bool
+valid_str_id(size_t str_id) {
+    return str_id >= 0 && str_id != MARISA_INVALID_KEY_ID;
 }
 
 void
-StringIndexMarisa::Build(size_t n, const std::string* values) {
+StringIndexMarisa::Build(const Config& config) {
     if (built_) {
-        throw std::runtime_error("index has been built");
+        ThrowInfo(IndexAlreadyBuild, "index has been built");
+    }
+    auto field_datas =
+        storage::CacheRawDataAndFillMissing(file_manager_, config);
+
+    BuildWithFieldData(field_datas);
+}
+
+void
+StringIndexMarisa::BuildWithFieldData(
+    const std::vector<FieldDataPtr>& field_datas) {
+    int64_t total_num_rows = 0;
+
+    // fill key set.
+    marisa::Keyset keyset;
+    for (const auto& data : field_datas) {
+        auto slice_num = data->get_num_rows();
+        for (int64_t i = 0; i < slice_num; ++i) {
+            if (data->is_valid(i)) {
+                keyset.push_back(
+                    (*static_cast<const std::string*>(data->RawValue(i)))
+                        .c_str());
+            }
+        }
+        total_num_rows += slice_num;
+    }
+    trie_.build(keyset, MARISA_LABEL_ORDER);
+
+    // fill str_ids_
+    str_ids_.resize(total_num_rows, MARISA_NULL_KEY_ID);
+    int64_t offset = 0;
+    for (const auto& data : field_datas) {
+        auto slice_num = data->get_num_rows();
+        for (int64_t i = 0; i < slice_num; ++i) {
+            if (data->is_valid(i)) {
+                auto str_id =
+                    lookup(*static_cast<const std::string*>(data->RawValue(i)));
+                AssertInfo(valid_str_id(str_id), "invalid marisa key");
+                str_ids_[offset] = str_id;
+            }
+            offset++;
+        }
+    }
+
+    // fill str_ids_to_offsets_
+    fill_offsets();
+
+    built_ = true;
+    total_size_ = CalculateTotalSize();
+}
+
+void
+StringIndexMarisa::Build(size_t n,
+                         const std::string* values,
+                         const bool* valid_data) {
+    if (built_) {
+        ThrowInfo(IndexAlreadyBuild, "index has been built");
     }
 
     marisa::Keyset keyset;
     {
         // fill key set.
         for (size_t i = 0; i < n; i++) {
-            keyset.push_back(values[i].c_str());
+            if (valid_data == nullptr || valid_data[i]) {
+                keyset.push_back(values[i].c_str());
+            }
         }
     }
 
-    trie_.build(keyset);
-    fill_str_ids(n, values);
+    trie_.build(keyset, MARISA_LABEL_ORDER);
+    fill_str_ids(n, values, valid_data);
     fill_offsets();
 
     built_ = true;
+    total_size_ = CalculateTotalSize();
 }
 
 BinarySet
@@ -63,16 +169,14 @@ StringIndexMarisa::Serialize(const Config& config) {
     auto uuid_string = boost::uuids::to_string(uuid);
     auto file = std::string("/tmp/") + uuid_string;
 
-    auto fd = open(file.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IXUSR);
+    auto fd = open(
+        file.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IXUSR);
+    AssertInfo(fd != -1, "open file failed");
     trie_.write(fd);
 
     auto size = get_file_size(fd);
-    auto buf = new uint8_t[size];
-
-    while (read(fd, buf, size) != size) {
-        lseek(fd, 0, SEEK_SET);
-    }
-    std::shared_ptr<uint8_t[]> index_data(buf);
+    auto index_data = std::shared_ptr<uint8_t[]>(new uint8_t[size]);
+    ReadDataFromFD(fd, index_data.get(), size);
 
     close(fd);
     remove(file.c_str());
@@ -85,166 +189,372 @@ StringIndexMarisa::Serialize(const Config& config) {
     res_set.Append(MARISA_TRIE_INDEX, index_data, size);
     res_set.Append(MARISA_STR_IDS, str_ids, str_ids_len);
 
-    knowhere::Disassemble(res_set, config);
+    Disassemble(res_set);
 
     return res_set;
 }
 
-void
-StringIndexMarisa::Load(const BinarySet& set, const Config& config) {
-    knowhere::Assemble(const_cast<BinarySet&>(set));
+IndexStatsPtr
+StringIndexMarisa::Upload(const Config& config) {
+    auto binary_set = Serialize(config);
+    file_manager_->AddFile(binary_set);
 
+    auto remote_paths_to_size = file_manager_->GetRemotePathsToFileSize();
+    return IndexStats::NewFromSizeMap(file_manager_->GetAddedTotalMemSize(),
+                                      remote_paths_to_size);
+}
+
+void
+StringIndexMarisa::LoadWithoutAssemble(const BinarySet& set,
+                                       const Config& config) {
     auto uuid = boost::uuids::random_generator()();
     auto uuid_string = boost::uuids::to_string(uuid);
-    auto file = std::string("/tmp/") + uuid_string;
+    // TODO: change the mmap path of marisa index
+    auto file_name = std::string("/tmp/") + uuid_string;
 
     auto index = set.GetByName(MARISA_TRIE_INDEX);
     auto len = index->size;
+    auto load_priority =
+        GetValueFromConfig<milvus::proto::common::LoadPriority>(
+            config, milvus::LOAD_PRIORITY)
+            .value_or(milvus::proto::common::LoadPriority::HIGH);
 
-    auto fd = open(file.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IXUSR);
-    lseek(fd, 0, SEEK_SET);
-    while (write(fd, index->data.get(), len) != len) {
-        lseek(fd, 0, SEEK_SET);
+    {
+        auto file_writer = storage::FileWriter(
+            file_name, storage::io::GetPriorityFromLoadPriority(load_priority));
+        file_writer.Write(index->data.get(), len);
+        file_writer.Finish();
     }
 
-    lseek(fd, 0, SEEK_SET);
-    trie_.read(fd);
-    close(fd);
-    remove(file.c_str());
+    if (config.contains(MMAP_FILE_PATH)) {
+        trie_.mmap(file_name.c_str());
+        mmap_file_raii_ = std::make_unique<MmapFileRAII>(file_name);
+    } else {
+        auto file = File::Open(file_name, O_RDONLY);
+        trie_.read(file.Descriptor());
+        mmap_file_raii_ = nullptr;
+    }
+
+    if (!config.contains(MMAP_FILE_PATH)) {
+        unlink(file_name.c_str());
+    }
 
     auto str_ids = set.GetByName(MARISA_STR_IDS);
     auto str_ids_len = str_ids->size;
-    str_ids_.resize(str_ids_len / sizeof(size_t));
+    str_ids_.resize(str_ids_len / sizeof(size_t), MARISA_NULL_KEY_ID);
     memcpy(str_ids_.data(), str_ids->data.get(), str_ids_len);
 
     fill_offsets();
+    built_ = true;
+    total_size_ = CalculateTotalSize();
 }
 
-bool
-valid_str_id(size_t str_id) {
-    return str_id >= 0 && str_id != MARISA_INVALID_KEY_ID;
+void
+StringIndexMarisa::Load(const BinarySet& set, const Config& config) {
+    milvus::Assemble(const_cast<BinarySet&>(set));
+    LoadWithoutAssemble(set, config);
 }
 
-const TargetBitmapPtr
+void
+StringIndexMarisa::Load(milvus::tracer::TraceContext ctx,
+                        const Config& config) {
+    auto index_files =
+        GetValueFromConfig<std::vector<std::string>>(config, "index_files");
+    AssertInfo(index_files.has_value(),
+               "index file paths is empty when load index");
+    auto load_priority =
+        GetValueFromConfig<milvus::proto::common::LoadPriority>(
+            config, milvus::LOAD_PRIORITY)
+            .value_or(milvus::proto::common::LoadPriority::HIGH);
+    auto index_datas =
+        file_manager_->LoadIndexToMemory(index_files.value(), load_priority);
+    BinarySet binary_set;
+    AssembleIndexDatas(index_datas, binary_set);
+    // clear index_datas to free memory early
+    index_datas.clear();
+    LoadWithoutAssemble(binary_set, config);
+}
+
+const TargetBitmap
 StringIndexMarisa::In(size_t n, const std::string* values) {
-    TargetBitmapPtr bitset = std::make_unique<TargetBitmap>(str_ids_.size());
+    tracer::AutoSpan span("StringIndexMarisa::In", tracer::GetRootSpan());
+    TargetBitmap bitset(str_ids_.size());
     for (size_t i = 0; i < n; i++) {
         auto str = values[i];
         auto str_id = lookup(str);
         if (valid_str_id(str_id)) {
             auto offsets = str_ids_to_offsets_[str_id];
             for (auto offset : offsets) {
-                bitset->set(offset);
+                bitset[offset] = true;
             }
         }
     }
     return bitset;
 }
 
-const TargetBitmapPtr
+const TargetBitmap
 StringIndexMarisa::NotIn(size_t n, const std::string* values) {
-    TargetBitmapPtr bitset = std::make_unique<TargetBitmap>(str_ids_.size());
-    bitset->set();
+    tracer::AutoSpan span("StringIndexMarisa::NotIn", tracer::GetRootSpan());
+    TargetBitmap bitset(str_ids_.size(), true);
     for (size_t i = 0; i < n; i++) {
         auto str = values[i];
         auto str_id = lookup(str);
         if (valid_str_id(str_id)) {
             auto offsets = str_ids_to_offsets_[str_id];
             for (auto offset : offsets) {
-                bitset->reset(offset);
+                bitset[offset] = false;
             }
         }
     }
+    // NotIn(null) and In(null) is both false, need to mask with IsNotNull operate
+    ResetNull(bitset);
     return bitset;
 }
 
-const TargetBitmapPtr
-StringIndexMarisa::Range(std::string value, OpType op) {
-    auto count = Count();
-    TargetBitmapPtr bitset = std::make_unique<TargetBitmap>(count);
-    marisa::Agent agent;
-    for (size_t offset = 0; offset < count; ++offset) {
-        agent.set_query(str_ids_[offset]);
-        trie_.reverse_lookup(agent);
-        std::string raw_data(agent.key().ptr(), agent.key().length());
-        bool set = false;
-        switch (op) {
-            case OpType::LessThan:
-                set = raw_data.compare(value) < 0;
-                break;
-            case OpType::LessEqual:
-                set = raw_data.compare(value) <= 0;
-                break;
-            case OpType::GreaterThan:
-                set = raw_data.compare(value) > 0;
-                break;
-            case OpType::GreaterEqual:
-                set = raw_data.compare(value) >= 0;
-                break;
-            default:
-                throw std::invalid_argument(std::string("Invalid OperatorType: ") + std::to_string((int)op) + "!");
+const TargetBitmap
+StringIndexMarisa::IsNull() {
+    tracer::AutoSpan span("StringIndexMarisa::IsNull", tracer::GetRootSpan());
+    TargetBitmap bitset(str_ids_.size());
+    SetNull(bitset);
+    return bitset;
+}
+
+void
+StringIndexMarisa::SetNull(TargetBitmap& bitset) {
+    tracer::AutoSpan span("StringIndexMarisa::SetNull", tracer::GetRootSpan());
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] == MARISA_NULL_KEY_ID) {
+            bitset.set(i);
         }
-        if (set) {
-            bitset->set(offset);
+    }
+}
+
+void
+StringIndexMarisa::ResetNull(TargetBitmap& bitset) {
+    tracer::AutoSpan span("StringIndexMarisa::ResetNull",
+                          tracer::GetRootSpan());
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] == MARISA_NULL_KEY_ID) {
+            bitset.reset(i);
+        }
+    }
+}
+
+TargetBitmap
+StringIndexMarisa::IsNotNull() {
+    tracer::AutoSpan span("StringIndexMarisa::IsNotNull",
+                          tracer::GetRootSpan());
+    TargetBitmap bitset(str_ids_.size());
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] != MARISA_NULL_KEY_ID) {
+            bitset.set(i);
         }
     }
     return bitset;
 }
 
-const TargetBitmapPtr
+const TargetBitmap
+StringIndexMarisa::Range(std::string value, OpType op) {
+    tracer::AutoSpan span("StringIndexMarisa::Range", tracer::GetRootSpan());
+    auto count = Count();
+    TargetBitmap bitset(count);
+    std::vector<size_t> ids;
+    marisa::Agent agent;
+    bool in_lexico_order = in_lexicographic_order();
+    switch (op) {
+        case OpType::GreaterThan: {
+            if (in_lexico_order) {
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key > value) {
+                        ids.push_back(agent.key().id());
+                        break;
+                    }
+                };
+                // since in lexicographic order, all following nodes is greater than value
+                while (trie_.predictive_search(agent)) {
+                    ids.push_back(agent.key().id());
+                }
+            } else {
+                // lexicographic order is not guaranteed, check all values
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key > value) {
+                        ids.push_back(agent.key().id());
+                    }
+                };
+            }
+            break;
+        }
+        case OpType::GreaterEqual: {
+            if (in_lexico_order) {
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key >= value) {
+                        ids.push_back(agent.key().id());
+                        break;
+                    }
+                };
+                // since in lexicographic order, all following nodes is greater than or equal value
+                while (trie_.predictive_search(agent)) {
+                    ids.push_back(agent.key().id());
+                }
+            } else {
+                // lexicographic order is not guaranteed, check all values
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key >= value) {
+                        ids.push_back(agent.key().id());
+                    }
+                };
+            }
+            break;
+        }
+        case OpType::LessThan: {
+            if (in_lexico_order) {
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key >= value) {
+                        break;
+                    }
+                    ids.push_back(agent.key().id());
+                }
+            } else {
+                // lexicographic order is not guaranteed, check all values
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key < value) {
+                        ids.push_back(agent.key().id());
+                    }
+                };
+            }
+            break;
+        }
+        case OpType::LessEqual: {
+            if (in_lexico_order) {
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key > value) {
+                        break;
+                    }
+                    ids.push_back(agent.key().id());
+                }
+            } else {
+                // lexicographic order is not guaranteed, check all values
+                while (trie_.predictive_search(agent)) {
+                    auto key =
+                        std::string(agent.key().ptr(), agent.key().length());
+                    if (key <= value) {
+                        ids.push_back(agent.key().id());
+                    }
+                };
+            }
+            break;
+        }
+        default:
+            ThrowInfo(
+                OpTypeInvalid,
+                fmt::format("Invalid OperatorType: {}", static_cast<int>(op)));
+    }
+
+    for (const auto str_id : ids) {
+        auto offsets = str_ids_to_offsets_[str_id];
+        for (auto offset : offsets) {
+            bitset[offset] = true;
+        }
+    }
+    return bitset;
+}
+
+const TargetBitmap
 StringIndexMarisa::Range(std::string lower_bound_value,
                          bool lb_inclusive,
                          std::string upper_bound_value,
                          bool ub_inclusive) {
+    tracer::AutoSpan span("StringIndexMarisa::Range", tracer::GetRootSpan());
     auto count = Count();
-    TargetBitmapPtr bitset = std::make_unique<TargetBitmap>(count);
+    TargetBitmap bitset(count);
     if (lower_bound_value.compare(upper_bound_value) > 0 ||
-        (lower_bound_value.compare(upper_bound_value) == 0 && !(lb_inclusive && ub_inclusive))) {
+        (lower_bound_value.compare(upper_bound_value) == 0 &&
+         !(lb_inclusive && ub_inclusive))) {
         return bitset;
     }
+
+    bool in_lexico_oder = in_lexicographic_order();
+
+    auto common_prefix = GetCommonPrefix(lower_bound_value, upper_bound_value);
     marisa::Agent agent;
-    for (size_t offset = 0; offset < count; ++offset) {
-        agent.set_query(str_ids_[offset]);
-        trie_.reverse_lookup(agent);
-        std::string raw_data(agent.key().ptr(), agent.key().length());
-        bool set = true;
-        if (lb_inclusive) {
-            set &= raw_data.compare(lower_bound_value) >= 0;
-        } else {
-            set &= raw_data.compare(lower_bound_value) > 0;
+    agent.set_query(common_prefix.c_str());
+    std::vector<size_t> ids;
+    while (trie_.predictive_search(agent)) {
+        std::string_view val =
+            std::string_view(agent.key().ptr(), agent.key().length());
+        if (val > upper_bound_value ||
+            (!ub_inclusive && val == upper_bound_value)) {
+            // we could only break when trie in lexicographic order.
+            if (in_lexico_oder) {
+                break;
+            } else {
+                continue;
+            }
         }
-        if (ub_inclusive) {
-            set &= raw_data.compare(upper_bound_value) <= 0;
-        } else {
-            set &= raw_data.compare(upper_bound_value) < 0;
+
+        if (val < lower_bound_value ||
+            (!lb_inclusive && val == lower_bound_value)) {
+            continue;
         }
-        if (set) {
-            bitset->set(offset);
+
+        if (((lb_inclusive && lower_bound_value <= val) ||
+             (!lb_inclusive && lower_bound_value < val)) &&
+            ((ub_inclusive && val <= upper_bound_value) ||
+             (!ub_inclusive && val < upper_bound_value))) {
+            ids.push_back(agent.key().id());
         }
     }
+    for (const auto str_id : ids) {
+        auto offsets = str_ids_to_offsets_[str_id];
+        for (auto offset : offsets) {
+            bitset[offset] = true;
+        }
+    }
+
     return bitset;
 }
 
-const TargetBitmapPtr
-StringIndexMarisa::PrefixMatch(std::string prefix) {
-    TargetBitmapPtr bitset = std::make_unique<TargetBitmap>(str_ids_.size());
+const TargetBitmap
+StringIndexMarisa::PrefixMatch(std::string_view prefix) {
+    tracer::AutoSpan span("StringIndexMarisa::PrefixMatch",
+                          tracer::GetRootSpan());
+    TargetBitmap bitset(str_ids_.size());
     auto matched = prefix_match(prefix);
     for (const auto str_id : matched) {
         auto offsets = str_ids_to_offsets_[str_id];
         for (auto offset : offsets) {
-            bitset->set(offset);
+            bitset[offset] = true;
         }
     }
     return bitset;
 }
 
 void
-StringIndexMarisa::fill_str_ids(size_t n, const std::string* values) {
-    str_ids_.resize(n);
+StringIndexMarisa::fill_str_ids(size_t n,
+                                const std::string* values,
+                                const bool* valid_data) {
+    str_ids_.resize(n, MARISA_NULL_KEY_ID);
     for (size_t i = 0; i < n; i++) {
+        if (valid_data != nullptr && !valid_data[i]) {
+            continue;
+        }
         auto str = values[i];
         auto str_id = lookup(str);
-        assert(valid_str_id(str_id));
+        AssertInfo(valid_str_id(str_id), "invalid marisa key");
         str_ids_[i] = str_id;
     }
 }
@@ -261,9 +571,9 @@ StringIndexMarisa::fill_offsets() {
 }
 
 size_t
-StringIndexMarisa::lookup(const std::string& str) {
+StringIndexMarisa::lookup(const std::string_view str) {
     marisa::Agent agent;
-    agent.set_query(str.c_str());
+    agent.set_query(str.data());
     if (trie_.lookup(agent)) {
         return agent.key().id();
     }
@@ -273,25 +583,40 @@ StringIndexMarisa::lookup(const std::string& str) {
 }
 
 std::vector<size_t>
-StringIndexMarisa::prefix_match(const std::string& prefix) {
+StringIndexMarisa::prefix_match(const std::string_view prefix) {
+    tracer::AutoSpan span("StringIndexMarisa::prefix_match",
+                          tracer::GetRootSpan());
     std::vector<size_t> ret;
     marisa::Agent agent;
-    agent.set_query(prefix.c_str());
+    agent.set_query(prefix.data());
     while (trie_.predictive_search(agent)) {
         ret.push_back(agent.key().id());
     }
     return ret;
 }
-
-std::string
+std::optional<std::string>
 StringIndexMarisa::Reverse_Lookup(size_t offset) const {
+    tracer::AutoSpan span("StringIndexMarisa::Reverse_Lookup",
+                          tracer::GetRootSpan());
     AssertInfo(offset < str_ids_.size(), "out of range of total count");
     marisa::Agent agent;
+    if (str_ids_[offset] < 0) {
+        return std::nullopt;
+    }
     agent.set_query(str_ids_[offset]);
     trie_.reverse_lookup(agent);
     return std::string(agent.key().ptr(), agent.key().length());
 }
 
-#endif
+bool
+StringIndexMarisa::in_lexicographic_order() {
+    // by default, marisa trie uses `MARISA_WEIGHT_ORDER` to build trie
+    // so `predictive_search` will not iterate in lexicographic order
+    // now we build trie using `MARISA_LABEL_ORDER` and also handle old index in weight order.
+    if (trie_.node_order() == MARISA_LABEL_ORDER) {
+        return true;
+    }
 
+    return false;
+}
 }  // namespace milvus::index

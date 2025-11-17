@@ -17,35 +17,100 @@
 package job
 
 import (
+	"context"
 	"time"
 
-	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
-	"github.com/milvus-io/milvus/internal/util/typeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
+	"go.uber.org/zap"
+
+	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
+	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
+	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
-// waitCollectionReleased blocks until
+const waitCollectionReleasedTimeout = 30 * time.Second
+
+// WaitCollectionReleased blocks until
 // all channels and segments of given collection(partitions) are released,
 // empty partition list means wait for collection released
-func waitCollectionReleased(dist *meta.DistributionManager, collection int64, partitions ...int64) {
+func WaitCollectionReleased(ctx context.Context, dist *meta.DistributionManager, checkerController *checkers.CheckerController, collection int64, partitions ...int64) error {
 	partitionSet := typeutil.NewUniqueSet(partitions...)
+	var (
+		lastChannelCount int
+		lastSegmentCount int
+		lastChangeTime   = time.Now()
+	)
+
 	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Wrapf(err, "context error while waiting for release, collection=%d", collection)
+		}
+
 		var (
 			channels []*meta.DmChannel
-			segments []*meta.Segment = dist.SegmentDistManager.GetByCollection(collection)
+			segments []*meta.Segment = dist.SegmentDistManager.GetByFilter(meta.WithCollectionID(collection))
 		)
 		if partitionSet.Len() > 0 {
 			segments = lo.Filter(segments, func(segment *meta.Segment, _ int) bool {
 				return partitionSet.Contain(segment.GetPartitionID())
 			})
 		} else {
-			channels = dist.ChannelDistManager.GetByCollection(collection)
+			channels = dist.ChannelDistManager.GetByCollectionAndFilter(collection)
 		}
 
-		if len(channels)+len(segments) == 0 {
+		currentChannelCount := len(channels)
+		currentSegmentCount := len(segments)
+		if currentChannelCount+currentSegmentCount == 0 {
 			break
 		}
 
+		// If release is in progress, reset last change time
+		if currentChannelCount < lastChannelCount || currentSegmentCount < lastSegmentCount {
+			lastChangeTime = time.Now()
+		}
+
+		// If release is not in progress for a while, return error
+		if time.Since(lastChangeTime) > waitCollectionReleasedTimeout {
+			return errors.Errorf("wait collection released timeout, collection=%d, channels=%d, segments=%d",
+				collection, currentChannelCount, currentSegmentCount)
+		}
+
+		log.Ctx(ctx).Info("waitting for release...",
+			zap.Int64("collection", collection),
+			zap.Int64s("partitions", partitions),
+			zap.Int("channel", currentChannelCount),
+			zap.Int("segments", currentSegmentCount),
+		)
+
+		lastChannelCount = currentChannelCount
+		lastSegmentCount = currentSegmentCount
+
+		// trigger check more frequently
+		checkerController.Check()
 		time.Sleep(200 * time.Millisecond)
+	}
+	return nil
+}
+
+func WaitCurrentTargetUpdated(ctx context.Context, targetObserver *observers.TargetObserver, collection int64) error {
+	// manual trigger update next target
+	ready, err := targetObserver.UpdateNextTarget(collection)
+	if err != nil {
+		return errors.Wrapf(err, "failed to update next target, collection=%d", collection)
+	}
+
+	// accelerate check
+	targetObserver.TriggerUpdateCurrentTarget(collection)
+	// wait current target ready
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrapf(ctx.Err(), "context error while waiting for current target updated, collection=%d", collection)
+	case <-time.After(waitCollectionReleasedTimeout):
+		return errors.Errorf("wait current target updated timeout, collection=%d", collection)
 	}
 }

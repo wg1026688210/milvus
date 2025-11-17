@@ -21,9 +21,58 @@ extern "C" {
 #endif
 
 #include <stdbool.h>
+#include <stdint.h>
+#include "common/type_c.h"
 
 void
-LocalRootPathInit(const char*);
+InitCpuNum(const int);
+
+void
+SetIndexSliceSize(const int64_t);
+
+void
+SetHighPriorityThreadCoreCoefficient(const float);
+
+void
+SetMiddlePriorityThreadCoreCoefficient(const float);
+
+void
+SetLowPriorityThreadCoreCoefficient(const float);
+
+void
+SetDefaultExprEvalBatchSize(int64_t val);
+
+void
+SetDefaultDeleteDumpBatchSize(int64_t val);
+
+void
+SetDefaultOptimizeExprEnable(bool val);
+
+void
+SetDefaultGrowingJSONKeyStatsEnable(bool val);
+
+void
+SetDefaultConfigParamTypeCheck(bool val);
+
+void
+SetDefaultEnableParquetStatsSkipIndex(bool val);
+
+// dynamic update segcore params
+void
+SetLogLevel(const char* level);
+
+void
+InitTrace(CTraceConfig* config);
+
+void
+SetTrace(CTraceConfig* config);
+
+// Expr result cache
+void
+SetExprResCacheEnable(bool val);
+
+void
+SetExprResCacheCapacityBytes(int64_t bytes);
 
 #ifdef __cplusplus
 };

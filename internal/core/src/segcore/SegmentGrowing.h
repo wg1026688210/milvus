@@ -18,16 +18,12 @@
 #include "common/Schema.h"
 #include "common/Types.h"
 #include "query/Plan.h"
-#include "query/deprecated/GeneralQuery.h"
 #include "segcore/SegmentInterface.h"
 
 namespace milvus::segcore {
 
 class SegmentGrowing : public SegmentInternalInterface {
  public:
-    virtual void
-    disable_small_index() = 0;
-
     virtual int64_t
     PreInsert(int64_t size) = 0;
 
@@ -36,17 +32,18 @@ class SegmentGrowing : public SegmentInternalInterface {
            int64_t size,
            const int64_t* row_ids,
            const Timestamp* timestamps,
-           const InsertData* insert_data) = 0;
+           InsertRecordProto* insert_record_proto) = 0;
+
+    SegmentType
+    type() const override {
+        return SegmentType::Growing;
+    }
 
     // virtual int64_t
     // PreDelete(int64_t size) = 0;
 
     // virtual Status
     // Delete(int64_t reserved_offset, int64_t size, const int64_t* row_ids, const Timestamp* timestamps) = 0;
-
- public:
-    virtual int64_t
-    get_deleted_count() const = 0;
 };
 
 using SegmentGrowingPtr = std::unique_ptr<SegmentGrowing>;

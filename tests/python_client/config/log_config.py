@@ -1,5 +1,5 @@
 import os
-
+from pathlib import Path
 
 class LogConfig:
     def __init__(self):
@@ -16,16 +16,17 @@ class LogConfig:
             log_path = os.environ[var]
             return str(log_path)
         except Exception as e:
-            log_path = "/tmp/ci_logs/"
+            # now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+            log_path = f"/tmp/ci_logs"
             print("[get_env_variable] failed to get environment variables : %s, use default path : %s" % (str(e), log_path))
             return log_path
 
     @staticmethod
     def create_path(log_path):
-        if not os.path.isdir(str(log_path)):
-            print("[create_path] folder(%s) is not exist." % log_path)
-            print("[create_path] create path now...")
-            os.makedirs(log_path)
+        print("[create_path] folder(%s) is not exist." % log_path)
+        print("[create_path] create path now...")
+        folder_path = Path(str(log_path))
+        folder_path.mkdir(parents=True, exist_ok=True)
 
     def get_default_config(self):
         """ Make sure the path exists """

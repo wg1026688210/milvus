@@ -24,41 +24,123 @@
 
 #include "storage/IndexData.h"
 #include "storage/FileManager.h"
-#include "storage/MinioChunkManager.h"
+#include "storage/LocalChunkManager.h"
+#include "common/Consts.h"
+#include "storage/Types.h"
+#include "storage/ThreadPools.h"
 
 namespace milvus::storage {
 
 class DiskFileManagerImpl : public FileManagerImpl {
  public:
-    explicit DiskFileManagerImpl(const FieldDataMeta& field_mata,
-                                 const IndexMeta& index_meta,
-                                 const StorageConfig& storage_config);
+    explicit DiskFileManagerImpl(const FileManagerContext& fileManagerContext);
 
-    virtual ~DiskFileManagerImpl();
+    ~DiskFileManagerImpl() override;
 
-    virtual bool
-    LoadFile(const std::string& filename) noexcept;
+    bool
+    LoadFile(const std::string& filename) noexcept override;
 
-    virtual bool
-    AddFile(const std::string& filename) noexcept;
+    bool
+    AddFile(const std::string& filename) noexcept override;
 
-    virtual std::optional<bool>
-    IsExisted(const std::string& filename) noexcept;
+    bool
+    AddFileMeta(const FileMeta& file_meta) override;
 
-    virtual bool
-    RemoveFile(const std::string& filename) noexcept;
+    std::optional<bool>
+    IsExisted(const std::string& filename) noexcept override;
+
+    bool
+    RemoveFile(const std::string& filename) noexcept override;
+
+    /**
+    * @brief Opens an output stream for provided filename
+    * 
+    *  This function utilizes the arrow file system to open an output stream for the provided filename.
+    * 
+    * @param filename the filename to open
+    * @return std::shared_ptr<OutputStream> a shared pointer to the output stream
+    * @throws milvus::SegcoreError
+    * 
+    * @note the internal `fs_` must be initialized to use this API.
+    */
+    std::shared_ptr<InputStream>
+    OpenInputStream(const std::string& filename) override;
+
+    /**
+    * @brief Opens an output stream for provided filename
+    * 
+    *  This function utilizes the arrow file system to open an output stream for the provided filename.
+    * 
+    * @param filename the filename to open
+    * @return std::shared_ptr<OutputStream> a shared pointer to the output stream
+    * @throws milvus::SegcoreError if fs_ is nullptr
+    * 
+    * @note the internal `fs_` must be initialized to use this API.
+    */
+    std::shared_ptr<OutputStream>
+    OpenOutputStream(const std::string& filename) override;
 
  public:
-    virtual std::string
-    GetName() const {
+    bool
+    AddTextLog(const std::string& filename) noexcept;
+
+    bool
+    AddJsonSharedIndexLog(const std::string& filename) noexcept;
+
+ public:
+    std::string
+    GetName() const override {
         return "DiskFileManagerImpl";
     }
 
     std::string
-    GetRemoteIndexObjectPrefix();
+    GetIndexIdentifier();
 
     std::string
     GetLocalIndexObjectPrefix();
+
+    std::string
+    GetLocalTempIndexObjectPrefix();
+
+    // Similar to GetTextIndexIdentifier, segment_id and field_id is also required.
+    std::string
+    GetLocalTextIndexPrefix();
+
+    std::string
+    GetLocalTempTextIndexPrefix();
+
+    std::string
+    GetLocalJsonStatsPrefix();
+
+    std::string
+    GetLocalTempJsonStatsPrefix();
+
+    std::string
+    GetLocalJsonStatsShreddingPrefix();
+
+    std::string
+    GetLocalJsonStatsSharedIndexPrefix();
+
+    std::string
+    GetLocalJsonStatsShreddingPath(const std::string& file_name);
+
+    // Used for upload index to remote storage, using this index prefix dir as remote storage directory
+    std::string
+    GetLocalNgramIndexPrefix();
+
+    // Used for loading index, using this index prefix dir to store index.
+    std::string
+    GetLocalTempNgramIndexPrefix();
+
+    std::string
+    GetRemoteJsonStatsLogPrefix();
+
+    std::string
+    GetRemoteJsonStatsShreddingPrefix();
+
+    std::string
+    GetRemoteJsonStatsSharedIndexPath(const std::string& file_name,
+                                      int64_t slice_num);
 
     std::string
     GetLocalRawDataObjectPrefix();
@@ -74,17 +156,62 @@ class DiskFileManagerImpl : public FileManagerImpl {
     }
 
     void
-    CacheIndexToDisk(std::vector<std::string> remote_files);
+    CacheIndexToDisk(const std::vector<std::string>& remote_files,
+                     milvus::proto::common::LoadPriority priority);
 
-    FieldDataMeta
-    GetFileDataMeta() const {
-        return field_meta_;
+    void
+    CacheTextLogToDisk(const std::vector<std::string>& remote_files,
+                       milvus::proto::common::LoadPriority priority);
+
+    void
+    CacheNgramIndexToDisk(const std::vector<std::string>& remote_files,
+                          milvus::proto::common::LoadPriority priority);
+
+    void
+    RemoveIndexFiles();
+
+    void
+    RemoveTextLogFiles();
+
+    void
+    RemoveJsonStatsFiles();
+
+    void
+    CacheJsonStatsSharedIndexToDisk(
+        const std::vector<std::string>& remote_files,
+        milvus::proto::common::LoadPriority priority);
+
+    void
+    RemoveNgramIndexFiles();
+
+    void
+    AddBatchIndexFiles(const std::string& local_file_name,
+                       const std::vector<int64_t>& local_file_offsets,
+                       const std::vector<std::string>& remote_files,
+                       const std::vector<int64_t>& remote_file_sizes);
+
+    template <typename DataType>
+    std::string
+    CacheRawDataToDisk(const Config& config);
+
+    std::string
+    CacheOptFieldToDisk(const Config& config);
+
+    std::string
+    GetRemoteIndexPrefix() const {
+        return GetRemoteIndexObjectPrefix();
     }
 
-    IndexMeta
-    GetIndexMeta() const {
-        return index_meta_;
+    size_t
+    GetAddedTotalFileSize() const {
+        return added_total_file_size_;
     }
+
+    std::string
+    GetFileName(const std::string& localfile);
+
+    std::string
+    GetRemoteIndexFilePrefixV2() const override;
 
  private:
     int64_t
@@ -93,23 +220,57 @@ class DiskFileManagerImpl : public FileManagerImpl {
     }
 
     std::string
-    GetFileName(const std::string& localfile);
+    GetRemoteIndexPath(const std::string& file_name, int64_t slice_num) const;
+
+    /**
+     * @brief Get the Remote Index Path V2
+     * @param file_name; v2 will not split the file with slice_num
+     * @return std::string
+     */
+    std::string
+    GetRemoteIndexPathV2(const std::string& file_name) const;
+
+    std::string
+    GetRemoteTextLogPath(const std::string& file_name, int64_t slice_num) const;
+
+    bool
+    AddFileInternal(const std::string& file_name,
+                    const std::function<std::string(const std::string&, int)>&
+                        get_remote_path) noexcept;
+
+    void
+    CacheIndexToDiskInternal(const std::vector<std::string>& remote_files,
+                             const std::string& local_index_prefix,
+                             milvus::proto::common::LoadPriority priority =
+                                 milvus::proto::common::LoadPriority::HIGH);
+
+    template <typename DataType>
+    std::string
+    cache_raw_data_to_disk_internal(const Config& config);
+
+    template <typename T>
+    std::string
+    cache_raw_data_to_disk_storage_v2(const Config& config);
+
+    template <typename DataType>
+    void
+    cache_raw_data_to_disk_common(
+        const FieldDataPtr& field_data,
+        const std::shared_ptr<LocalChunkManager>& local_chunk_manager,
+        std::string& local_data_path,
+        bool& file_created,
+        uint32_t& dim,
+        int64_t& write_offset,
+        std::vector<size_t>* offsets = nullptr);
 
  private:
-    // collection meta
-    FieldDataMeta field_meta_;
-
-    // index meta
-    IndexMeta index_meta_;
-
     // local file path (abs path)
     std::vector<std::string> local_paths_;
 
     // remote file path
     std::map<std::string, int64_t> remote_paths_to_size_;
 
-    RemoteChunkManagerPtr rcm_;
-    std::string remote_root_path_;
+    size_t added_total_file_size_ = 0;
 };
 
 using DiskANNFileManagerImplPtr = std::shared_ptr<DiskFileManagerImpl>;

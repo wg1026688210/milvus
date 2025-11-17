@@ -11,7 +11,7 @@
 
 #include <cmath>
 
-#include "exceptions/EasyAssert.h"
+#include "common/EasyAssert.h"
 #include "query/SubSearchResult.h"
 
 namespace milvus::query {
@@ -19,10 +19,13 @@ namespace milvus::query {
 template <bool is_desc>
 void
 SubSearchResult::merge_impl(const SubSearchResult& right) {
-    AssertInfo(num_queries_ == right.num_queries_, "[SubSearchResult]Nq check failed");
+    AssertInfo(num_queries_ == right.num_queries_,
+               "[SubSearchResult]Nq check failed");
     AssertInfo(topk_ == right.topk_, "[SubSearchResult]Topk check failed");
-    AssertInfo(metric_type_ == right.metric_type_, "[SubSearchResult]Metric type check failed");
-    AssertInfo(is_desc == PositivelyRelated(metric_type_), "[SubSearchResult]Metric type isn't desc");
+    AssertInfo(metric_type_ == right.metric_type_,
+               "[SubSearchResult]Metric type check failed");
+    AssertInfo(is_desc == PositivelyRelated(metric_type_),
+               "[SubSearchResult]Metric type isn't desc");
 
     for (int64_t qn = 0; qn < num_queries_; ++qn) {
         auto offset = qn * topk_;
@@ -40,17 +43,29 @@ SubSearchResult::merge_impl(const SubSearchResult& right) {
         auto rit = 0;  // right iter
 
         for (auto buf_iter = 0; buf_iter < topk_; ++buf_iter) {
+            auto left_id = left_ids[lit];
             auto left_v = left_distances[lit];
+            auto right_id = right_ids[rit];
             auto right_v = right_distances[rit];
             // optimize out at compiling
-            if (is_desc ? (left_v >= right_v) : (left_v <= right_v)) {
+            if (left_id == INVALID_SEG_OFFSET) {
+                buf_distances[buf_iter] = right_distances[rit];
+                buf_ids[buf_iter] = right_ids[rit];
+                ++rit;
+            } else if (right_id == INVALID_SEG_OFFSET) {
                 buf_distances[buf_iter] = left_distances[lit];
                 buf_ids[buf_iter] = left_ids[lit];
                 ++lit;
             } else {
-                buf_distances[buf_iter] = right_distances[rit];
-                buf_ids[buf_iter] = right_ids[rit];
-                ++rit;
+                if (is_desc ? (left_v >= right_v) : (left_v <= right_v)) {
+                    buf_distances[buf_iter] = left_distances[lit];
+                    buf_ids[buf_iter] = left_ids[lit];
+                    ++lit;
+                } else {
+                    buf_distances[buf_iter] = right_distances[rit];
+                    buf_ids[buf_iter] = right_ids[rit];
+                    ++rit;
+                }
             }
         }
         std::copy_n(buf_distances.data(), topk_, left_distances);
@@ -59,12 +74,19 @@ SubSearchResult::merge_impl(const SubSearchResult& right) {
 }
 
 void
-SubSearchResult::merge(const SubSearchResult& sub_result) {
-    AssertInfo(metric_type_ == sub_result.metric_type_, "[SubSearchResult]Metric type check failed when merge");
-    if (PositivelyRelated(metric_type_)) {
-        this->merge_impl<true>(sub_result);
+SubSearchResult::merge(const SubSearchResult& other) {
+    AssertInfo(metric_type_ == other.metric_type_,
+               "[SubSearchResult]Metric type check failed when merge");
+    if (!other.chunk_iterators_.empty()) {
+        std::move(std::begin(other.chunk_iterators_),
+                  std::end(other.chunk_iterators_),
+                  std::back_inserter(this->chunk_iterators_));
     } else {
-        this->merge_impl<false>(sub_result);
+        if (PositivelyRelated(metric_type_)) {
+            this->merge_impl<true>(other);
+        } else {
+            this->merge_impl<false>(other);
+        }
     }
 }
 
@@ -73,8 +95,8 @@ SubSearchResult::round_values() {
     if (round_decimal_ == -1)
         return;
     const float multiplier = pow(10.0, round_decimal_);
-    for (auto it = this->distances_.begin(); it != this->distances_.end(); it++) {
-        *it = round(*it * multiplier) / multiplier;
+    for (float& distance : this->distances_) {
+        distance = std::round(distance * multiplier) / multiplier;
     }
 }
 
